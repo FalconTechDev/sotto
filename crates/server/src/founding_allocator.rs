@@ -498,7 +498,10 @@ pub async fn record_pending_checkout_completion(
     let status: String = row.try_get("status")?;
     let completed_at: Option<i64> = row.try_get("checkout_completed_by_epoch")?;
     if let Some(completed_at) = completed_at {
-        if completed_at != checkout_completed_by_epoch {
+        // An async-payment event can arrive first and only proves completion happened before
+        // the Checkout Session expired. The later completed event carries the actual timestamp,
+        // which may be earlier than that stored upper bound.
+        if checkout_completed_by_epoch > completed_at {
             return Err(FoundingAllocatorError::ConfirmationConflict);
         }
         return Ok(true);

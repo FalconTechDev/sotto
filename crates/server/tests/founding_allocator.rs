@@ -809,6 +809,13 @@ async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
         .expect("confirm out-of-order delayed payment"),
         ConfirmationOutcome::Awarded(_)
     ));
+    assert!(record_pending_checkout_completion(
+        &mut out_of_order_tx,
+        out_of_order_operation,
+        out_of_order_expiry - 100,
+    )
+    .await
+    .expect("later Checkout-completed event replays after async payment success"));
     out_of_order_tx
         .commit()
         .await
