@@ -564,12 +564,11 @@ pub async fn confirm_payment(
     let reservation_expires_at_epoch: i64 = row.try_get("reservation_expires_at_epoch")?;
     let remaining = available_places(tx, now_epoch).await?;
     let reservation_is_live = reservation_expires_at_epoch > now_epoch;
-    // An expired reservation is no longer included in available_places. If all places have
-    // since been awarded, or the last place is held by another live reservation, a late payment
-    // must be refunded rather than taking a place that was already promised to someone else.
+    // Once a reservation expires, its founding offer is no longer honoured. Even if capacity
+    // happens to remain, accepting the late payment would make a short-lived quote reusable.
     // A live reservation being confirmed itself is included in `remaining`, so zero is valid for
     // that path.
-    if awarded >= FOUNDING_CAPACITY || remaining < 0 || (!reservation_is_live && remaining == 0) {
+    if awarded >= FOUNDING_CAPACITY || remaining < 0 || !reservation_is_live {
         sqlx::query(
             "UPDATE billing_founding_reservations SET status = 'refund_required', \
              payment_reference = $2, updated_at = now() \
@@ -808,7 +807,12 @@ pub async fn load_award(
     row.map(award_from_row).transpose()
 }
 
-async fn lock_capacity(tx: &mut Transaction<'_, Postgres>) -> Result<(), FoundingAllocatorError> {
+/// Acquire the shared founding ledger lock before touching personal or sponsored billing rows.
+/// Checkout and webhook settlement paths take this first so they cannot deadlock while acquiring
+/// the ledger alongside account, operation, or subscription locks.
+pub async fn lock_capacity(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), FoundingAllocatorError> {
     sqlx::query(
         "SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE",
     )

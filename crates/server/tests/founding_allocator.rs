@@ -611,6 +611,50 @@ async fn late_payment_is_refunded_when_capacity_was_consumed_after_reservation()
 }
 
 #[tokio::test]
+async fn expired_reservation_is_refunded_even_when_founding_capacity_remains() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _guard = TEST_LOCK.get_or_init(|| Mutex::const_new(())).lock().await;
+    let fixture = "expired-open-capacity";
+    cleanup(&pool, fixture).await;
+    let now = 1_800_000_000;
+    let mut tx = pool.begin().await.expect("begin expiring reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut tx,
+            "founding-test-expired-open-capacity-reservation",
+            "founding-test-expired-open-capacity-operation",
+            "founding-test-expired-open-capacity-person",
+            FoundingPayerKind::Personal,
+            "founding-test-expired-open-capacity-payer",
+            FoundingOffer::Monthly,
+            1,
+            now + 1,
+            now + 1,
+            now,
+        )
+        .await
+        .expect("create short reservation"),
+        ReservationOutcome::Created(_)
+    ));
+    assert_eq!(
+        confirm_payment(
+            &mut tx,
+            "founding-test-expired-open-capacity-reservation",
+            "founding-test-expired-open-capacity-payment",
+            FoundingDate::new(2026, 2, 1).unwrap(),
+            now + 2,
+        )
+        .await
+        .expect("late payment outcome"),
+        ConfirmationOutcome::RefundRequired
+    );
+    tx.commit().await.expect("commit expired refund decision");
+    cleanup(&pool, fixture).await;
+}
+
+#[tokio::test]
 async fn expired_payment_cannot_take_a_place_held_by_a_live_reservation() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -878,7 +922,7 @@ async fn founding_award_preserves_person_and_anniversary_across_payer_transfer()
         "founding-test-transfer-reservation",
         "founding-test-transfer-payment",
         FoundingDate::new(2024, 2, 29).unwrap(),
-        now + 1_801,
+        now + 1,
     )
     .await
     .expect("confirm transfer award")
@@ -905,7 +949,7 @@ async fn founding_award_preserves_person_and_anniversary_across_payer_transfer()
             "founding-test-transfer-reservation",
             "founding-test-transfer-other-payment",
             FoundingDate::new(2024, 2, 29).unwrap(),
-            now + 1_802,
+            now + 2,
         )
         .await,
         Err(sotto_server::founding_allocator::FoundingAllocatorError::ConfirmationConflict)

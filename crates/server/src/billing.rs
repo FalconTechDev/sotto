@@ -1526,6 +1526,11 @@ async fn sponsored_checkout(
         .map_err(Error::from)?;
     let now = sponsored_billing::current_epoch();
     let mut tx = state.pool.begin().await?;
+    // Keep the allocator mutex ahead of organisation, seat, operation and subscription locks.
+    // Invoice settlement and expiry use the same order.
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let incoming_beneficiary = request
         .replacement_beneficiary_id
         .as_deref()
@@ -1987,6 +1992,9 @@ async fn personal_checkout(
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
     let mut tx = state.pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let operation = billing_operations::begin_personal_operation(
         &mut tx,
         &user.user_id,
@@ -3503,6 +3511,9 @@ async fn personal_checkout_completed(
         // become a free hosted term.
         return Ok(());
     }
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let customer = object["customer"]
         .as_str()
         .ok_or_else(|| Error::Config("paid personal checkout has no customer".into()))?;
@@ -3889,6 +3900,9 @@ async fn invoice_paid(
     if !personal {
         return Ok(());
     }
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let period_end = invoice_period_end(object)
         .ok_or_else(|| Error::Config("paid personal invoice has no period end".into()))?;
     let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
@@ -3921,6 +3935,19 @@ async fn sponsored_invoice_paid(
             "sponsored billing price catalogue is not configured".into(),
         ));
     };
+    let known_subscription: Option<String> = sqlx::query_scalar(
+        "SELECT organization_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if known_subscription.is_none() {
+        return Ok(false);
+    }
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let organization_id: Option<String> = sqlx::query_scalar(
         "SELECT organization_id FROM billing_sponsored_subscriptions \
          WHERE provider_subscription_id = $1 FOR UPDATE",
@@ -3976,7 +4003,8 @@ async fn sponsored_invoice_paid(
         "SELECT operation_id, offer FROM billing_sponsored_operations \
          WHERE organization_id = $1 \
            AND (state IN ('checkout_created', 'provider_pending') \
-                OR (state = 'failed' AND result_code IN ('checkout_expired', 'founding_refund_required'))) \
+                OR (state = 'failed' AND result_code = 'checkout_expired' \
+                    AND offer IN ('founding_monthly', 'founding_annual'))) \
            AND effective_from < $2 \
          ORDER BY created_at FOR UPDATE",
     )
@@ -4019,6 +4047,9 @@ async fn record_sponsored_founding_award(
     evidence: &sponsored_billing::SponsoredProviderEvidence,
     paid_at_epoch: i64,
 ) -> Result<bool> {
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let offer: String = sqlx::query_scalar(
         "SELECT offer FROM billing_sponsored_operations WHERE operation_id = $1 FOR UPDATE",
     )

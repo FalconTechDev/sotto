@@ -7,7 +7,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::{postgres::PgConnectOptions, PgPool};
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::{sleep, Instant};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -105,6 +106,29 @@ async fn post_webhook(app: &Router, payload: &str) -> StatusCode {
     response.status()
 }
 
+async fn wait_for_capacity_waiter(pool: &PgPool, holder_pid: i32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiter_found: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+             WHERE $1 = ANY(pg_blocking_pids(pid)) \
+               AND query LIKE '%billing_founding_capacity%')",
+        )
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .expect("find webhook waiting on founding capacity");
+        if waiter_found {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "webhook did not block on the founding-capacity lock"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() {
     let Some(pool) = pool_or_skip().await else {
@@ -116,15 +140,19 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     let owner_id = format!("founding-owner-{fixture}");
     let beneficiary_id = format!("founding-person-{fixture}");
     let refunded_beneficiary_id = format!("founding-refunded-person-{fixture}");
+    let expired_standard_beneficiary_id = format!("founding-standard-expired-person-{fixture}");
     let organization_id = format!("founding-org-{fixture}");
     let operation_id = format!("sponsored:founding-operation-{fixture}");
     let refunded_operation_id = format!("sponsored:founding-refunded-operation-{fixture}");
+    let expired_standard_operation_id =
+        format!("sponsored:founding-standard-expired-operation-{fixture}");
     let reservation_id = format!("founding:{operation_id}");
     let refunded_reservation_id = format!("founding:{refunded_operation_id}");
     let subscription_id = format!("sub_founding_{fixture}");
     let customer_id = format!("cus_founding_{fixture}");
     let provider_item_id = format!("si_founding_{fixture}");
     let event_id = format!("evt_founding_{fixture}");
+    let replay_event_id = format!("evt_founding_replay_{fixture}");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after unix epoch")
@@ -132,10 +160,11 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     let quote_expiry = now + 1_800;
     let period_end = now + 30 * 24 * 60 * 60;
 
-    sqlx::query("INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'github', $1), ($2, 'github', $2), ($3, 'github', $3)")
+    sqlx::query("INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'github', $1), ($2, 'github', $2), ($3, 'github', $3), ($4, 'github', $4)")
         .bind(&owner_id)
         .bind(&beneficiary_id)
         .bind(&refunded_beneficiary_id)
+        .bind(&expired_standard_beneficiary_id)
         .execute(&pool)
         .await
         .expect("seed users");
@@ -203,6 +232,25 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     .execute(&pool)
     .await
     .expect("seed late sponsored operation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, state, result_code) \
+         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'standard_monthly', 1, $7, $8, $9, 'failed', 'checkout_expired')",
+    )
+    .bind(&expired_standard_operation_id)
+    .bind(&organization_id)
+    .bind(&owner_id)
+    .bind(format!("idempotency-standard-expired-{fixture}"))
+    .bind(format!("request-standard-expired-{fixture}"))
+    .bind(&expired_standard_beneficiary_id)
+    .bind(quote_expiry)
+    .bind(now - 20)
+    .bind(format!("provider-standard-expired-{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("seed expired standard operation");
     sqlx::query(
         "INSERT INTO billing_sponsored_seats \
          (seat_id, organization_id, beneficiary_id, offer, effective_from, state, operation_id) \
@@ -304,7 +352,46 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     })
     .to_string();
 
-    assert_eq!(post_webhook(&app, &invoice).await, StatusCode::OK);
+    // Hold the allocator row while a real invoice webhook reaches settlement. It must wait
+    // before locking the subscription row, so checkout, expiry and renewal all share one lock
+    // order (capacity first).
+    let mut capacity_holder = pool.begin().await.expect("begin capacity lock holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *capacity_holder)
+        .await
+        .expect("read capacity lock holder pid");
+    sotto_server::founding_allocator::lock_capacity(&mut capacity_holder)
+        .await
+        .expect("hold founding capacity");
+    let first_invoice = invoice.clone();
+    let app_for_invoice = app.clone();
+    let invoice_task =
+        tokio::spawn(async move { post_webhook(&app_for_invoice, &first_invoice).await });
+    wait_for_capacity_waiter(&pool, holder_pid).await;
+    let mut subscription_probe = pool.begin().await.expect("begin subscription lock probe");
+    let subscription_lock = sqlx::query_scalar::<_, String>(
+        "SELECT provider_subscription_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1 FOR UPDATE NOWAIT",
+    )
+    .bind(&subscription_id)
+    .fetch_one(&mut *subscription_probe)
+    .await;
+    assert_eq!(
+        subscription_lock.expect("webhook must wait for capacity before locking subscription"),
+        subscription_id
+    );
+    subscription_probe
+        .rollback()
+        .await
+        .expect("release subscription lock probe");
+    capacity_holder
+        .commit()
+        .await
+        .expect("release capacity lock");
+    assert_eq!(
+        invoice_task.await.expect("invoice webhook task"),
+        StatusCode::OK
+    );
     assert_eq!(post_webhook(&app, &invoice).await, StatusCode::OK);
     let award: (String, String, String, String) = sqlx::query_as(
         "SELECT beneficiary_id, payer_kind, payer_id, offer FROM billing_founding_awards WHERE beneficiary_id = $1",
@@ -378,6 +465,51 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     .expect("confirmed shared reservation");
     assert_eq!(receipt, "confirmed");
 
+    // A distinct, later invoice must not retry a terminal refund or try to complete a standard
+    // checkout that was already expired. Either row would otherwise make the webhook fail.
+    let mut replay_invoice: serde_json::Value =
+        serde_json::from_str(&invoice).expect("parse invoice payload");
+    replay_invoice["id"] = replay_event_id.clone().into();
+    replay_invoice["created"] = (now + 1).into();
+    replay_invoice["data"]["object"]["id"] = format!("in_founding_replay_{fixture}").into();
+    replay_invoice["data"]["object"]["payment_intent"] =
+        format!("pi_founding_replay_{fixture}").into();
+    replay_invoice["data"]["object"]["status_transitions"]["paid_at"] = (now + 1).into();
+    replay_invoice["data"]["object"]["lines"]["data"][0]["period"]["end"] =
+        (period_end + 30 * 24 * 60 * 60).into();
+    assert_eq!(
+        post_webhook(&app, &replay_invoice.to_string()).await,
+        StatusCode::OK
+    );
+    let terminal_operations: (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT failed.state, failed.result_code, failed.provider_payment_reference, \
+                    standard.state, standard.result_code \
+             FROM billing_sponsored_operations AS failed \
+             CROSS JOIN billing_sponsored_operations AS standard \
+             WHERE failed.operation_id = $1 AND standard.operation_id = $2",
+    )
+    .bind(&refunded_operation_id)
+    .bind(&expired_standard_operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load terminal operations after later invoice");
+    assert_eq!(
+        terminal_operations,
+        (
+            "failed".into(),
+            Some("founding_refund_required".into()),
+            Some(format!("pi_founding_{fixture}")),
+            "failed".into(),
+            Some("checkout_expired".into()),
+        )
+    );
+
     sqlx::query("DELETE FROM billing_sponsored_seats WHERE organization_id = $1")
         .bind(&organization_id)
         .execute(&pool)
@@ -408,6 +540,11 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         .execute(&pool)
         .await
         .expect("clean webhook receipt");
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+        .bind(replay_event_id)
+        .execute(&pool)
+        .await
+        .expect("clean replay webhook receipt");
     sqlx::query("DELETE FROM billing_founding_reservations WHERE beneficiary_id = $1")
         .bind(&beneficiary_id)
         .execute(&pool)
@@ -433,10 +570,11 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         .execute(&pool)
         .await
         .expect("clean organisation");
-    sqlx::query("DELETE FROM users WHERE id IN ($1, $2, $3)")
+    sqlx::query("DELETE FROM users WHERE id IN ($1, $2, $3, $4)")
         .bind(&owner_id)
         .bind(&beneficiary_id)
         .bind(&refunded_beneficiary_id)
+        .bind(&expired_standard_beneficiary_id)
         .execute(&pool)
         .await
         .expect("clean users");
