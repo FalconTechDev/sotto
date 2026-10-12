@@ -220,14 +220,15 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
 }
 
 export type PersonalBillingTerm = "monthly" | "annual";
-export type PersonalBillingOffer =
+export type BillingOffer =
   | "standard_monthly"
   | "standard_annual"
   | "founding_monthly"
   | "founding_annual";
+export type PersonalBillingOffer = BillingOffer;
 
 export interface PersonalQuote {
-  offer: PersonalBillingOffer;
+  offer: BillingOffer;
   amountPence: number;
   currency: string;
   interval: string;
@@ -243,7 +244,7 @@ export interface PersonalQuote {
 export async function fetchPersonalQuote(term: PersonalBillingTerm): Promise<PersonalQuote> {
   const offer = term === "monthly" ? "standard_monthly" : "standard_annual";
   const body = await authedJson<{
-    offer: PersonalBillingOffer;
+    offer: BillingOffer;
     amount_pence: number;
     currency: string;
     interval: string;
@@ -277,7 +278,7 @@ export interface PersonalCheckoutResult {
 }
 
 export async function createPersonalCheckout(input: {
-  offer: PersonalBillingOffer;
+  offer: BillingOffer;
   idempotencyKey: string;
   quoteVersion: number;
   quoteExpiresAtEpoch: number;
@@ -431,7 +432,7 @@ export interface SponsoredQuote {
   quoteExpiresAtEpoch: number;
 }
 
-export async function fetchSponsoredQuote(orgId: string, input: { action: string; offer: string; beneficiaryIds: string[] }): Promise<SponsoredQuote> {
+export async function fetchSponsoredQuote(orgId: string, input: { action: string; offer: BillingOffer; beneficiaryIds: string[] }): Promise<SponsoredQuote> {
   const body = await postJson<{
     action: string; seat_count: number; amount_pence: number; currency: string; interval: string;
     quote_version: number; quote_expires_at_epoch: number;
@@ -444,7 +445,7 @@ export async function fetchSponsoredQuote(orgId: string, input: { action: string
 }
 
 export async function createSponsoredCheckout(orgId: string, input: {
-  action: string; offer: string; beneficiaryId: string; replacementBeneficiaryId?: string;
+  action: string; offer: BillingOffer; beneficiaryId: string; replacementBeneficiaryId?: string;
   quoteVersion: number; quoteExpiresAtEpoch: number; effectiveFrom: number; effectiveUntil?: number;
   idempotencyKey: string; returnUrl: string;
 }): Promise<{ operationId: string; state: string; checkoutUrl: string | null }> {
