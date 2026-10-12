@@ -492,33 +492,35 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         post_webhook(&app, &replay_invoice.to_string()).await,
         StatusCode::OK
     );
-    let terminal_operations: (
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    ) = sqlx::query_as(
-        "SELECT failed.state, failed.result_code, failed.provider_payment_reference, \
-                    expired.state, expired.result_code, expired.provider_payment_reference, reservation.status \
-             FROM billing_sponsored_operations AS failed \
-             CROSS JOIN billing_sponsored_operations AS expired \
-             JOIN billing_founding_reservations AS reservation ON reservation.operation_id = expired.operation_id \
-             WHERE failed.operation_id = $1 AND expired.operation_id = $2",
+    let late_operation: (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT state, result_code, provider_payment_reference \
+         FROM billing_sponsored_operations WHERE operation_id = $1",
     )
     .bind(&refunded_operation_id)
-    .bind(&expired_standard_operation_id)
     .fetch_one(&pool)
     .await
-    .expect("load terminal operations after later invoice");
+    .expect("load late operation after later invoice");
     assert_eq!(
-        terminal_operations,
+        late_operation,
         (
             "failed".into(),
             Some("founding_refund_required".into()),
             Some(format!("pi_founding_{fixture}")),
+        )
+    );
+    let expired_checkout: (String, Option<String>, Option<String>, String) = sqlx::query_as(
+        "SELECT operation.state, operation.result_code, operation.provider_payment_reference, reservation.status \
+         FROM billing_sponsored_operations AS operation \
+         JOIN billing_founding_reservations AS reservation USING (operation_id) \
+         WHERE operation.operation_id = $1",
+    )
+    .bind(&expired_standard_operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load expired checkout after later invoice");
+    assert_eq!(
+        expired_checkout,
+        (
             "failed".into(),
             Some("checkout_expired".into()),
             None,
