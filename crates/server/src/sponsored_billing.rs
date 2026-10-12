@@ -170,6 +170,7 @@ impl SponsoredSeatRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SponsoredQuote {
     pub action: SponsoredSeatAction,
+    pub offer: BillingOffer,
     pub seat_count: i64,
     pub amount_pence: i64,
     pub currency: &'static str,
@@ -202,6 +203,7 @@ pub fn quote(
         .ok_or(SponsoredBillingError::InvalidField("quote expiry"))?;
     Ok(SponsoredQuote {
         action,
+        offer,
         seat_count,
         amount_pence,
         currency: "gbp",
@@ -278,6 +280,8 @@ pub enum SponsoredBillingError {
     ResultConflict,
     #[error("sponsored billing state is corrupt")]
     CorruptState,
+    #[error("founding reservation could not be released: {0}")]
+    FoundingAllocator(#[from] crate::founding_allocator::FoundingAllocatorError),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }
@@ -310,6 +314,9 @@ impl From<SponsoredBillingError> for Error {
             }
             SponsoredBillingError::CorruptState => {
                 Self::Internal("sponsored billing state is corrupt".into())
+            }
+            SponsoredBillingError::FoundingAllocator(error) => {
+                Self::Internal(format!("founding reservation update failed: {error}"))
             }
             SponsoredBillingError::Database(error) => Self::Db(error),
         }
@@ -746,6 +753,53 @@ pub async fn complete_paid_checkout(
     load_operation(tx, operation_id).await
 }
 
+/// Preserve paid evidence when a founding place can no longer be awarded.
+///
+/// The pending seat is cancelled in the same transaction, so a paid-but-unhonourable founding
+/// checkout never becomes sponsored coverage. The payment reference remains available for the
+/// refund repair path.
+pub async fn record_founding_refund_required(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    evidence: &SponsoredProviderEvidence,
+) -> Result<SponsoredOperation, SponsoredBillingError> {
+    let updated = sqlx::query(
+        "UPDATE billing_sponsored_operations SET state = 'failed', \
+         provider_payment_reference = $2, provider_customer_id = COALESCE($3, provider_customer_id), \
+         provider_subscription_id = $4, provider_checkout_session_id = COALESCE($5, provider_checkout_session_id), \
+         provider_item_id = COALESCE($6, provider_item_id), result_code = 'founding_refund_required', updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','failed') \
+           AND (provider_payment_reference IS NULL OR provider_payment_reference = $2) RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(&evidence.payment_reference)
+    .bind(evidence.customer_id.as_deref())
+    .bind(&evidence.subscription_id)
+    .bind(evidence.checkout_session_id.as_deref())
+    .bind(evidence.provider_item_id.as_deref())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let current = load_operation(tx, operation_id).await?;
+        if current.state != "failed"
+            || current.result_code.as_deref() != Some("founding_refund_required")
+            || current.provider_payment_reference.as_deref()
+                != Some(evidence.payment_reference.as_str())
+        {
+            return Err(SponsoredBillingError::ResultConflict);
+        }
+        return Ok(current);
+    }
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET state = 'canceled', updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending'",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    load_operation(tx, operation_id).await
+}
+
 pub async fn complete_local_removal(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
@@ -774,6 +828,9 @@ pub async fn cancel_failed_operation(
     operation_id: &str,
     result_code: &str,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    // Paid settlement takes the shared capacity lock before it updates this operation. Release in
+    // the same order so a late invoice and an expiry event cannot deadlock each other.
+    crate::founding_allocator::release_reservation(tx, operation_id).await?;
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'failed', result_code = $2, updated_at = now() \
          WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown') RETURNING operation_id",
