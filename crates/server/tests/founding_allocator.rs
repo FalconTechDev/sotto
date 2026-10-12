@@ -9,7 +9,8 @@ use tokio::sync::Mutex;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::db;
 use sotto_server::founding_allocator::{
-    confirm_payment, load_capacity_status, quote_status, reserve, reserve_with_payer_kind,
+    confirm_payment, load_capacity_status, quote_status, record_async_payment_checkout_completion,
+    record_pending_checkout_completion, reserve, reserve_with_payer_kind,
     reserve_with_payer_kind_until, select_offer, ConfirmationOutcome, FoundingDate, FoundingOffer,
     FoundingPayerKind, ReservationOutcome, FOUNDING_CAPACITY,
 };
@@ -638,6 +639,13 @@ async fn expired_reservation_is_refunded_even_when_founding_capacity_remains() {
         .expect("create short reservation"),
         ReservationOutcome::Created(_)
     ));
+    assert!(!record_pending_checkout_completion(
+        &mut tx,
+        "founding-test-expired-open-capacity-operation",
+        now + 2,
+    )
+    .await
+    .expect("late Checkout completion cannot extend an expired reservation"));
     assert_eq!(
         confirm_payment(
             &mut tx,
@@ -651,6 +659,160 @@ async fn expired_reservation_is_refunded_even_when_founding_capacity_remains() {
         ConfirmationOutcome::RefundRequired
     );
     tx.commit().await.expect("commit expired refund decision");
+    cleanup(&pool, fixture).await;
+}
+
+#[tokio::test]
+async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _guard = TEST_LOCK.get_or_init(|| Mutex::const_new(())).lock().await;
+    let fixture = "delayed-checkout-payment";
+    cleanup(&pool, fixture).await;
+    let now = 1_800_000_000;
+    let reservation_expires = now + 1_800;
+    let completed_at = now + 1_700;
+    let mut reserve_tx = pool.begin().await.expect("begin reservation");
+    assert!(matches!(
+        reserve(
+            &mut reserve_tx,
+            "founding-test-delayed-checkout-payment-reservation",
+            "founding-test-delayed-checkout-payment-operation",
+            "founding-test-delayed-checkout-payment-person",
+            "founding-test-delayed-checkout-payment-payer",
+            FoundingOffer::Annual,
+            1,
+            reservation_expires,
+            now,
+        )
+        .await
+        .expect("create reservation"),
+        ReservationOutcome::Created(_)
+    ));
+    reserve_tx.commit().await.expect("commit reservation");
+
+    let mut completed_tx = pool.begin().await.expect("begin Checkout completion");
+    assert!(record_pending_checkout_completion(
+        &mut completed_tx,
+        "founding-test-delayed-checkout-payment-operation",
+        completed_at,
+    )
+    .await
+    .expect("record timely Checkout completion"));
+    assert!(record_pending_checkout_completion(
+        &mut completed_tx,
+        "founding-test-delayed-checkout-payment-operation",
+        completed_at,
+    )
+    .await
+    .expect("replay same Checkout completion"));
+    let deadline: i64 = sqlx::query_scalar(
+        "SELECT reservation_expires_at_epoch FROM billing_founding_reservations \
+         WHERE operation_id = $1",
+    )
+    .bind("founding-test-delayed-checkout-payment-operation")
+    .fetch_one(&mut *completed_tx)
+    .await
+    .expect("read extended reservation deadline");
+    assert_eq!(
+        deadline,
+        completed_at + sotto_server::founding_allocator::SETTLEMENT_RECOVERY_SECONDS
+    );
+    completed_tx
+        .commit()
+        .await
+        .expect("commit Checkout completion");
+
+    let paid_at = completed_at + 5 * 24 * 60 * 60;
+    let mut confirm_tx = pool.begin().await.expect("begin delayed confirmation");
+    let outcome = confirm_payment(
+        &mut confirm_tx,
+        "founding-test-delayed-checkout-payment-reservation",
+        "founding-test-delayed-checkout-payment-reference",
+        FoundingDate::from_unix_seconds(paid_at).unwrap(),
+        paid_at,
+    )
+    .await
+    .expect("confirm delayed payment within the bounded settlement window");
+    assert!(matches!(outcome, ConfirmationOutcome::Awarded(_)));
+    confirm_tx
+        .commit()
+        .await
+        .expect("commit delayed confirmation");
+
+    // Stripe can deliver the async-success event before its separate Checkout-completed event.
+    // The completed Session's original expiry proves it could only have completed in time.
+    let out_of_order_operation = "founding-test-delayed-checkout-payment-out-of-order-operation";
+    let out_of_order_reservation =
+        "founding-test-delayed-checkout-payment-out-of-order-reservation";
+    let out_of_order_quote_expiry = now + 1_800;
+    let out_of_order_expiry = out_of_order_quote_expiry + 1_800;
+    let mut out_of_order_reserve_tx = pool.begin().await.expect("begin out-of-order reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut out_of_order_reserve_tx,
+            out_of_order_reservation,
+            out_of_order_operation,
+            "founding-test-delayed-checkout-payment-out-of-order-person",
+            FoundingPayerKind::Personal,
+            "founding-test-delayed-checkout-payment-payer",
+            FoundingOffer::Annual,
+            1,
+            out_of_order_quote_expiry,
+            out_of_order_expiry,
+            now,
+        )
+        .await
+        .expect("create out-of-order reservation"),
+        ReservationOutcome::Created(_)
+    ));
+    out_of_order_reserve_tx
+        .commit()
+        .await
+        .expect("commit out-of-order reservation");
+    let mut out_of_order_tx = pool.begin().await.expect("begin async-success recording");
+    assert!(!record_async_payment_checkout_completion(
+        &mut out_of_order_tx,
+        out_of_order_operation,
+        out_of_order_expiry + 1,
+        true,
+    )
+    .await
+    .expect("a different Session expiry cannot claim this reservation"));
+    assert!(!record_async_payment_checkout_completion(
+        &mut out_of_order_tx,
+        out_of_order_operation,
+        out_of_order_expiry,
+        false,
+    )
+    .await
+    .expect("an incomplete Session cannot extend the reservation"));
+    assert!(record_async_payment_checkout_completion(
+        &mut out_of_order_tx,
+        out_of_order_operation,
+        out_of_order_expiry,
+        true,
+    )
+    .await
+    .expect("recover timely completion from completed Session"));
+    let out_of_order_paid_at = out_of_order_expiry + 5 * 24 * 60 * 60;
+    assert!(matches!(
+        confirm_payment(
+            &mut out_of_order_tx,
+            out_of_order_reservation,
+            "founding-test-delayed-checkout-payment-out-of-order-reference",
+            FoundingDate::from_unix_seconds(out_of_order_paid_at).unwrap(),
+            out_of_order_paid_at,
+        )
+        .await
+        .expect("confirm out-of-order delayed payment"),
+        ConfirmationOutcome::Awarded(_)
+    ));
+    out_of_order_tx
+        .commit()
+        .await
+        .expect("commit out-of-order delayed payment");
     cleanup(&pool, fixture).await;
 }
 

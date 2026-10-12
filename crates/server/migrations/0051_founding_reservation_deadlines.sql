@@ -1,7 +1,9 @@
--- A quote expires quickly, but a sponsored seat added to an existing subscription is charged
--- only at the next renewal. Keep its reserved capacity until that payment can settle.
+-- Keep scheduled sponsored additions reserved until their renewal can settle. A founding Checkout
+-- that completes before its own expiry also records that completion and retains the place while a
+-- delayed payment method is being processed.
 ALTER TABLE billing_founding_reservations
-    ADD COLUMN reservation_expires_at_epoch BIGINT;
+    ADD COLUMN reservation_expires_at_epoch BIGINT,
+    ADD COLUMN checkout_completed_by_epoch BIGINT;
 
 UPDATE billing_founding_reservations
 SET reservation_expires_at_epoch = quote_expires_at_epoch;

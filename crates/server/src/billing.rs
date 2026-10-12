@@ -1651,7 +1651,7 @@ async fn sponsored_checkout(
                     )
                 })?;
                 period_end
-                    .checked_add(founding_allocator::SPONSORED_SETTLEMENT_RECOVERY_SECONDS)
+                    .checked_add(founding_allocator::SETTLEMENT_RECOVERY_SECONDS)
                     .ok_or_else(|| Error::Internal("billing clock overflow".into()))?
                     .max(request.quote_expires_at_epoch)
             } else {
@@ -3528,7 +3528,11 @@ async fn checkout_completed(
             return Ok(());
         }
         if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
+            record_pending_founding_checkout(tx, operation_id, event_created).await?;
             return Ok(());
+        }
+        if async_payment_succeeded {
+            record_async_payment_founding_checkout(tx, operation_id, object).await?;
         }
         let payment_reference = object["payment_intent"]
             .as_str()
@@ -3614,8 +3618,13 @@ async fn personal_checkout_completed(
     if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
         // A completed Checkout session is not itself authority. The account remains pending until
         // Stripe says the session is paid, so SCA failures and asynchronous payment methods never
-        // become a free hosted term.
+        // become a free hosted term. Preserve a founding reservation only if Checkout completed
+        // while that offer was still live; delayed payment success is handled separately below.
+        record_pending_founding_checkout(tx, operation_id, event_created).await?;
         return Ok(());
+    }
+    if async_payment_succeeded {
+        record_async_payment_founding_checkout(tx, operation_id, object).await?;
     }
     founding_allocator::lock_capacity(tx)
         .await
@@ -3712,6 +3721,37 @@ async fn personal_checkout_completed(
         .await
         .map_err(personal_billing_error)?;
     }
+    Ok(())
+}
+
+async fn record_pending_founding_checkout(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    event_created: i64,
+) -> Result<()> {
+    founding_allocator::record_pending_checkout_completion(tx, operation_id, event_created)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    Ok(())
+}
+
+async fn record_async_payment_founding_checkout(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(session_expires_at_epoch) = object["expires_at"].as_i64() else {
+        // A missing deadline cannot extend an expired offer. Settlement will fail closed below.
+        return Ok(());
+    };
+    founding_allocator::record_async_payment_checkout_completion(
+        tx,
+        operation_id,
+        session_expires_at_epoch,
+        object["status"].as_str() == Some("complete"),
+    )
+    .await
+    .map_err(|error| Error::Internal(error.to_string()))?;
     Ok(())
 }
 

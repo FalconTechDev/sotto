@@ -307,7 +307,7 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
             FoundingOffer::Monthly,
             1,
             quote_expiry,
-            period_end + sotto_server::founding_allocator::SPONSORED_SETTLEMENT_RECOVERY_SECONDS,
+            period_end + sotto_server::founding_allocator::SETTLEMENT_RECOVERY_SECONDS,
             now,
         )
         .await
@@ -651,7 +651,7 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
             FoundingOffer::Monthly,
             1,
             quote_expiry,
-            period_end + sotto_server::founding_allocator::SPONSORED_SETTLEMENT_RECOVERY_SECONDS,
+            period_end + sotto_server::founding_allocator::SETTLEMENT_RECOVERY_SECONDS,
             now,
         )
         .await

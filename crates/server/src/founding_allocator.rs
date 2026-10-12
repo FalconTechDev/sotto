@@ -14,9 +14,9 @@ use crate::billing_catalogue::{BillingInterval, BillingOffer};
 
 pub const FOUNDING_CAPACITY: i64 = 100;
 pub const RESERVATION_SECONDS: i64 = 30 * 60;
-/// Keep a scheduled sponsor's place through the invoice due date and the accepted 14-day
-/// settlement recovery window before treating a late payment as refundable.
-pub const SPONSORED_SETTLEMENT_RECOVERY_SECONDS: i64 = 14 * 24 * 60 * 60;
+/// Keep a timely Checkout or scheduled sponsored place through the accepted 14-day settlement
+/// recovery window before treating a late payment as refundable.
+pub const SETTLEMENT_RECOVERY_SECONDS: i64 = 14 * 24 * 60 * 60;
 /// A Checkout Session is created after the quote, so its expiry may be one quote window beyond
 /// the reservation window while still satisfying Stripe's minimum lifetime.
 pub const MAX_RESERVATION_SECONDS: i64 = RESERVATION_SECONDS * 2;
@@ -464,6 +464,148 @@ pub async fn reserve_with_payer_kind_until(
         quote_expires_at_epoch,
         reservation_expires_at_epoch,
     }))
+}
+
+/// Keep a founding place reserved when a verified Checkout Session completed before its
+/// reservation deadline but Stripe is still processing a delayed payment method. The original
+/// deadline remains the eligibility boundary; only the resulting payment-processing window is
+/// extended, and it is bounded by the existing settlement-recovery period.
+pub async fn record_pending_checkout_completion(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    checkout_completed_by_epoch: i64,
+) -> Result<bool, FoundingAllocatorError> {
+    validate_identity(operation_id, "operation_id")?;
+    if checkout_completed_by_epoch <= 0 {
+        return Err(FoundingAllocatorError::InvalidField(
+            "checkout_completed_by_epoch",
+        ));
+    }
+
+    lock_capacity(tx).await?;
+    let row = sqlx::query(
+        "SELECT status, reservation_expires_at_epoch, checkout_completed_by_epoch \
+         FROM billing_founding_reservations WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        // Standard-price checkouts do not have a founding reservation.
+        return Ok(false);
+    };
+
+    let status: String = row.try_get("status")?;
+    let completed_at: Option<i64> = row.try_get("checkout_completed_by_epoch")?;
+    if let Some(completed_at) = completed_at {
+        if completed_at != checkout_completed_by_epoch {
+            return Err(FoundingAllocatorError::ConfirmationConflict);
+        }
+        return Ok(true);
+    }
+    if status != "reserved" {
+        return Ok(false);
+    }
+
+    let reservation_expires_at_epoch: i64 = row.try_get("reservation_expires_at_epoch")?;
+    if checkout_completed_by_epoch >= reservation_expires_at_epoch {
+        return Ok(false);
+    }
+    let settlement_deadline = checkout_completed_by_epoch
+        .checked_add(SETTLEMENT_RECOVERY_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField(
+            "checkout_completed_by_epoch",
+        ))?;
+    sqlx::query(
+        "UPDATE billing_founding_reservations \
+         SET checkout_completed_by_epoch = $2, \
+             reservation_expires_at_epoch = GREATEST(reservation_expires_at_epoch, $3), \
+             updated_at = now() \
+         WHERE operation_id = $1 AND status = 'reserved' \
+           AND checkout_completed_by_epoch IS NULL",
+    )
+    .bind(operation_id)
+    .bind(checkout_completed_by_epoch)
+    .bind(settlement_deadline)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
+/// Apply the same bounded hold when Stripe delivers the successful delayed-payment event before
+/// the separate Checkout-completed event. A completed Session cannot be paid after its own expiry,
+/// so its provider-reported expiry must match the reservation's original checkout deadline.
+pub async fn record_async_payment_checkout_completion(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    session_expires_at_epoch: i64,
+    session_is_complete: bool,
+) -> Result<bool, FoundingAllocatorError> {
+    validate_identity(operation_id, "operation_id")?;
+    if session_expires_at_epoch <= 1 {
+        return Err(FoundingAllocatorError::InvalidField(
+            "session_expires_at_epoch",
+        ));
+    }
+    if !session_is_complete {
+        return Ok(false);
+    }
+
+    lock_capacity(tx).await?;
+    let row = sqlx::query(
+        "SELECT status, quote_expires_at_epoch, reservation_expires_at_epoch, checkout_completed_by_epoch \
+         FROM billing_founding_reservations WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let status: String = row.try_get("status")?;
+    let quote_expires_at_epoch: i64 = row.try_get("quote_expires_at_epoch")?;
+    let expected_session_expiry = quote_expires_at_epoch
+        .checked_add(RESERVATION_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField(
+            "session_expires_at_epoch",
+        ))?;
+    if expected_session_expiry != session_expires_at_epoch {
+        return Ok(false);
+    }
+    if row
+        .try_get::<Option<i64>, _>("checkout_completed_by_epoch")?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if status != "reserved"
+        || row.try_get::<i64, _>("reservation_expires_at_epoch")? != session_expires_at_epoch
+    {
+        return Ok(false);
+    }
+
+    let completion_upper_bound = session_expires_at_epoch - 1;
+    let settlement_deadline = completion_upper_bound
+        .checked_add(SETTLEMENT_RECOVERY_SECONDS)
+        .ok_or(FoundingAllocatorError::InvalidField(
+            "session_expires_at_epoch",
+        ))?;
+    sqlx::query(
+        "UPDATE billing_founding_reservations \
+         SET checkout_completed_by_epoch = $2, \
+             reservation_expires_at_epoch = GREATEST(reservation_expires_at_epoch, $3), \
+             updated_at = now() \
+         WHERE operation_id = $1 AND status = 'reserved' \
+           AND checkout_completed_by_epoch IS NULL \
+           AND reservation_expires_at_epoch = $4",
+    )
+    .bind(operation_id)
+    .bind(completion_upper_bound)
+    .bind(settlement_deadline)
+    .bind(session_expires_at_epoch)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
 }
 
 pub async fn confirm_payment(
