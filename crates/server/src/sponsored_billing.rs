@@ -856,6 +856,36 @@ pub async fn cancel_failed_operation(
     load_operation(tx, operation_id).await
 }
 
+/// Release unrecorded first-checkout attempts once their server-issued Checkout lifetime has
+/// elapsed. Checkout sessions are no longer payable after this boundary, so an operation whose
+/// provider call failed before recording a session cannot keep a pending seat or founding place.
+/// The caller must acquire the shared founding-capacity lock before calling this function.
+pub async fn cancel_expired_pending_checkouts(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    beneficiary_id: &str,
+    now_epoch: i64,
+) -> Result<usize, SponsoredBillingError> {
+    let latest_expired_quote =
+        now_epoch.saturating_sub(crate::founding_allocator::RESERVATION_SECONDS);
+    let operation_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT operation_id FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND beneficiary_id = $2 AND action = 'add' \
+           AND state = 'pending' AND provider_subscription_id IS NULL \
+           AND quote_expires_at_epoch <= $3 ORDER BY created_at FOR UPDATE",
+    )
+    .bind(organization_id)
+    .bind(beneficiary_id)
+    .bind(latest_expired_quote)
+    .fetch_all(&mut **tx)
+    .await?;
+    let count = operation_ids.len();
+    for operation_id in operation_ids {
+        cancel_failed_operation(tx, &operation_id, "checkout_reservation_expired").await?;
+    }
+    Ok(count)
+}
+
 pub async fn load_operation_for_actor(
     pool: &PgPool,
     operation_id: &str,

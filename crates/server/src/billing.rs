@@ -22,8 +22,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
+use uuid::Uuid;
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -143,6 +144,57 @@ impl ProviderError {
         let detail = self.code.unwrap_or_else(|| "unknown_error".into());
         Error::Upstream(format!("stripe provider error: {detail}"))
     }
+}
+
+/// A provider 4xx response proves that the requested sponsored mutation was rejected. A 5xx,
+/// transport failure or malformed success response can follow an applied mutation, so its
+/// reservation must remain until the provider outcome is reconciled.
+fn provider_failure_is_definitive(error: &ProviderError) -> bool {
+    matches!(error.status, Some(400 | 401 | 403 | 404))
+        && error.kind != ProviderErrorKind::Retryable
+}
+
+async fn fail_sponsored_provider_operation(
+    pool: &sqlx::PgPool,
+    operation_id: &str,
+    result_code: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    sponsored_billing::cancel_failed_operation(&mut tx, operation_id, result_code)
+        .await
+        .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn rotate_sponsored_provider_retry_key(
+    pool: &sqlx::PgPool,
+    operation_id: &str,
+    current_key: &str,
+) -> Result<()> {
+    // Updating a subscription schedule replaces the complete desired phase set, so an ambiguous
+    // outcome can be retried with a fresh provider key without duplicating a charge or a resource.
+    let operation_hash: String = Sha256::digest(operation_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let next_key = format!(
+        "sotto-sponsored:{operation_hash}-retry-{}",
+        Uuid::new_v4().simple()
+    );
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET provider_idempotency_key = $3, updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending' AND provider_idempotency_key = $2",
+    )
+    .bind(operation_id)
+    .bind(current_key)
+    .bind(next_key)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 impl fmt::Display for ProviderError {
@@ -1535,6 +1587,14 @@ async fn sponsored_checkout(
         .replacement_beneficiary_id
         .as_deref()
         .unwrap_or(&request.beneficiary_id);
+    sponsored_billing::cancel_expired_pending_checkouts(
+        &mut tx,
+        &org_id,
+        incoming_beneficiary,
+        now,
+    )
+    .await
+    .map_err(Error::from)?;
     let operation =
         sponsored_billing::begin_operation(&mut tx, &org_id, &user.user_id, &request, now)
             .await
@@ -1619,6 +1679,19 @@ async fn sponsored_checkout(
             }
         }
     }
+    if let Some((_, Some(subscription_id), _)) = existing_subscription.as_ref() {
+        // Persist the target before the provider call. If Stripe ends the subscription while an
+        // update is in flight, the terminal webhook can fail this operation and release its
+        // founding reservation instead of leaving an orphaned pending seat behind.
+        sqlx::query(
+            "UPDATE billing_sponsored_operations SET provider_subscription_id = $2, updated_at = now() \
+             WHERE operation_id = $1 AND state = 'pending'",
+        )
+        .bind(&operation.operation_id)
+        .bind(subscription_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
 
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
@@ -1630,7 +1703,7 @@ async fn sponsored_checkout(
             sponsored_billing::current_epoch(),
         )
         .await?;
-        let snapshot = billing
+        let snapshot = match billing
             .provider
             .update_sponsored_subscription(
                 &org_id,
@@ -1639,7 +1712,27 @@ async fn sponsored_checkout(
                 &operation.provider_idempotency_key,
             )
             .await
-            .map_err(ProviderError::into_error)?;
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if provider_failure_is_definitive(&error) {
+                    fail_sponsored_provider_operation(
+                        &state.pool,
+                        &operation.operation_id,
+                        "provider_rejected",
+                    )
+                    .await?;
+                } else if error.kind == ProviderErrorKind::Retryable {
+                    rotate_sponsored_provider_retry_key(
+                        &state.pool,
+                        &operation.operation_id,
+                        &operation.provider_idempotency_key,
+                    )
+                    .await?;
+                }
+                return Err(error.into_error());
+            }
+        };
         let mut result_tx = state.pool.begin().await?;
         let operation = sponsored_billing::record_provider_update(
             &mut result_tx,
@@ -1661,7 +1754,7 @@ async fn sponsored_checkout(
         }
     } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
         let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
-        let checkout = billing
+        let checkout = match billing
             .provider
             .create_sponsored_checkout(
                 &org_id,
@@ -1677,7 +1770,20 @@ async fn sponsored_checkout(
                 &cancel_url,
             )
             .await
-            .map_err(ProviderError::into_error)?;
+        {
+            Ok(checkout) => checkout,
+            Err(error) => {
+                if provider_failure_is_definitive(&error) {
+                    fail_sponsored_provider_operation(
+                        &state.pool,
+                        &operation.operation_id,
+                        "provider_rejected",
+                    )
+                    .await?;
+                }
+                return Err(error.into_error());
+            }
+        };
         let mut result_tx = state.pool.begin().await?;
         let operation = sponsored_billing::record_checkout(
             &mut result_tx,
@@ -3665,6 +3771,12 @@ async fn apply_sponsored_subscription_state(
     period_start: Option<i64>,
     period_end: Option<i64>,
 ) -> Result<()> {
+    if terminal {
+        // Match invoice settlement's lock order before touching subscription or operation rows.
+        founding_allocator::lock_capacity(tx)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+    }
     sqlx::query(
         "UPDATE billing_sponsored_subscriptions SET \
            provider_customer_id = COALESCE($2, provider_customer_id), \
@@ -3685,6 +3797,21 @@ async fn apply_sponsored_subscription_state(
     .execute(&mut **tx)
     .await?;
     if terminal {
+        let pending_operations: Vec<String> = sqlx::query_scalar(
+            "SELECT operation_id FROM billing_sponsored_operations \
+             WHERE organization_id = $1 AND provider_subscription_id = $2 \
+               AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown') \
+             ORDER BY created_at FOR UPDATE",
+        )
+        .bind(organization_id)
+        .bind(subscription_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for operation_id in pending_operations {
+            sponsored_billing::cancel_failed_operation(tx, &operation_id, "subscription_ended")
+                .await
+                .map_err(Error::from)?;
+        }
         sqlx::query(
             "UPDATE billing_sponsored_seats SET state = 'canceled', \
              effective_until = COALESCE(effective_until, $2, floor(extract(epoch FROM now()))::BIGINT), \
@@ -4002,13 +4129,12 @@ async fn sponsored_invoice_paid(
     let operations: Vec<(String, String)> = sqlx::query_as(
         "SELECT operation_id, offer FROM billing_sponsored_operations \
          WHERE organization_id = $1 \
-           AND (state IN ('checkout_created', 'provider_pending') \
-                OR (state = 'failed' AND result_code = 'checkout_expired' \
-                    AND offer IN ('founding_monthly', 'founding_annual'))) \
-           AND effective_from < $2 \
+           AND state = 'provider_pending' AND provider_subscription_id = $2 \
+           AND effective_from < $3 \
          ORDER BY created_at FOR UPDATE",
     )
     .bind(&organization_id)
+    .bind(subscription_id)
     .bind(period_end)
     .fetch_all(&mut **tx)
     .await?;
@@ -4624,6 +4750,26 @@ mod tests {
             ProviderError::transport().kind,
             ProviderErrorKind::Retryable
         );
+        assert!(provider_failure_is_definitive(&ProviderError::http(
+            400,
+            Some("invalid_request_error".into())
+        )));
+        assert!(provider_failure_is_definitive(&ProviderError::http(
+            401,
+            Some("invalid_api_key".into())
+        )));
+        assert!(!provider_failure_is_definitive(&ProviderError::http(
+            409,
+            Some("idempotency_key_in_use".into())
+        )));
+        assert!(!provider_failure_is_definitive(&ProviderError::http(
+            500,
+            Some("api_error".into())
+        )));
+        assert!(!provider_failure_is_definitive(&ProviderError::transport()));
+        assert!(!provider_failure_is_definitive(
+            &ProviderError::malformed_response()
+        ));
     }
 
     #[test]

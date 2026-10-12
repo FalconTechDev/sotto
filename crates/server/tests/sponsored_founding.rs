@@ -153,11 +153,13 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     let provider_item_id = format!("si_founding_{fixture}");
     let event_id = format!("evt_founding_{fixture}");
     let replay_event_id = format!("evt_founding_replay_{fixture}");
+    let terminal_event_id = format!("evt_founding_terminal_{fixture}");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after unix epoch")
         .as_secs() as i64;
     let quote_expiry = now + 1_800;
+    let late_quote_expiry = now - 90;
     let period_end = now + 30 * 24 * 60 * 60;
 
     sqlx::query("INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'github', $1), ($2, 'github', $2), ($3, 'github', $3), ($4, 'github', $4)")
@@ -198,8 +200,8 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         "INSERT INTO billing_sponsored_operations \
          (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
           beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
-          provider_idempotency_key, state) \
-         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'founding_monthly', 1, $7, $8, $9, 'provider_pending')",
+         provider_idempotency_key, provider_subscription_id, state) \
+         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'founding_monthly', 1, $7, $8, $9, $10, 'provider_pending')",
     )
     .bind(&operation_id)
     .bind(&organization_id)
@@ -210,6 +212,7 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     .bind(quote_expiry)
     .bind(now - 60)
     .bind(format!("provider-{fixture}"))
+    .bind(&subscription_id)
     .execute(&pool)
     .await
     .expect("seed sponsored operation");
@@ -217,8 +220,8 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         "INSERT INTO billing_sponsored_operations \
          (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
           beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
-          provider_idempotency_key, state) \
-         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'founding_monthly', 1, $7, $8, $9, 'provider_pending')",
+         provider_idempotency_key, provider_subscription_id, state) \
+         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'founding_monthly', 1, $7, $8, $9, $10, 'provider_pending')",
     )
     .bind(&refunded_operation_id)
     .bind(&organization_id)
@@ -226,9 +229,10 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     .bind(format!("idempotency-refunded-{fixture}"))
     .bind(format!("request-refunded-{fixture}"))
     .bind(&refunded_beneficiary_id)
-    .bind(quote_expiry)
+    .bind(late_quote_expiry)
     .bind(now - 30)
     .bind(format!("provider-refunded-{fixture}"))
+    .bind(&subscription_id)
     .execute(&pool)
     .await
     .expect("seed late sponsored operation");
@@ -237,7 +241,7 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
          (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
           beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
           provider_idempotency_key, state, result_code) \
-         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'standard_monthly', 1, $7, $8, $9, 'failed', 'checkout_expired')",
+         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'founding_monthly', 1, $7, $8, $9, 'failed', 'checkout_expired')",
     )
     .bind(&expired_standard_operation_id)
     .bind(&organization_id)
@@ -250,7 +254,21 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
     .bind(format!("provider-standard-expired-{fixture}"))
     .execute(&pool)
     .await
-    .expect("seed expired standard operation");
+    .expect("seed expired founding Checkout operation");
+    sqlx::query(
+        "INSERT INTO billing_founding_reservations \
+         (reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
+          quote_expires_at_epoch, reservation_expires_at_epoch, status) \
+         VALUES ($1, $2, $3, 'sponsor', $4, 'founding_monthly', 1, $5, $5, 'released')",
+    )
+    .bind(format!("founding:{expired_standard_operation_id}"))
+    .bind(&expired_standard_operation_id)
+    .bind(&expired_standard_beneficiary_id)
+    .bind(&organization_id)
+    .bind(quote_expiry)
+    .execute(&pool)
+    .await
+    .expect("seed released founding reservation for expired Checkout");
     sqlx::query(
         "INSERT INTO billing_sponsored_seats \
          (seat_id, organization_id, beneficiary_id, offer, effective_from, state, operation_id) \
@@ -308,25 +326,18 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
             &organization_id,
             FoundingOffer::Monthly,
             1,
-            quote_expiry,
-            period_end + sotto_server::founding_allocator::SPONSORED_SETTLEMENT_RECOVERY_SECONDS,
-            now,
+            late_quote_expiry,
+            now - 1,
+            now - 100,
         )
         .await
         .expect("reserve second founding place"),
         ReservationOutcome::Created(_)
     ));
-    sponsored_billing::cancel_failed_operation(
-        &mut late_reservation_tx,
-        &refunded_operation_id,
-        "checkout_expired",
-    )
-    .await
-    .expect("expire second checkout and release its reservation");
     late_reservation_tx
         .commit()
         .await
-        .expect("commit released reservation");
+        .expect("commit late settlement reservation");
 
     let app = app(pool.clone());
     let invoice = serde_json::json!({
@@ -487,12 +498,15 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         Option<String>,
         String,
         Option<String>,
+        Option<String>,
+        String,
     ) = sqlx::query_as(
         "SELECT failed.state, failed.result_code, failed.provider_payment_reference, \
-                    standard.state, standard.result_code \
+                    expired.state, expired.result_code, expired.provider_payment_reference, reservation.status \
              FROM billing_sponsored_operations AS failed \
-             CROSS JOIN billing_sponsored_operations AS standard \
-             WHERE failed.operation_id = $1 AND standard.operation_id = $2",
+             CROSS JOIN billing_sponsored_operations AS expired \
+             JOIN billing_founding_reservations AS reservation ON reservation.operation_id = expired.operation_id \
+             WHERE failed.operation_id = $1 AND expired.operation_id = $2",
     )
     .bind(&refunded_operation_id)
     .bind(&expired_standard_operation_id)
@@ -507,6 +521,181 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
             Some(format!("pi_founding_{fixture}")),
             "failed".into(),
             Some("checkout_expired".into()),
+            None,
+            "released".into(),
+        )
+    );
+
+    let abandoned_operation_id = format!("sponsored:founding-abandoned-checkout-{fixture}");
+    let abandoned_reservation_id = format!("founding:{abandoned_operation_id}");
+    let abandoned_deadline = now - sotto_server::founding_allocator::RESERVATION_SECONDS - 60;
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, state) \
+         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'founding_monthly', 1, $7, $8, $9, 'pending')",
+    )
+    .bind(&abandoned_operation_id)
+    .bind(&organization_id)
+    .bind(&owner_id)
+    .bind(format!("idempotency-abandoned-{fixture}"))
+    .bind(format!("request-abandoned-{fixture}"))
+    .bind(&expired_standard_beneficiary_id)
+    .bind(abandoned_deadline)
+    .bind(abandoned_deadline)
+    .bind(format!("provider-abandoned-{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("seed abandoned checkout operation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_seats \
+         (seat_id, organization_id, beneficiary_id, offer, effective_from, state, operation_id) \
+         VALUES ($1, $2, $3, 'founding_monthly', $4, 'pending', $5)",
+    )
+    .bind(format!("seat-abandoned-{fixture}"))
+    .bind(&organization_id)
+    .bind(&expired_standard_beneficiary_id)
+    .bind(abandoned_deadline)
+    .bind(&abandoned_operation_id)
+    .execute(&pool)
+    .await
+    .expect("seed abandoned checkout seat");
+    sqlx::query(
+        "INSERT INTO billing_founding_reservations \
+         (reservation_id, operation_id, beneficiary_id, payer_kind, payer_id, offer, quote_version, \
+          quote_expires_at_epoch, reservation_expires_at_epoch, status) \
+         VALUES ($1, $2, $3, 'sponsor', $4, 'founding_monthly', 1, $5, $5, 'reserved')",
+    )
+    .bind(&abandoned_reservation_id)
+    .bind(&abandoned_operation_id)
+    .bind(&expired_standard_beneficiary_id)
+    .bind(&organization_id)
+    .bind(abandoned_deadline)
+    .execute(&pool)
+    .await
+    .expect("seed expired founding reservation");
+    let mut abandoned_tx = pool.begin().await.expect("begin abandoned cleanup");
+    sotto_server::founding_allocator::lock_capacity(&mut abandoned_tx)
+        .await
+        .expect("lock capacity before abandoning checkout");
+    assert_eq!(
+        sponsored_billing::cancel_expired_pending_checkouts(
+            &mut abandoned_tx,
+            &organization_id,
+            &expired_standard_beneficiary_id,
+            now,
+        )
+        .await
+        .expect("release expired checkout attempt"),
+        1
+    );
+    abandoned_tx
+        .commit()
+        .await
+        .expect("commit abandoned checkout cleanup");
+    let abandoned_state: (String, Option<String>, String, String) = sqlx::query_as(
+        "SELECT operation.state, operation.result_code, reservation.status, seat.state \
+         FROM billing_sponsored_operations AS operation \
+         JOIN billing_founding_reservations AS reservation USING (operation_id) \
+         JOIN billing_sponsored_seats AS seat USING (operation_id) \
+         WHERE operation.operation_id = $1",
+    )
+    .bind(&abandoned_operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load expired checkout cleanup result");
+    assert_eq!(
+        abandoned_state,
+        (
+            "failed".into(),
+            Some("checkout_reservation_expired".into()),
+            "released".into(),
+            "canceled".into(),
+        )
+    );
+
+    let terminal_operation_id = format!("sponsored:founding-terminal-operation-{fixture}");
+    let terminal_reservation_id = format!("founding:{terminal_operation_id}");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, provider_subscription_id, state) \
+         VALUES ($1, $2, $3, $4, $5, 'add', $6, 'founding_monthly', 1, $7, $8, $9, $10, 'pending')",
+    )
+    .bind(&terminal_operation_id)
+    .bind(&organization_id)
+    .bind(&owner_id)
+    .bind(format!("idempotency-terminal-{fixture}"))
+    .bind(format!("request-terminal-{fixture}"))
+    .bind(&expired_standard_beneficiary_id)
+    .bind(quote_expiry)
+    .bind(now + 30)
+    .bind(format!("provider-terminal-{fixture}"))
+    .bind(&subscription_id)
+    .execute(&pool)
+    .await
+    .expect("seed pending sponsored operation for terminal subscription");
+    let mut terminal_reservation_tx = pool.begin().await.expect("begin terminal reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut terminal_reservation_tx,
+            &terminal_reservation_id,
+            &terminal_operation_id,
+            &expired_standard_beneficiary_id,
+            FoundingPayerKind::Sponsor,
+            &organization_id,
+            FoundingOffer::Monthly,
+            1,
+            quote_expiry,
+            period_end + sotto_server::founding_allocator::SPONSORED_SETTLEMENT_RECOVERY_SECONDS,
+            now,
+        )
+        .await
+        .expect("reserve founding place before subscription deletion"),
+        ReservationOutcome::Created(_)
+    ));
+    terminal_reservation_tx
+        .commit()
+        .await
+        .expect("commit terminal reservation");
+
+    let subscription_deleted = serde_json::json!({
+        "id": terminal_event_id,
+        "created": now + 2,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": subscription_id,
+            "customer": customer_id,
+            "status": "canceled",
+            "metadata": { "organization_id": organization_id }
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &subscription_deleted).await,
+        StatusCode::OK
+    );
+    let terminal_result: (String, Option<String>, String, String) = sqlx::query_as(
+        "SELECT operation.state, operation.result_code, reservation.status, subscription.status \
+         FROM billing_sponsored_operations AS operation \
+         JOIN billing_founding_reservations AS reservation ON reservation.operation_id = operation.operation_id \
+         JOIN billing_sponsored_subscriptions AS subscription USING (organization_id) \
+         WHERE operation.operation_id = $1",
+    )
+    .bind(&terminal_operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load operation after terminal subscription event");
+    assert_eq!(
+        terminal_result,
+        (
+            "failed".into(),
+            Some("subscription_ended".into()),
+            "released".into(),
+            "canceled".into(),
         )
     );
 
@@ -545,6 +734,11 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         .execute(&pool)
         .await
         .expect("clean replay webhook receipt");
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+        .bind(terminal_event_id)
+        .execute(&pool)
+        .await
+        .expect("clean terminal webhook receipt");
     sqlx::query("DELETE FROM billing_founding_reservations WHERE beneficiary_id = $1")
         .bind(&beneficiary_id)
         .execute(&pool)
@@ -555,6 +749,16 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         .execute(&pool)
         .await
         .expect("clean released founding reservation");
+    sqlx::query("DELETE FROM billing_founding_reservations WHERE beneficiary_id = $1")
+        .bind(&expired_standard_beneficiary_id)
+        .execute(&pool)
+        .await
+        .expect("clean expired and terminal founding reservations");
+    sqlx::query("DELETE FROM billing_founding_reservations WHERE operation_id = $1")
+        .bind(&terminal_operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean terminal founding reservation");
     sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
         .bind(&beneficiary_id)
         .execute(&pool)
