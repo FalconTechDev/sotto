@@ -219,8 +219,15 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
   }));
 }
 
+export type PersonalBillingTerm = "monthly" | "annual";
+export type PersonalBillingOffer =
+  | "standard_monthly"
+  | "standard_annual"
+  | "founding_monthly"
+  | "founding_annual";
+
 export interface PersonalQuote {
-  offer: "monthly" | "annual";
+  offer: PersonalBillingOffer;
   amountPence: number;
   currency: string;
   interval: string;
@@ -233,9 +240,10 @@ export interface PersonalQuote {
   nextRenewalAmountPence: number;
 }
 
-export async function fetchPersonalQuote(offer: PersonalQuote["offer"]): Promise<PersonalQuote> {
+export async function fetchPersonalQuote(term: PersonalBillingTerm): Promise<PersonalQuote> {
+  const offer = term === "monthly" ? "standard_monthly" : "standard_annual";
   const body = await authedJson<{
-    offer: PersonalQuote["offer"];
+    offer: PersonalBillingOffer;
     amount_pence: number;
     currency: string;
     interval: string;
@@ -269,7 +277,7 @@ export interface PersonalCheckoutResult {
 }
 
 export async function createPersonalCheckout(input: {
-  offer: PersonalQuote["offer"];
+  offer: PersonalBillingOffer;
   idempotencyKey: string;
   quoteVersion: number;
   quoteExpiresAtEpoch: number;
