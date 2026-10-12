@@ -17,6 +17,7 @@ import {
   type Entitlements,
   type Member,
   type Org,
+  type SponsoredQuote,
 } from "./api";
 import { decryptOrgName, openOrgKey, sealGrantTo } from "./vault";
 import { OrganisationDeletionPanel } from "./OrganisationDeletionPanel";
@@ -99,6 +100,7 @@ export function TeamPanel({
   const [sponsoredReplacement, setSponsoredReplacement] = useState("");
   const [sponsoredUntil, setSponsoredUntil] = useState("");
   const [sponsoredBusy, setSponsoredBusy] = useState(false);
+  const [sponsoredQuote, setSponsoredQuote] = useState<SponsoredQuote | null>(null);
   const orgLoadGeneration = useRef(0);
   const billingGeneration = useRef(0);
   const inviteInFlight = useRef(false);
@@ -131,6 +133,8 @@ export function TeamPanel({
     const isCurrent = () => generation === orgLoadGeneration.current;
     ++billingGeneration.current;
     setBillingBusy(false);
+    setSponsoredBusy(false);
+    setSponsoredQuote(null);
     setError(null);
     setNotice(null);
     setOpenOrg(no);
@@ -141,6 +145,7 @@ export function TeamPanel({
     setDeletionActive(false);
     setSponsoredSeats([]);
     setSponsoredAvailable(null);
+    setSponsoredQuote(null);
     try {
       const nextMembers = await fetchMembers(no.org.id);
       if (!isCurrent()) return;
@@ -182,23 +187,30 @@ export function TeamPanel({
 
   async function addSponsoredSeat() {
     if (openOrg === null || sponsoredBeneficiary.trim() === "") return;
+    const orgId = openOrg.org.id;
+    const generation = orgLoadGeneration.current;
+    const isCurrent = () => generation === orgLoadGeneration.current;
     setSponsoredBusy(true);
     setError(null);
     try {
       const beneficiaryId = sponsoredBeneficiary.trim();
-      const offer: BillingOffer = "standard_monthly";
-      const quote = await fetchSponsoredQuote(openOrg.org.id, {
+      if (sponsoredQuote === null) {
+        const offer: BillingOffer = "standard_monthly";
+        const quotedBeneficiaryId = sponsoredAction === "replace" ? sponsoredReplacement.trim() : beneficiaryId;
+        const quote = await fetchSponsoredQuote(orgId, {
+          action: sponsoredAction,
+          offer,
+          beneficiaryIds: [quotedBeneficiaryId],
+        });
+        if (!isCurrent()) return;
+        setSponsoredQuote(quote);
+        return;
+      }
+      const quote = sponsoredQuote;
+      const effectiveFrom = Math.min(Math.floor(Date.now() / 1000) + 30, quote.quoteExpiresAtEpoch - 1);
+      const result = await createSponsoredCheckout(orgId, {
         action: sponsoredAction,
-        offer,
-        beneficiaryIds: [beneficiaryId],
-      });
-      const effectiveFrom = Math.min(
-        Math.floor(Date.now() / 1000) + 30,
-        quote.quoteExpiresAtEpoch - 1,
-      );
-      const result = await createSponsoredCheckout(openOrg.org.id, {
-        action: sponsoredAction,
-        offer,
+        offer: quote.offer,
         beneficiaryId,
         replacementBeneficiaryId: sponsoredAction === "replace" ? sponsoredReplacement.trim() : undefined,
         quoteVersion: quote.quoteVersion,
@@ -208,6 +220,7 @@ export function TeamPanel({
         idempotencyKey: crypto.randomUUID(),
         returnUrl: window.location.origin,
       });
+      if (!isCurrent()) return;
       if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
       else setNotice("Seat checkout is pending provider confirmation. Reload shortly.");
     } catch (e) {
@@ -395,11 +408,26 @@ export function TeamPanel({
                 </ul>
               )}
               <form className="row" onSubmit={(e) => { e.preventDefault(); void addSponsoredSeat(); }}>
-                <label>Change <select value={sponsoredAction} onChange={(e) => setSponsoredAction(e.target.value as "add" | "remove" | "replace")} disabled={sponsoredBusy}><option value="add">Add seat</option><option value="remove">Remove seat</option><option value="replace">Replace seat</option></select></label>
-                <label>Beneficiary user id<input value={sponsoredBeneficiary} onChange={(e) => setSponsoredBeneficiary(e.target.value)} disabled={sponsoredBusy} /></label>
-                {sponsoredAction === "replace" && <label>Replacement user id<input value={sponsoredReplacement} onChange={(e) => setSponsoredReplacement(e.target.value)} disabled={sponsoredBusy} /></label>}
-                {sponsoredAction !== "add" && <label>Effective until<input type="date" value={sponsoredUntil} onChange={(e) => setSponsoredUntil(e.target.value)} disabled={sponsoredBusy} required /></label>}
-                <button type="submit" disabled={sponsoredBusy || sponsoredBeneficiary.trim() === "" || (sponsoredAction === "replace" && sponsoredReplacement.trim() === "")}>{sponsoredBusy ? "Preparing…" : sponsoredAction === "add" ? "Add seat" : sponsoredAction === "remove" ? "Schedule removal" : "Schedule replacement"}</button>
+                <label>Change <select value={sponsoredAction} onChange={(e) => { setSponsoredQuote(null); setSponsoredAction(e.target.value as "add" | "remove" | "replace"); }} disabled={sponsoredBusy}><option value="add">Add seat</option><option value="remove">Remove seat</option><option value="replace">Replace seat</option></select></label>
+                <label>Beneficiary user id<input value={sponsoredBeneficiary} onChange={(e) => { setSponsoredQuote(null); setSponsoredBeneficiary(e.target.value); }} disabled={sponsoredBusy} /></label>
+                {sponsoredAction === "replace" && <label>Replacement user id<input value={sponsoredReplacement} onChange={(e) => { setSponsoredQuote(null); setSponsoredReplacement(e.target.value); }} disabled={sponsoredBusy} /></label>}
+                {sponsoredAction !== "add" && <label>Effective until<input type="date" value={sponsoredUntil} onChange={(e) => { setSponsoredQuote(null); setSponsoredUntil(e.target.value); }} disabled={sponsoredBusy} required /></label>}
+                {sponsoredQuote !== null && (
+                  <div role="status" className="notice">
+                    <p>
+                      {sponsoredAction === "remove"
+                        ? "This schedules removal of the named seat. The current subscription charge continues until the effective date."
+                        : <>
+                            {new Intl.NumberFormat("en-GB", { style: "currency", currency: sponsoredQuote.currency.toUpperCase() }).format(sponsoredQuote.amountPence / 100)} per {sponsoredQuote.interval}.
+                            {sponsoredQuote.founding
+                              ? ` Founding price applies ${sponsoredQuote.foundingTerm}; after that, ${new Intl.NumberFormat("en-GB", { style: "currency", currency: sponsoredQuote.currency.toUpperCase() }).format(sponsoredQuote.nextRenewalAmountPence / 100)} per ${sponsoredQuote.interval}.`
+                              : " This is the standard recurring price."}
+                          </>}
+                    </p>
+                    <button type="button" onClick={() => setSponsoredQuote(null)} disabled={sponsoredBusy}>Change quote</button>
+                  </div>
+                )}
+                <button type="submit" disabled={sponsoredBusy || sponsoredBeneficiary.trim() === "" || (sponsoredAction === "replace" && sponsoredReplacement.trim() === "")}>{sponsoredBusy ? "Preparing…" : sponsoredQuote !== null ? "Continue to checkout" : sponsoredAction === "add" ? "Review seat price" : sponsoredAction === "remove" ? "Review removal" : "Review replacement"}</button>
               </form>
             </section>
           )}

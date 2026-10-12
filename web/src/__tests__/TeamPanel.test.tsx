@@ -390,15 +390,20 @@ describe("TeamPanel billing request ownership", () => {
     vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
   });
 
-  it("uses the canonical offer for sponsored quotes and checkout", async () => {
+  it("uses the server selected offer for sponsored checkout", async () => {
     vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
       action: "add",
+      offer: "founding_monthly",
       seatCount: 1,
-      amountPence: 299,
+      amountPence: 199,
       currency: "gbp",
       interval: "month",
       quoteVersion: 1,
       quoteExpiresAtEpoch: 2_000_000_000,
+      founding: true,
+      foundingRemainingPlaces: 42,
+      foundingTerm: "for the first monthly billing term",
+      nextRenewalAmountPence: 299,
     });
     vi.mocked(api.createSponsoredCheckout).mockResolvedValue({
       operationId: "sponsored-operation-1",
@@ -412,8 +417,12 @@ describe("TeamPanel billing request ownership", () => {
     fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
       target: { value: "beneficiary-a" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Add seat" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
 
+    expect(await screen.findByText(/£1\.99 per month/)).toBeInTheDocument();
+    expect(screen.getByText(/£2\.99 per month/)).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
     expect(await screen.findByText(/pending provider confirmation/)).toBeInTheDocument();
     expect(api.fetchSponsoredQuote).toHaveBeenCalledWith("org-a", {
       action: "add",
@@ -424,7 +433,7 @@ describe("TeamPanel billing request ownership", () => {
       "org-a",
       expect.objectContaining({
         action: "add",
-        offer: "standard_monthly",
+        offer: "founding_monthly",
         beneficiaryId: "beneficiary-a",
       }),
     );
