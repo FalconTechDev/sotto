@@ -1305,12 +1305,17 @@ struct SponsoredQuoteRequest {
 #[derive(Debug, Serialize)]
 struct SponsoredQuoteView {
     action: String,
+    offer: String,
     seat_count: i64,
     amount_pence: i64,
     currency: &'static str,
     interval: &'static str,
     quote_version: i64,
     quote_expires_at_epoch: i64,
+    founding: bool,
+    founding_remaining_places: Option<i64>,
+    founding_term: Option<&'static str>,
+    next_renewal_amount_pence: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1376,7 +1381,7 @@ async fn sponsored_quote(
     Json(request): Json<SponsoredQuoteRequest>,
 ) -> Result<Json<SponsoredQuoteView>> {
     let action = SponsoredSeatAction::parse(&request.action).map_err(Error::from)?;
-    if request.beneficiary_ids.is_empty()
+    if request.beneficiary_ids.len() != 1
         || request
             .beneficiary_ids
             .iter()
@@ -1389,10 +1394,10 @@ async fn sponsored_quote(
             != request.beneficiary_ids.len()
     {
         return Err(Error::BadRequest(
-            "beneficiary_ids must contain unique existing accounts".into(),
+            "a sponsored quote must name exactly one unique beneficiary account".into(),
         ));
     }
-    let offer = billing_offer(&request.offer)?;
+    let requested_offer = billing_offer(&request.offer)?;
     let billing = sponsored_sales_config(&state)?;
     let catalogue = billing
         .price_catalogue()
@@ -1414,21 +1419,68 @@ async fn sponsored_quote(
             return Err(Error::NotFound("sponsored beneficiary not found".into()));
         }
     }
-    let quote = sponsored_billing::quote(
-        action,
-        offer,
-        request.beneficiary_ids.len(),
-        sponsored_billing::current_epoch(),
-    )
-    .map_err(Error::from)?;
+    let now = sponsored_billing::current_epoch();
+    let (offer, founding_remaining_places) = if action == SponsoredSeatAction::Remove {
+        (requested_offer, None)
+    } else {
+        let mut tx = state.pool.begin().await?;
+        let selected = founding_allocator::select_offer(
+            &mut tx,
+            &request.beneficiary_ids[0],
+            FoundingOffer::for_billing_offer_interval(requested_offer),
+            None,
+            now,
+        )
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+        let founding_offer = FoundingOffer::from_billing_offer(selected);
+        let remaining = if let Some(founding_offer) = founding_offer {
+            let status = founding_allocator::quote_status(&mut tx, founding_offer, now)
+                .await
+                .map_err(|error| Error::Internal(error.to_string()))?;
+            let subscription_period_end: Option<Option<i64>> = sqlx::query_scalar(
+                "SELECT current_period_end FROM billing_sponsored_subscriptions \
+                 WHERE organization_id = $1 AND provider_subscription_id IS NOT NULL \
+                   AND status IN ('pending', 'active', 'past_due')",
+            )
+            .bind(&org_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if subscription_period_end.is_some_and(|period_end| period_end.is_none()) {
+                return Err(Error::Conflict(
+                    "sponsored subscription period is unavailable; founding quote cannot be issued"
+                        .into(),
+                ));
+            }
+            Some(status.remaining_places)
+        } else {
+            None
+        };
+        tx.rollback().await?;
+        (selected, remaining)
+    };
+    let quote = sponsored_billing::quote(action, offer, request.beneficiary_ids.len(), now)
+        .map_err(Error::from)?;
     Ok(Json(SponsoredQuoteView {
         action: quote.action.as_str().into(),
+        offer: quote.offer.as_str().into(),
         seat_count: quote.seat_count,
         amount_pence: quote.amount_pence,
         currency: quote.currency,
         interval: quote.interval,
         quote_version: quote.quote_version,
         quote_expires_at_epoch: quote.quote_expires_at_epoch,
+        founding: FoundingOffer::from_billing_offer(offer).is_some(),
+        founding_remaining_places,
+        founding_term: FoundingOffer::from_billing_offer(offer).map(|offer| match offer {
+            FoundingOffer::Monthly => "for the first monthly billing term",
+            FoundingOffer::Annual => "for the first annual billing term",
+        }),
+        next_renewal_amount_pence: match FoundingOffer::from_billing_offer(offer) {
+            Some(FoundingOffer::Monthly) => BillingOffer::StandardMonthly.expected_amount_pence(),
+            Some(FoundingOffer::Annual) => BillingOffer::StandardAnnual.expected_amount_pence(),
+            None => offer.expected_amount_pence(),
+        },
     }))
 }
 
@@ -1474,6 +1526,10 @@ async fn sponsored_checkout(
         .map_err(Error::from)?;
     let now = sponsored_billing::current_epoch();
     let mut tx = state.pool.begin().await?;
+    let incoming_beneficiary = request
+        .replacement_beneficiary_id
+        .as_deref()
+        .unwrap_or(&request.beneficiary_id);
     let operation =
         sponsored_billing::begin_operation(&mut tx, &org_id, &user.user_id, &request, now)
             .await
@@ -1487,24 +1543,81 @@ async fn sponsored_checkout(
             provider_checkout_url: operation.provider_checkout_url,
         }));
     }
-    let existing_subscription: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT provider_customer_id, provider_subscription_id \
+    if request.action != SponsoredSeatAction::Remove {
+        let selected_offer = founding_allocator::select_offer(
+            &mut tx,
+            incoming_beneficiary,
+            FoundingOffer::for_billing_offer_interval(offer),
+            Some(&operation.operation_id),
+            now,
+        )
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+        if selected_offer != offer {
+            return Err(Error::Conflict(
+                "sponsored billing quote no longer matches founding availability; refresh the quote".into(),
+            ));
+        }
+    }
+    let existing_subscription: Option<(Option<String>, Option<String>, Option<i64>)> =
+        sqlx::query_as(
+            "SELECT provider_customer_id, provider_subscription_id, current_period_end \
          FROM billing_sponsored_subscriptions \
          WHERE organization_id = $1 AND provider_subscription_id IS NOT NULL \
            AND status IN ('pending', 'active', 'past_due') FOR UPDATE",
-    )
-    .bind(&org_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+        )
+        .bind(&org_id)
+        .fetch_optional(&mut *tx)
+        .await?;
     let existing_customer: Option<String> =
         sqlx::query_scalar("SELECT stripe_customer_id FROM organizations WHERE id = $1")
             .bind(&org_id)
             .fetch_one(&mut *tx)
             .await?;
+
+    if request.action != SponsoredSeatAction::Remove {
+        if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
+            let reservation_expires_at = if let Some((_, Some(_), period_end)) =
+                existing_subscription.as_ref()
+            {
+                let period_end = period_end.ok_or_else(|| {
+                    Error::Conflict(
+                        "sponsored subscription period is unavailable; founding quote cannot be reserved".into(),
+                    )
+                })?;
+                period_end
+                    .checked_add(founding_allocator::SPONSORED_SETTLEMENT_RECOVERY_SECONDS)
+                    .ok_or_else(|| Error::Internal("billing clock overflow".into()))?
+                    .max(request.quote_expires_at_epoch)
+            } else {
+                personal_checkout_expiry(request.quote_expires_at_epoch, now)?
+            };
+            let reservation = founding_allocator::reserve_with_payer_kind_until(
+                &mut tx,
+                &format!("founding:{}", operation.operation_id),
+                &operation.operation_id,
+                incoming_beneficiary,
+                founding_allocator::FoundingPayerKind::Sponsor,
+                &org_id,
+                founding_offer,
+                request.quote_version,
+                request.quote_expires_at_epoch,
+                reservation_expires_at,
+                now,
+            )
+            .await
+            .map_err(|error| Error::Conflict(error.to_string()))?;
+            if matches!(reservation, founding_allocator::ReservationOutcome::Full) {
+                return Err(Error::Conflict(
+                    "founding hosted places are no longer available; refresh the quote".into(),
+                ));
+            }
+        }
+    }
     tx.commit().await?;
 
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let result = if let Some((customer_id, Some(subscription_id))) = existing_subscription {
+    let result = if let Some((customer_id, Some(subscription_id), _)) = existing_subscription {
         let phases = sponsored_provider_phases(
             &state.pool,
             &org_id,
@@ -1768,7 +1881,8 @@ async fn personal_quote(
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
-    let offer = billing_offer(&query.offer)?;
+    let requested_offer = billing_offer(&query.offer)?;
+    let requested_interval = FoundingOffer::for_billing_offer_interval(requested_offer);
     validate_personal_catalogue(billing, catalogue).await?;
     let now = billing_epoch();
     let expires = now
@@ -1804,6 +1918,10 @@ async fn personal_quote(
             "this person already has sponsored hosted coverage".into(),
         ));
     }
+    let offer =
+        founding_allocator::select_offer(&mut tx, &user.user_id, requested_interval, None, now)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
     let amount_pence = offer.expected_amount_pence();
     let interval = offer.expected_interval();
     let founding = FoundingOffer::from_billing_offer(offer);
@@ -1814,8 +1932,8 @@ async fn personal_quote(
         (
             Some(status.remaining_places),
             Some(match founding_offer {
-                FoundingOffer::Monthly => "through the founding monthly term",
-                FoundingOffer::Annual => "through the founding annual term",
+                FoundingOffer::Monthly => "for the first monthly billing term",
+                FoundingOffer::Annual => "for the first annual billing term",
             }),
             status.standard_amount_pence,
         )
@@ -1884,6 +2002,21 @@ async fn personal_checkout(
     let mut checkout_expires_at_epoch = None;
     let operation = match operation {
         BeginOperation::Created(operation) => {
+            let selected_offer = founding_allocator::select_offer(
+                &mut tx,
+                &user.user_id,
+                FoundingOffer::for_billing_offer_interval(offer),
+                Some(&operation.operation_id),
+                billing_epoch(),
+            )
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+            if selected_offer != offer {
+                return Err(Error::Conflict(
+                    "billing quote no longer matches founding availability; refresh the quote"
+                        .into(),
+                ));
+            }
             let expiry = personal_checkout_expiry(request.quote_expires_at_epoch, billing_epoch())?;
             checkout_expires_at_epoch = Some(expiry);
             personal_billing::begin_account(
@@ -1897,14 +2030,16 @@ async fn personal_checkout(
             .await
             .map_err(personal_billing_error)?;
             if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
-                let reservation = founding_allocator::reserve(
+                let reservation = founding_allocator::reserve_with_payer_kind_until(
                     &mut tx,
                     &format!("founding:{}", operation.operation_id),
                     &operation.operation_id,
                     &user.user_id,
+                    founding_allocator::FoundingPayerKind::Personal,
                     &user.user_id,
                     founding_offer,
                     request.quote_version,
+                    request.quote_expires_at_epoch,
                     expiry,
                     billing_epoch(),
                 )
@@ -2986,7 +3121,9 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             "checkout.session.expired" => sponsored_checkout_expired(&mut tx, object).await?,
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
-            "invoice.paid" => invoice_paid(&mut tx, object, billing.price_catalogue()).await?,
+            "invoice.paid" => {
+                invoice_paid(&mut tx, object, event.created, billing.price_catalogue()).await?
+            }
             _ => {}
         },
         EventDisposition::Reconcile | EventDisposition::Ignore => {
@@ -3302,6 +3439,9 @@ async fn checkout_completed(
                 (snapshot.items.len() == 1).then(|| snapshot.items[0].provider_item_id.clone())
             }),
         };
+        if record_sponsored_founding_award(tx, operation_id, &evidence, event_created).await? {
+            return Ok(());
+        }
         sponsored_billing::complete_paid_checkout(tx, operation_id, &evidence)
             .await
             .map_err(Error::from)?;
@@ -3728,13 +3868,14 @@ fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
+    event_created: i64,
     catalogue: Option<&BillingPriceIds>,
 ) -> Result<()> {
     let Some(subscription_id) = invoice_subscription_id(object) else {
         return Ok(());
     };
     if sponsored_billing_enabled()
-        && sponsored_invoice_paid(tx, object, subscription_id, catalogue).await?
+        && sponsored_invoice_paid(tx, object, subscription_id, event_created, catalogue).await?
     {
         return Ok(());
     }
@@ -3772,6 +3913,7 @@ async fn sponsored_invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
     subscription_id: &str,
+    event_created: i64,
     catalogue: Option<&BillingPriceIds>,
 ) -> Result<bool> {
     let Some(catalogue) = catalogue else {
@@ -3795,6 +3937,10 @@ async fn sponsored_invoice_paid(
         .ok_or_else(|| Error::Config("paid sponsored invoice has no payment reference".into()))?;
     let period_end = invoice_period_end(object)
         .ok_or_else(|| Error::Config("paid sponsored invoice has no period end".into()))?;
+    let paid_at = object["status_transitions"]["paid_at"]
+        .as_i64()
+        .or_else(|| object["created"].as_i64())
+        .unwrap_or(event_created);
     let customer_id = object["customer"].as_str().map(str::to_string);
     sqlx::query(
         "INSERT INTO billing_sponsored_subscriptions \
@@ -3828,7 +3974,9 @@ async fn sponsored_invoice_paid(
     }
     let operations: Vec<(String, String)> = sqlx::query_as(
         "SELECT operation_id, offer FROM billing_sponsored_operations \
-         WHERE organization_id = $1 AND state IN ('checkout_created', 'provider_pending') \
+         WHERE organization_id = $1 \
+           AND (state IN ('checkout_created', 'provider_pending') \
+                OR (state = 'failed' AND result_code IN ('checkout_expired', 'founding_refund_required'))) \
            AND effective_from < $2 \
          ORDER BY created_at FOR UPDATE",
     )
@@ -3853,11 +4001,59 @@ async fn sponsored_invoice_paid(
             payment_reference: payment_reference.to_string(),
             provider_item_id,
         };
+        if record_sponsored_founding_award(tx, &operation_id, &evidence, paid_at).await? {
+            continue;
+        }
         sponsored_billing::complete_paid_checkout(tx, &operation_id, &evidence)
             .await
             .map_err(Error::from)?;
     }
     Ok(true)
+}
+
+/// Confirm a sponsor's founding reservation before activating its named seat. Returns true when
+/// payment must remain refund-required instead of becoming coverage.
+async fn record_sponsored_founding_award(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    evidence: &sponsored_billing::SponsoredProviderEvidence,
+    paid_at_epoch: i64,
+) -> Result<bool> {
+    let offer: String = sqlx::query_scalar(
+        "SELECT offer FROM billing_sponsored_operations WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let offer = billing_offer(&offer)?;
+    if FoundingOffer::from_billing_offer(offer).is_none() {
+        return Ok(false);
+    }
+    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(paid_at_epoch)
+        .map_err(|_| Error::Config("sponsored founding payment timestamp is invalid".into()))?;
+    // One organisation invoice can pay for several named founding seats. Keep the allocator's
+    // globally unique payment claim specific to this operation while retaining the unmodified
+    // provider reference in the sponsored operation for refund handling.
+    let allocation_payment_reference = format!("{}:{operation_id}", evidence.payment_reference);
+    match founding_allocator::confirm_payment(
+        tx,
+        &format!("founding:{operation_id}"),
+        &allocation_payment_reference,
+        paid_on,
+        paid_at_epoch,
+    )
+    .await
+    .map_err(|error| Error::Internal(error.to_string()))?
+    {
+        founding_allocator::ConfirmationOutcome::Awarded(_)
+        | founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => Ok(false),
+        founding_allocator::ConfirmationOutcome::RefundRequired => {
+            sponsored_billing::record_founding_refund_required(tx, operation_id, evidence)
+                .await
+                .map_err(Error::from)?;
+            Ok(true)
+        }
+    }
 }
 
 fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i64)> {
