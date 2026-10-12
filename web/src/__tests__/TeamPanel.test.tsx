@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -436,6 +436,82 @@ describe("TeamPanel billing request ownership", () => {
         offer: "founding_monthly",
         beneficiaryId: "beneficiary-a",
       }),
+    );
+  });
+
+  it("requires a fresh sponsored quote after a checkout conflict", async () => {
+    vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
+      action: "add",
+      offer: "founding_monthly",
+      seatCount: 1,
+      amountPence: 199,
+      currency: "gbp",
+      interval: "month",
+      quoteVersion: 1,
+      quoteExpiresAtEpoch: 2_000_000_000,
+      founding: true,
+      foundingRemainingPlaces: 42,
+      foundingTerm: "for the first monthly billing term",
+      nextRenewalAmountPence: 299,
+    });
+    vi.mocked(api.createSponsoredCheckout).mockRejectedValueOnce(new Error("server error (409)"));
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    await screen.findByText(/£1\.99 per month/);
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+
+    expect(await screen.findByText("server error (409)")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    await waitFor(() => expect(api.fetchSponsoredQuote).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "Continue to checkout" })).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays the same sponsored operation after a transient provider error", async () => {
+    vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
+      action: "add",
+      offer: "founding_monthly",
+      seatCount: 1,
+      amountPence: 199,
+      currency: "gbp",
+      interval: "month",
+      quoteVersion: 1,
+      quoteExpiresAtEpoch: 2_000_000_000,
+      founding: true,
+      foundingRemainingPlaces: 42,
+      foundingTerm: "for the first monthly billing term",
+      nextRenewalAmountPence: 299,
+    });
+    vi.mocked(api.createSponsoredCheckout)
+      .mockRejectedValueOnce(new Error("server error (502)"))
+      .mockResolvedValueOnce({
+        operationId: "sponsored-operation-1",
+        state: "provider_pending",
+        checkoutUrl: null,
+      });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    await screen.findByText(/£1\.99 per month/);
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+    await screen.findByText("server error (502)");
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+
+    expect(await screen.findByText(/pending provider confirmation/)).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.createSponsoredCheckout).mock.calls[1]).toEqual(
+      vi.mocked(api.createSponsoredCheckout).mock.calls[0],
     );
   });
 
