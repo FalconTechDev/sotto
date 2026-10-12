@@ -3729,9 +3729,14 @@ async fn record_pending_founding_checkout(
     operation_id: &str,
     event_created: i64,
 ) -> Result<()> {
-    founding_allocator::record_pending_checkout_completion(tx, operation_id, event_created)
-        .await
-        .map_err(|error| Error::Internal(error.to_string()))?;
+    founding_allocator::record_pending_checkout_completion(
+        tx,
+        operation_id,
+        event_created,
+        billing_epoch(),
+    )
+    .await
+    .map_err(|error| Error::Internal(error.to_string()))?;
     Ok(())
 }
 
@@ -3749,6 +3754,7 @@ async fn record_async_payment_founding_checkout(
         operation_id,
         session_expires_at_epoch,
         object["status"].as_str() == Some("complete"),
+        billing_epoch(),
     )
     .await
     .map_err(|error| Error::Internal(error.to_string()))?;

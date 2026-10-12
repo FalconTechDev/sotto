@@ -643,6 +643,7 @@ async fn expired_reservation_is_refunded_even_when_founding_capacity_remains() {
         &mut tx,
         "founding-test-expired-open-capacity-operation",
         now + 2,
+        now + 2,
     )
     .await
     .expect("late Checkout completion cannot extend an expired reservation"));
@@ -659,6 +660,126 @@ async fn expired_reservation_is_refunded_even_when_founding_capacity_remains() {
         ConfirmationOutcome::RefundRequired
     );
     tx.commit().await.expect("commit expired refund decision");
+    cleanup(&pool, fixture).await;
+}
+
+#[tokio::test]
+async fn late_checkout_webhook_does_not_reclaim_a_place_reserved_by_another_buyer() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _guard = TEST_LOCK.get_or_init(|| Mutex::const_new(())).lock().await;
+    let fixture = "late-webhook-capacity";
+    cleanup(&pool, fixture).await;
+    let checkout_created_at = 1_800_000_000;
+    let checkout_completed_at = checkout_created_at + 1_700;
+    let checkout_expiry = checkout_created_at + 100 + 1_800;
+    let webhook_received_at = checkout_expiry + 200;
+
+    let mut original_tx = pool.begin().await.expect("begin original reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut original_tx,
+            "founding-test-late-webhook-capacity-original-reservation",
+            "founding-test-late-webhook-capacity-original-operation",
+            "founding-test-late-webhook-capacity-original-person",
+            FoundingPayerKind::Personal,
+            "founding-test-late-webhook-capacity-payer",
+            FoundingOffer::Monthly,
+            1,
+            checkout_created_at + 100,
+            checkout_expiry,
+            checkout_created_at,
+        )
+        .await
+        .expect("create original reservation"),
+        ReservationOutcome::Created(_)
+    ));
+    original_tx
+        .commit()
+        .await
+        .expect("commit original reservation");
+    seed_awards(&pool, fixture, FOUNDING_CAPACITY - 1).await;
+
+    let mut later_tx = pool.begin().await.expect("begin later reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut later_tx,
+            "founding-test-late-webhook-capacity-later-reservation",
+            "founding-test-late-webhook-capacity-later-operation",
+            "founding-test-late-webhook-capacity-later-person",
+            FoundingPayerKind::Personal,
+            "founding-test-late-webhook-capacity-payer",
+            FoundingOffer::Monthly,
+            1,
+            webhook_received_at + 1_000,
+            webhook_received_at + 1_800,
+            webhook_received_at,
+        )
+        .await
+        .expect("the later buyer reserves the expired place"),
+        ReservationOutcome::Created(_)
+    ));
+    later_tx.commit().await.expect("commit later reservation");
+
+    let mut webhook_tx = pool.begin().await.expect("begin delayed webhook");
+    assert!(!record_pending_checkout_completion(
+        &mut webhook_tx,
+        "founding-test-late-webhook-capacity-original-operation",
+        checkout_completed_at,
+        webhook_received_at,
+    )
+    .await
+    .expect("do not revive an expired reservation after capacity was claimed"));
+    assert!(!record_async_payment_checkout_completion(
+        &mut webhook_tx,
+        "founding-test-late-webhook-capacity-original-operation",
+        checkout_expiry,
+        true,
+        webhook_received_at,
+    )
+    .await
+    .expect("do not revive a completed Session after capacity was claimed"));
+    let stored_expiry: i64 = sqlx::query_scalar(
+        "SELECT reservation_expires_at_epoch FROM billing_founding_reservations \
+         WHERE operation_id = $1",
+    )
+    .bind("founding-test-late-webhook-capacity-original-operation")
+    .fetch_one(&mut *webhook_tx)
+    .await
+    .expect("read original reservation expiry");
+    assert_eq!(stored_expiry, checkout_expiry);
+    webhook_tx.commit().await.expect("commit delayed webhook");
+
+    let mut original_confirm_tx = pool.begin().await.expect("begin original payment result");
+    assert_eq!(
+        confirm_payment(
+            &mut original_confirm_tx,
+            "founding-test-late-webhook-capacity-original-reservation",
+            "founding-test-late-webhook-capacity-original-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            webhook_received_at,
+        )
+        .await
+        .expect("original payment confirmation"),
+        ConfirmationOutcome::RefundRequired
+    );
+    assert!(matches!(
+        confirm_payment(
+            &mut original_confirm_tx,
+            "founding-test-late-webhook-capacity-later-reservation",
+            "founding-test-late-webhook-capacity-later-payment",
+            FoundingDate::new(2026, 1, 1).unwrap(),
+            webhook_received_at,
+        )
+        .await
+        .expect("confirm later buyer"),
+        ConfirmationOutcome::Awarded(_)
+    ));
+    original_confirm_tx
+        .commit()
+        .await
+        .expect("commit payment outcomes");
     cleanup(&pool, fixture).await;
 }
 
@@ -697,6 +818,7 @@ async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
         &mut completed_tx,
         "founding-test-delayed-checkout-payment-operation",
         completed_at,
+        now,
     )
     .await
     .expect("record timely Checkout completion"));
@@ -704,6 +826,7 @@ async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
         &mut completed_tx,
         "founding-test-delayed-checkout-payment-operation",
         completed_at,
+        now,
     )
     .await
     .expect("replay same Checkout completion"));
@@ -777,6 +900,7 @@ async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
         out_of_order_operation,
         out_of_order_expiry + 1,
         true,
+        out_of_order_expiry + 1,
     )
     .await
     .expect("a different Session expiry cannot claim this reservation"));
@@ -785,6 +909,7 @@ async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
         out_of_order_operation,
         out_of_order_expiry,
         false,
+        out_of_order_expiry + 1,
     )
     .await
     .expect("an incomplete Session cannot extend the reservation"));
@@ -793,6 +918,7 @@ async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
         out_of_order_operation,
         out_of_order_expiry,
         true,
+        out_of_order_expiry + 1,
     )
     .await
     .expect("recover timely completion from completed Session"));
@@ -813,6 +939,7 @@ async fn timely_checkout_completion_keeps_delayed_founding_payment_reserved() {
         &mut out_of_order_tx,
         out_of_order_operation,
         out_of_order_expiry - 100,
+        out_of_order_expiry + 5 * 24 * 60 * 60,
     )
     .await
     .expect("later Checkout-completed event replays after async payment success"));

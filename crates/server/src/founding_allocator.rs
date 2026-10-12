@@ -474,12 +474,16 @@ pub async fn record_pending_checkout_completion(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
     checkout_completed_by_epoch: i64,
+    now_epoch: i64,
 ) -> Result<bool, FoundingAllocatorError> {
     validate_identity(operation_id, "operation_id")?;
     if checkout_completed_by_epoch <= 0 {
         return Err(FoundingAllocatorError::InvalidField(
             "checkout_completed_by_epoch",
         ));
+    }
+    if now_epoch <= 0 {
+        return Err(FoundingAllocatorError::InvalidField("now_epoch"));
     }
 
     lock_capacity(tx).await?;
@@ -514,6 +518,11 @@ pub async fn record_pending_checkout_completion(
     if checkout_completed_by_epoch >= reservation_expires_at_epoch {
         return Ok(false);
     }
+    if reservation_expires_at_epoch <= now_epoch && available_places(tx, now_epoch).await? <= 0 {
+        // A delayed webhook must not reclaim a place another checkout reserved after this one
+        // expired. Capacity is serialised by the shared ledger lock held above.
+        return Ok(false);
+    }
     let settlement_deadline = checkout_completed_by_epoch
         .checked_add(SETTLEMENT_RECOVERY_SECONDS)
         .ok_or(FoundingAllocatorError::InvalidField(
@@ -543,6 +552,7 @@ pub async fn record_async_payment_checkout_completion(
     operation_id: &str,
     session_expires_at_epoch: i64,
     session_is_complete: bool,
+    now_epoch: i64,
 ) -> Result<bool, FoundingAllocatorError> {
     validate_identity(operation_id, "operation_id")?;
     if session_expires_at_epoch <= 1 {
@@ -552,6 +562,9 @@ pub async fn record_async_payment_checkout_completion(
     }
     if !session_is_complete {
         return Ok(false);
+    }
+    if now_epoch <= 0 {
+        return Err(FoundingAllocatorError::InvalidField("now_epoch"));
     }
 
     lock_capacity(tx).await?;
@@ -581,9 +594,13 @@ pub async fn record_async_payment_checkout_completion(
     {
         return Ok(true);
     }
-    if status != "reserved"
-        || row.try_get::<i64, _>("reservation_expires_at_epoch")? != session_expires_at_epoch
-    {
+    let reservation_expires_at_epoch: i64 = row.try_get("reservation_expires_at_epoch")?;
+    if status != "reserved" || reservation_expires_at_epoch != session_expires_at_epoch {
+        return Ok(false);
+    }
+    if reservation_expires_at_epoch <= now_epoch && available_places(tx, now_epoch).await? <= 0 {
+        // This event can arrive after the Checkout deadline. Recover its timely completion only
+        // while a founding place remains unclaimed at delivery time.
         return Ok(false);
     }
 
