@@ -1,8 +1,19 @@
 [English](README.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (BR)](README.pt-BR.md)
 
-# Sotto
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="web/public/mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="web/public/mark-light.svg">
+    <img src="web/public/mark-dark.svg" alt="Sotto" width="64" height="64">
+  </picture>
+</p>
 
-End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
+<h1 align="center">Sotto</h1>
+
+<p align="center">
+  <strong>Frictionless secret sync. Zero-knowledge by design.</strong><br>
+  <em>Stop Slacking your <code>.env</code> files. Onboard a dev in seconds.</em>
+</p>
 
 > [!WARNING]
 > Sotto is pre-1.0 and has **not** had a third-party cryptographic audit. It works end to end, but
