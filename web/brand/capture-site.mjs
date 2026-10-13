@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const brandDir = __dirname;
 const distDir = path.resolve(__dirname, '../dist');
-const artifactDir = '/Users/maksgunerka/.gemini/antigravity-cli/brain/3beaccdb-0845-4667-bc67-d83324bf248b';
+const artifactDir = process.env.ARTIFACT_DIR || null;
 
 const MIME = {
   '.html': 'text/html',
@@ -222,14 +222,17 @@ async function capture() {
   fs.writeFileSync(path.join(brandDir, 'getsotto-browser-mockup-light.png'), mockupLightBuffer);
   console.log('✓ Captured light mode previews');
 
-  // 3. Copy all to artifact directory
-  fs.copyFileSync(path.join(brandDir, 'getsotto-hero.png'), path.join(artifactDir, 'getsotto-hero.png'));
-  fs.copyFileSync(path.join(brandDir, 'getsotto-fullpage.png'), path.join(artifactDir, 'getsotto-fullpage.png'));
-  fs.copyFileSync(path.join(brandDir, 'getsotto-browser-mockup.png'), path.join(artifactDir, 'getsotto-browser-mockup.png'));
-  fs.copyFileSync(path.join(brandDir, 'getsotto-hero-light.png'), path.join(artifactDir, 'getsotto-hero-light.png'));
-  fs.copyFileSync(path.join(brandDir, 'getsotto-fullpage-light.png'), path.join(artifactDir, 'getsotto-fullpage-light.png'));
-  fs.copyFileSync(path.join(brandDir, 'getsotto-browser-mockup-light.png'), path.join(artifactDir, 'getsotto-browser-mockup-light.png'));
-  console.log('✓ Synchronized all previews with artifact directory');
+  // 3. Copy all to artifact directory (optional)
+  if (artifactDir) {
+    fs.mkdirSync(artifactDir, { recursive: true });
+    fs.copyFileSync(path.join(brandDir, 'getsotto-hero.png'), path.join(artifactDir, 'getsotto-hero.png'));
+    fs.copyFileSync(path.join(brandDir, 'getsotto-fullpage.png'), path.join(artifactDir, 'getsotto-fullpage.png'));
+    fs.copyFileSync(path.join(brandDir, 'getsotto-browser-mockup.png'), path.join(artifactDir, 'getsotto-browser-mockup.png'));
+    fs.copyFileSync(path.join(brandDir, 'getsotto-hero-light.png'), path.join(artifactDir, 'getsotto-hero-light.png'));
+    fs.copyFileSync(path.join(brandDir, 'getsotto-fullpage-light.png'), path.join(artifactDir, 'getsotto-fullpage-light.png'));
+    fs.copyFileSync(path.join(brandDir, 'getsotto-browser-mockup-light.png'), path.join(artifactDir, 'getsotto-browser-mockup-light.png'));
+    console.log('✓ Synchronized all previews with artifact directory');
+  }
 
   await browser.close();
   server.close();
