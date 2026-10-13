@@ -8,12 +8,9 @@
   </picture>
 </p>
 
-<h1 align="center">Sotto</h1>
+# Sotto
 
-<p align="center">
-  <strong>Frictionless secret sync. Zero-knowledge by design.</strong><br>
-  <em>Stop Slacking your <code>.env</code> files. Onboard a dev in seconds.</em>
-</p>
+End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
 
 > [!WARNING]
 > Sotto is pre-1.0 and has **not** had a third-party cryptographic audit. It works end to end, but
