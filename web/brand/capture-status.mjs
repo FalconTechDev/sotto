@@ -16,7 +16,7 @@ function getMarkSvg(isDark) {
   const strokeColor = isDark ? '#334155' : '#CBD5E1';
   const glowOpacity = isDark ? '0.2' : '0.1';
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" role="img" aria-label="Sotto Mark" class="sotto-mark-svg">
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="106 106 300 300" fill="none" role="img" aria-label="Sotto Mark" class="sotto-mark-svg">
   <defs>
     <linearGradient id="tUpper_${isDark ? 'd' : 'l'}" x1="120" y1="90" x2="380" y2="300" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="${tGrad1Start}" />
@@ -58,7 +58,7 @@ function render90Bars({ pattern = 'pure-green' } = {}) {
       tooltip = `Day ${i}: Scheduled Maintenance (Completed)`;
     } else if (pattern === 'slight-degraded' && i === 18) {
       colorClass = 'bar-warn';
-      tooltip = `Day ${i}: Brief latency convergence`;
+      tooltip = `Day ${i}: Brief latency convergence (Resolved)`;
     } else if (pattern === 'realistic') {
       if (i === 12 || i === 48) {
         colorClass = 'bar-warn';
@@ -69,7 +69,7 @@ function render90Bars({ pattern = 'pure-green' } = {}) {
       }
     }
 
-    bars += `<div class="bar ${colorClass}" title="${tooltip}"></div>`;
+    bars += `<div class="bar ${colorClass}" role="img" aria-label="${tooltip}" tabindex="0" title="${tooltip}"></div>`;
   }
   return bars;
 }
@@ -79,46 +79,44 @@ function buildStatusPageHtml(isDark) {
 
   const services = [
     {
-      name: 'getsotto.co.uk',
+      name: 'API & Ingestion',
       status: 'Operational',
       statusClass: 'status-ok',
       uptime: '100 % uptime',
       pattern: 'pure-green',
+      summary: 'API & Ingestion is 100% operational with no recorded incidents over the past 90 days.',
     },
     {
-      name: 'Web Vault (app.getsotto.co.uk)',
+      name: 'Web Dashboard & Decryption',
       status: 'Operational',
       statusClass: 'status-ok',
       uptime: '99.98 % uptime',
       pattern: 'single-maint',
+      summary: 'Web Dashboard & Decryption is operational. 99.98% historical uptime with 1 scheduled maintenance window completed on day 24.',
     },
     {
-      name: 'Zero-Knowledge Sync & Key Relay',
+      name: 'Cloud KMS & Zero-Knowledge Enclave',
       status: 'Operational',
       statusClass: 'status-ok',
       uptime: '100 % uptime',
       pattern: 'pure-green',
+      summary: 'Cloud KMS & Zero-Knowledge Enclave is 100% operational with continuous zero-knowledge cryptographic verification.',
     },
     {
-      name: 'Ephemeral Share & Burn Service (getsotto.co.uk/s/*)',
-      status: 'Operational',
-      statusClass: 'status-ok',
-      uptime: '100 % uptime',
-      pattern: 'pure-green',
-    },
-    {
-      name: 'CLI Registry & Binary Distribution (crates.io / brew)',
+      name: 'Database Replica & Backup Engine',
       status: 'Operational',
       statusClass: 'status-ok',
       uptime: '99.95 % uptime',
-      pattern: 'realistic',
+      pattern: 'slight-degraded',
+      summary: 'Database Replica & Backup Engine is operational. 99.95% historical uptime with a brief latency convergence resolved on day 18.',
     },
     {
-      name: 'Cryptographic Identity & Auth Services',
+      name: 'Webhooks & Stripe Billing',
       status: 'Operational',
       statusClass: 'status-ok',
       uptime: '100 % uptime',
       pattern: 'pure-green',
+      summary: 'Webhooks & Stripe Billing is 100% operational with verified idempotent ledger processing.',
     },
   ];
 
@@ -152,8 +150,8 @@ function buildStatusPageHtml(isDark) {
       --ink:            #0f172a;
       --ink-dim:        #475569;
       --ink-meta:       #64748b;
-      --ok:             #16a34a;
-      --ok-banner-bg:   #16a34a;
+      --ok:             #15803d;
+      --ok-banner-bg:   #15803d;
       --ok-banner-text: #ffffff;
       --warn:           #d97706;
       --maint:          #0284c7;
@@ -164,6 +162,18 @@ function buildStatusPageHtml(isDark) {
     }
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
 
     body {
       background: var(--bg);
@@ -190,8 +200,10 @@ function buildStatusPageHtml(isDark) {
 
     .header-inner {
       display: flex;
-      align-items: baseline;
+      align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
     }
 
     .wordmark-wrap {
@@ -228,7 +240,8 @@ function buildStatusPageHtml(isDark) {
       font-family: var(--font-mono);
       font-size: 0.8125rem;
       display: flex;
-      gap: 20px;
+      flex-wrap: wrap;
+      gap: 16px;
     }
 
     nav a {
@@ -255,6 +268,8 @@ function buildStatusPageHtml(isDark) {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
     }
 
     .status-banner-left {
@@ -298,6 +313,8 @@ function buildStatusPageHtml(isDark) {
       display: flex;
       align-items: baseline;
       justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
       margin-bottom: 14px;
     }
 
@@ -356,6 +373,7 @@ function buildStatusPageHtml(isDark) {
       font-size: 0.8125rem;
       color: var(--ink-meta);
       font-family: var(--font-sans);
+      flex-wrap: wrap;
     }
 
     .legend-line {
@@ -368,6 +386,29 @@ function buildStatusPageHtml(isDark) {
       color: var(--ink-dim);
       font-weight: 500;
       white-space: nowrap;
+    }
+
+    @media (max-width: 640px) {
+      .container {
+        padding: 0 16px;
+      }
+      .service-row {
+        padding: 18px 16px;
+      }
+      .bars-container {
+        gap: 2px;
+        height: 28px;
+      }
+      .bar {
+        min-width: 1px;
+      }
+      .legend-line {
+        min-width: 8px;
+      }
+      footer {
+        flex-direction: column;
+        gap: 12px;
+      }
     }
 
     /* Footer */
@@ -427,8 +468,9 @@ function buildStatusPageHtml(isDark) {
           <span class="service-name">${s.name}</span>
           <span class="service-status ${s.statusClass}">${s.status}</span>
         </div>
+        <div class="sr-only">${s.summary}</div>
 
-        <div class="bars-container">
+        <div class="bars-container" role="group" aria-label="90-day uptime history for ${s.name}">
           ${render90Bars({ pattern: s.pattern })}
         </div>
 
