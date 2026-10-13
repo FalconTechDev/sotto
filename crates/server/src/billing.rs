@@ -3556,27 +3556,27 @@ async fn prepare_personal_invoice_coverage(
         .await
     {
         Ok(observation) => observation,
-        Err(error) if error.is_retryable() => {
-            return Err(Error::Internal(
-                "personal Stripe invoice read failed".into(),
+        Err(error) if error.is_evidence_rejection() => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_invoice_evidence_rejected",
             ));
         }
         Err(_) => {
-            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
-                "stripe_invoice_evidence_rejected",
+            return Err(Error::Internal(
+                "personal Stripe invoice read failed".into(),
             ));
         }
     };
     let payments = match stripe.invoice_payments(&mut session, &invoice_id).await {
         Ok(payments) => payments,
-        Err(error) if error.is_retryable() => {
-            return Err(Error::Internal(
-                "personal Stripe payment read failed".into(),
+        Err(error) if error.is_evidence_rejection() => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_payment_evidence_rejected",
             ));
         }
         Err(_) => {
-            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
-                "stripe_payment_evidence_rejected",
+            return Err(Error::Internal(
+                "personal Stripe payment read failed".into(),
             ));
         }
     };
