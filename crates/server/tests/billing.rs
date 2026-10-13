@@ -891,6 +891,11 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         "payment":{"type":"payment_intent", "payment_intent":"pi_coverage_person"}
     });
     let listed_invoice = invoice.clone();
+    let mut malformed_invoice = invoice.clone();
+    malformed_invoice
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("id");
     let (origin, stripe_task) = stripe_mock_server(HashMap::from([
         (
             "/v1/account".into(),
@@ -908,6 +913,10 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         (
             format!("/v1/invoices/in_coverage_auth_{fixture}"),
             serde_json::json!({"_http_status":401,"error":{"message":"invalid api key"}}),
+        ),
+        (
+            format!("/v1/invoices/in_coverage_malformed_{fixture}"),
+            malformed_invoice,
         ),
         (
             format!("/v1/invoices/{invoice_id}/lines"),
@@ -957,7 +966,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
     );
 
     let invoice_event = serde_json::json!({
-        "id":format!("evt_coverage_invoice_{fixture}"), "created":now + 4,
+        "id":format!("evt_coverage_invoice_{fixture}"), "created":now + 5,
         "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
         "data":{"object":invoice}
     })
@@ -1026,6 +1035,44 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
             .expect("authentication failure must not be receipted");
     assert_eq!(auth_receipt_count, 0);
 
+    // A Stripe invoice that cannot be decoded is a permanent evidence gap, unlike a
+    // credential failure. Acknowledge the billing event but leave Cloud coverage untouched.
+    let malformed_invoice_id = format!("in_coverage_malformed_{fixture}");
+    let mut malformed_event_invoice = invoice.clone();
+    malformed_event_invoice["id"] = serde_json::json!(malformed_invoice_id);
+    let malformed_event_id = format!("evt_coverage_malformed_invoice_{fixture}");
+    let malformed_event = serde_json::json!({
+        "id":malformed_event_id, "created":now + 2,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":malformed_event_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &malformed_event,
+            Some(&stripe_signature(&malformed_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let malformed_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&malformed_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("malformed invoice receipt");
+    assert_eq!(malformed_receipt, (1, 1));
+    let malformed_coverage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&malformed_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("no coverage receipt for malformed Stripe evidence");
+    assert_eq!(malformed_coverage_rows, 0);
+
     let (eligibility_status, eligibility) = get_eligibility(&app, &token).await;
     assert_eq!(eligibility_status, StatusCode::OK);
     assert_eq!(eligibility["state"], "unavailable");
@@ -1044,7 +1091,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         .expect("invoice line")
         .remove("metadata");
     let missing_binding_event = serde_json::json!({
-        "id":missing_binding_event_id, "created":now + 2,
+        "id":missing_binding_event_id, "created":now + 3,
         "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
         "data":{"object":invoice_without_binding}
     })
@@ -1083,7 +1130,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
     credited_invoice["amount_paid"] = serde_json::json!(0);
     credited_invoice["amount_due"] = serde_json::json!(0);
     let credited_event = serde_json::json!({
-        "id":credited_event_id, "created":now + 3,
+        "id":credited_event_id, "created":now + 4,
         "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
         "data":{"object":credited_invoice}
     })
@@ -1235,7 +1282,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         .remove("metadata");
     let legacy_event_id = format!("evt_coverage_legacy_invoice_{fixture}");
     let legacy_invoice_event = serde_json::json!({
-        "id":legacy_event_id, "created":now + 5,
+        "id":legacy_event_id, "created":now + 6,
         "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
         "data":{"object":legacy_invoice}
     })

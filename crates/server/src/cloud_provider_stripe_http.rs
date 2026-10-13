@@ -149,7 +149,10 @@ impl StripeReadError {
     }
 
     pub(crate) fn is_evidence_rejection(&self) -> bool {
-        matches!(self, Self::Settlement(_) | Self::Observation(_))
+        matches!(
+            self,
+            Self::MalformedResponse(_) | Self::Settlement(_) | Self::Observation(_)
+        )
     }
 
     fn retry_after(&self) -> Option<Duration> {
