@@ -9,13 +9,29 @@
 :root {
   color-scheme: dark;
 
+  /* ---- Monochromatic Scale --------------------------------------------- */
+  --mono-0:    #ffffff;
+  --mono-50:   #f8fafc;
+  --mono-100:  #f1f5f9;
+  --mono-200:  #e2e8f0;
+  --mono-300:  #cbd5e1;
+  --mono-400:  #94a3b8;
+  --mono-500:  #64748b;
+  --mono-600:  #475569;
+  --mono-700:  #334155;
+  --mono-800:  #1e293b;
+  --mono-900:  #0f172a;
+  --mono-950:  #070a10;
+  --mono-1000: #000000;
+
   /* ---- Dark Vault Neutrals (Obsidian Slate → Titanium) ------------------ */
   --paper:        #0b0f17; /* app / page background: deep obsidian slate */
   --paper-raised: #111827; /* lifted surface (fields, cards) */
   --paper-sunk:   #070a10; /* recessed surface (code blocks, secret vaults) */
   --ink:          #f8fafc; /* primary text: titanium near-white */
   --ink-2:        #94a3b8; /* secondary text, technical labels */
-  --ink-3:        #64748b; /* meta, placeholders, disabled */
+  --ink-3:        #94a3b8; /* meta text: contrast-safe (>= 4.5:1 on --paper and --paper-raised) */
+  --disabled:     #64748b; /* disabled-only controls */
   --hairline:     #1e293b; /* borders, rules: precision separation */
   --hairline-2:   #334155; /* inputs, active edges, chamfers */
 
@@ -24,6 +40,11 @@
   --accent-hover:    #38bdf8; /* bright cryo glow */
   --accent-contrast: #050811; /* text on primary accent buttons */
   --accent-glow:     rgba(6, 182, 212, 0.25);
+
+  /* ---- Semantic Accents ------------------------------------------------ */
+  --blue:         #38bdf8;
+  --amber:        #f59e0b;
+  --red:          #fb7185;
 
   /* ---- Links + Focus --------------------------------------------------- */
   --link:         #38bdf8;
@@ -70,24 +91,29 @@
     --paper-raised: #ffffff; /* pure white surface */
     --paper-sunk:   #f1f5f9; /* recessed machined panel */
     --ink:          #0f172a; /* deep slate primary ink */
-    --ink-2:        #475569; /* secondary steel text */
-    --ink-3:        #94a3b8; /* disabled, meta */
+    --ink-2:        #334155; /* secondary steel text */
+    --ink-3:        #475569; /* meta text: contrast-safe (>= 7:1 on --paper and --paper-raised) */
+    --disabled:     #94a3b8; /* disabled-only controls */
     --hairline:     #e2e8f0; /* hairline steel rules */
     --hairline-2:   #cbd5e1; /* input borders */
 
-    --accent:          #0284c7; /* high-contrast cryo cobalt/cyan */
-    --accent-hover:    #0369a1;
+    --accent:          #0369a1; /* high-contrast cryo cobalt (5.86:1 on white) */
+    --accent-hover:    #075985; /* darker hover shade (7.34:1 on white) */
     --accent-contrast: #ffffff;
-    --accent-glow:     rgba(2, 132, 199, 0.15);
+    --accent-glow:     rgba(3, 105, 161, 0.15);
 
-    --link:         #0284c7;
-    --link-visited: #6366f1;
-    --focus:        #0284c7;
+    --blue:         #0284c7;
+    --amber:        #d97706;
+    --red:          #e11d48;
+
+    --link:         #0369a1; /* >= 4.5:1 against #f8fafc and #ffffff */
+    --link-visited: #4f46e5;
+    --focus:        #0369a1;
 
     --alert:        #e11d48;
     --alert-bg:     #fff1f2;
     --alert-border: #fecdd3;
-    --ok:           #059669;
+    --ok:           #047857; /* 4.88:1 on #ecfdf5 (--ok-bg) */
     --ok-bg:        #ecfdf5;
 
     --term-bg:        #0f172a;
