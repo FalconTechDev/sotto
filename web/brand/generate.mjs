@@ -14,7 +14,7 @@ const publicDir = path.resolve(__dirname, '../public');
  * The Interlocking Mechanical 'S' - Mark Only (Transparent background)
  * Precision-engineered from two interlocking titanium tumblers around a cryogenic cyan cipher core.
  */
-function renderMarkSvg({ width = 512, height = 512, mode = 'dark' } = {}) {
+function renderMarkSvg({ width = 512, height = 512, mode = 'dark', viewBox = '106 106 300 300' } = {}) {
   const isDark = mode === 'dark';
   const strokeColor = isDark ? '#334155' : '#CBD5E1';
   const cyanCore = '#06B6D4';
@@ -28,7 +28,7 @@ function renderMarkSvg({ width = 512, height = 512, mode = 'dark' } = {}) {
   const tGrad2End = isDark ? '#64748B' : '#475569';
 
   return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 512 512" fill="none" role="img" aria-label="Sotto Mark">
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="${viewBox}" fill="none" role="img" aria-label="Sotto Mark">
   <defs>
     <!-- Titanium Upper Tumbler Gradient -->
     <linearGradient id="titaniumUpper" x1="120" y1="90" x2="380" y2="300" gradientUnits="userSpaceOnUse">
