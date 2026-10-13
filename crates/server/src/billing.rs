@@ -33,6 +33,13 @@ use crate::auth::AuthUser;
 use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
 use crate::billing_operations::{self, BeginOperation, BillingOperationState};
 use crate::billing_refunds::{self, CorrectionReason, PayerKind};
+use crate::cloud_provider::{
+    accept_provider_invalidation, record_verified_event, register_verified_allocation,
+    AllocationState, PayerKind as ProviderPayerKind, ProviderContext, VerifiedAllocation,
+};
+use crate::cloud_provider_stripe::StripeCoverageConfig;
+use crate::cloud_provider_stripe::{decode_paid_invoice, StripeAllocationBinding};
+use crate::cloud_provider_stripe_http::StripeReadClient;
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
 use crate::founding_allocator::{self, FoundingOffer};
@@ -357,12 +364,19 @@ pub trait SubscriptionProvider: Send + Sync {
         customer: Option<&str>,
         price_id: &str,
         operation_id: &str,
+        allocation_reference: &str,
         idempotency_key: &str,
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
     ) -> ProviderResult<String> {
-        let _ = (price_id, operation_id, idempotency_key, expires_at_epoch);
+        let _ = (
+            price_id,
+            operation_id,
+            allocation_reference,
+            idempotency_key,
+            expires_at_epoch,
+        );
         self.create_checkout(user_id, customer, success_url, cancel_url)
             .await
     }
@@ -504,6 +518,14 @@ pub struct BillingState {
     return_url: String,
     price_catalogue: Option<BillingPriceIds>,
     cloud_sales_enabled: bool,
+    personal_coverage: Option<PersonalCoverageRuntime>,
+}
+
+#[derive(Clone)]
+struct PersonalCoverageRuntime {
+    config: StripeCoverageConfig,
+    client: StripeReadClient,
+    ingest_enabled: bool,
 }
 
 impl BillingState {
@@ -531,7 +553,39 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            personal_coverage: None,
         }
+    }
+
+    pub fn with_personal_coverage(
+        mut self,
+        config: StripeCoverageConfig,
+        client: StripeReadClient,
+        ingest_enabled: bool,
+    ) -> Self {
+        self.personal_coverage = Some(PersonalCoverageRuntime {
+            config,
+            client,
+            ingest_enabled,
+        });
+        self
+    }
+
+    pub fn with_price_catalogue(mut self, catalogue: BillingPriceIds) -> Self {
+        self.price_catalogue = Some(catalogue);
+        self
+    }
+
+    pub(crate) fn personal_coverage(&self) -> Option<(&StripeCoverageConfig, &StripeReadClient)> {
+        self.personal_coverage
+            .as_ref()
+            .map(|runtime| (&runtime.config, &runtime.client))
+    }
+
+    pub(crate) fn personal_coverage_ingest_enabled(&self) -> bool {
+        self.personal_coverage
+            .as_ref()
+            .is_some_and(|runtime| runtime.ingest_enabled)
     }
 
     pub fn with_provider(
@@ -555,6 +609,7 @@ impl BillingState {
             return_url,
             price_catalogue: None,
             cloud_sales_enabled,
+            personal_coverage: None,
         }
     }
 
@@ -566,6 +621,7 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            personal_coverage: None,
         }
     }
 }
@@ -616,6 +672,7 @@ impl SubscriptionProvider for StripeBilling {
         customer: Option<&str>,
         price_id: &str,
         operation_id: &str,
+        allocation_reference: &str,
         idempotency_key: &str,
         expires_at_epoch: i64,
         success_url: &str,
@@ -639,6 +696,10 @@ impl SubscriptionProvider for StripeBilling {
             (
                 "subscription_data[metadata][operation_id]".to_string(),
                 operation_id.to_string(),
+            ),
+            (
+                "subscription_data[metadata][sotto_allocation_reference]".to_string(),
+                allocation_reference.to_string(),
             ),
             ("success_url".to_string(), success_url.to_string()),
             ("cancel_url".to_string(), cancel_url.to_string()),
@@ -2191,6 +2252,12 @@ async fn personal_checkout(
         Some(expiry) => expiry,
         None => personal_checkout_expiry(operation.quote_expires_at_epoch, billing_epoch())?,
     };
+    let allocation_reference: String = sqlx::query_scalar(
+        "SELECT allocation_reference FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_one(&state.pool)
+    .await?;
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
     let checkout_url = billing
         .provider
@@ -2199,6 +2266,7 @@ async fn personal_checkout(
             None,
             &price_id,
             &operation.operation_id,
+            &allocation_reference,
             &operation.provider_idempotency_key,
             checkout_expires_at_epoch,
             &success_url,
@@ -3128,6 +3196,13 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         )));
     }
 
+    let personal_coverage =
+        if event.kind == "invoice.paid" && billing.personal_coverage_ingest_enabled() {
+            prepare_personal_invoice_coverage(&state.pool, billing, &body, signature, now).await?
+        } else {
+            None
+        };
+
     let mut tx = state.pool.begin().await?;
     prune_webhook_events(&mut tx).await?;
     let disposition = record_webhook_event(&mut tx, &event).await?;
@@ -3236,7 +3311,24 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
             "invoice.paid" => {
-                invoice_paid(&mut tx, object, event.created, billing.price_catalogue()).await?
+                invoice_paid(
+                    &mut tx,
+                    object,
+                    event.created,
+                    billing.price_catalogue(),
+                    personal_coverage.as_ref(),
+                )
+                .await?;
+                if let Some(coverage) = &personal_coverage {
+                    accept_personal_invoice_coverage(
+                        &mut tx,
+                        &coverage.context,
+                        &coverage.event,
+                        &coverage.allocation,
+                        true,
+                    )
+                    .await?;
+                }
             }
             _ => {}
         },
@@ -3250,6 +3342,396 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
     Ok(())
+}
+
+struct PreparedPersonalInvoiceCoverage {
+    context: ProviderContext,
+    event: crate::cloud_provider::VerifiedProviderEvent,
+    allocation: VerifiedAllocation,
+    payment_reference: String,
+    period_end: i64,
+}
+
+async fn prepare_personal_invoice_coverage(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    raw_event: &str,
+    signature: &str,
+    now_epoch: i64,
+) -> Result<Option<PreparedPersonalInvoiceCoverage>> {
+    let (coverage_config, stripe) = billing
+        .personal_coverage()
+        .ok_or_else(|| Error::Internal("personal Stripe coverage is not configured".into()))?;
+    let value: serde_json::Value = serde_json::from_str(raw_event)
+        .map_err(|_| Error::BadRequest("malformed invoice event".into()))?;
+    let invoice = value
+        .get("data")
+        .and_then(|data| data.get("object"))
+        .ok_or_else(|| Error::BadRequest("malformed invoice event".into()))?;
+    let subscription_claim = invoice_subscription_id_claim(invoice);
+    let allocation_reference = invoice_allocation_reference_claim(invoice);
+    let looks_personal = invoice_metadata_claim(invoice, "personal_user_id").is_some()
+        || invoice_metadata_claim(invoice, "operation_id").is_some();
+    let known_personal_subscription = if let Some(subscription_id) = subscription_claim.as_deref() {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
+             WHERE stripe_subscription_id = $1)",
+        )
+        .bind(subscription_id)
+        .fetch_one(pool)
+        .await?
+    } else {
+        false
+    };
+    let Some(allocation_reference) = allocation_reference else {
+        if known_personal_subscription || looks_personal {
+            return Err(Error::Internal(
+                "personal invoice allocation reference is missing".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    if !allocation_reference.starts_with("alloc_") {
+        if known_personal_subscription || looks_personal {
+            return Err(Error::Internal(
+                "personal invoice allocation reference is invalid".into(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    let row = sqlx::query(
+        "SELECT user_id, operation_id, allocation_reference, offer, stripe_customer_id, \
+                stripe_subscription_id FROM billing_personal_accounts \
+         WHERE allocation_reference = $1",
+    )
+    .bind(&allocation_reference)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| Error::Internal("personal invoice binding is unavailable".into()))?;
+    let user_id: String = row.try_get("user_id")?;
+    let operation_id: String = row.try_get("operation_id")?;
+    let stored_reference: String = row.try_get("allocation_reference")?;
+    let offer: String = row.try_get("offer")?;
+    let customer_id: String = row
+        .try_get::<Option<String>, _>("stripe_customer_id")?
+        .ok_or_else(|| Error::Internal("personal invoice checkout is not settled".into()))?;
+    let subscription_id: String = row
+        .try_get::<Option<String>, _>("stripe_subscription_id")?
+        .ok_or_else(|| Error::Internal("personal invoice checkout is not settled".into()))?;
+    if stored_reference != allocation_reference
+        || invoice_metadata_claim(invoice, "personal_user_id").is_some_and(|claim| claim != user_id)
+        || invoice_metadata_claim(invoice, "operation_id")
+            .is_some_and(|claim| claim != operation_id)
+    {
+        return Err(Error::Internal(
+            "personal invoice ownership is inconsistent".into(),
+        ));
+    }
+    let invoice_id = invoice
+        .get("id")
+        .and_then(stripe_reference)
+        .ok_or_else(|| Error::Internal("personal invoice identity is missing".into()))?;
+    let customer_claim = invoice
+        .get("customer")
+        .and_then(stripe_reference)
+        .ok_or_else(|| Error::Internal("personal invoice customer is missing".into()))?;
+    let subscription_claim = invoice_subscription_id_claim(invoice)
+        .ok_or_else(|| Error::Internal("personal invoice subscription is missing".into()))?;
+    if customer_claim != customer_id || subscription_claim != subscription_id {
+        return Err(Error::Internal(
+            "personal invoice ownership is inconsistent".into(),
+        ));
+    }
+    let provider_item_id = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|lines| (lines.len() == 1).then(|| &lines[0]))
+        .and_then(|line| line.get("parent"))
+        .and_then(|parent| parent.get("subscription_item_details"))
+        .and_then(|details| details.get("subscription_item"))
+        .and_then(stripe_reference)
+        .ok_or_else(|| Error::Internal("personal invoice item is missing".into()))?;
+    let binding = StripeAllocationBinding::new(
+        allocation_reference.clone(),
+        customer_id.clone(),
+        subscription_id.clone(),
+        provider_item_id,
+        ProviderPayerKind::Personal,
+    )
+    .map_err(|_| Error::Internal("personal invoice binding is invalid".into()))?;
+    let mut session = stripe.session();
+    let observation = stripe
+        .personal_invoice_observation(&mut session, &invoice_id, &binding)
+        .await
+        .map_err(|_| Error::Internal("personal Stripe invoice read failed".into()))?;
+    let payments = stripe
+        .invoice_payments(&mut session, &invoice_id)
+        .await
+        .map_err(|_| Error::Internal("personal Stripe payment read failed".into()))?;
+    if payments.len() != 1 {
+        return Err(Error::Internal(
+            "personal Stripe payment is ambiguous".into(),
+        ));
+    }
+    let settlement = payments[0]
+        .settlement(coverage_config)
+        .map_err(|_| Error::Internal("personal Stripe payment is invalid".into()))?;
+    let evidence = decode_paid_invoice(
+        raw_event.as_bytes(),
+        signature,
+        &billing.webhook_secret,
+        now_epoch,
+        coverage_config,
+        &binding,
+        &settlement,
+    )
+    .map_err(|_| Error::Internal("personal Stripe invoice evidence is invalid".into()))?;
+    if evidence.invoice_id != observation.invoice_id()
+        || evidence.customer_id != observation.customer_id()
+        || evidence.subscription_id != observation.subscription_id()
+        || evidence.provider_item_id != observation.provider_item_id()
+        || evidence.allocation_reference != observation.allocation_reference()
+        || evidence.payment_intent_id != observation.payment_intent_id()
+        || evidence.amount_paid != observation.amount_paid()
+        || evidence.interval.to_string() != observation.interval().to_string()
+        || evidence.period_start != observation.period_start()
+        || evidence.period_end != observation.period_end()
+        || evidence.payment_intent_id != settlement.payment_intent_id()
+        || !billing_offer_matches_price(billing.price_catalogue(), &offer, &evidence.price_id)
+    {
+        return Err(Error::Internal(
+            "personal Stripe invoice evidence changed during read".into(),
+        ));
+    }
+
+    let context = coverage_config
+        .provider_context()
+        .map_err(|_| Error::Internal("personal Stripe context is invalid".into()))?;
+    let stored = sqlx::query(
+        "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
+                payer.provider_customer_id, allocation.provider_subscription_id, \
+                allocation.provider_item_id, allocation.coverage_source_id, allocation.effective_from, \
+                allocation.effective_until, allocation.state, allocation.ownership_evidence_reference, \
+                payer.payer_kind, allocation.provider_account_id, allocation.provider_environment \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.provider_namespace = $1 AND allocation.provider_account_id = $2 \
+           AND allocation.provider_environment = $3 AND allocation.external_allocation_reference = $4",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&allocation_reference)
+    .fetch_optional(pool)
+    .await?;
+    let allocation = VerifiedAllocation::new(
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("allocation_id"))
+            .transpose()?
+            .unwrap_or_else(|| {
+                opaque_provider_id("stripe-personal-allocation", &[&allocation_reference])
+            }),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("payer_id"))
+            .transpose()?
+            .unwrap_or_else(|| {
+                opaque_provider_id(
+                    "stripe-personal-payer",
+                    &[
+                        &context.account_id,
+                        context.environment.as_str(),
+                        &customer_id,
+                    ],
+                )
+            }),
+        customer_id.clone(),
+        ProviderPayerKind::Personal,
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("beneficiary_id"))
+            .transpose()?
+            .unwrap_or_else(|| user_id.clone()),
+        subscription_id.clone(),
+        evidence.provider_item_id.clone(),
+        allocation_reference.clone(),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("coverage_source_id"))
+            .transpose()?
+            .unwrap_or_else(|| {
+                opaque_provider_id("stripe-personal-source", &[&allocation_reference])
+            }),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<i64, _>("effective_from"))
+            .transpose()?
+            .unwrap_or(evidence.period_start),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<Option<i64>, _>("effective_until"))
+            .transpose()?
+            .unwrap_or(None),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("state"))
+            .transpose()?
+            .as_deref()
+            .map(parse_allocation_state)
+            .transpose()?
+            .unwrap_or(AllocationState::Active),
+        stored
+            .as_ref()
+            .map(|row| row.try_get::<String, _>("ownership_evidence_reference"))
+            .transpose()?
+            .unwrap_or_else(|| format!("stripe:personal-operation:{operation_id}")),
+    )
+    .map_err(|_| Error::Internal("personal provider allocation is invalid".into()))?;
+    if stored.as_ref().is_some_and(|row| {
+        row.try_get::<String, _>("beneficiary_id").ok().as_deref()
+            != Some(allocation.beneficiary_id.as_str())
+            || row
+                .try_get::<String, _>("provider_customer_id")
+                .ok()
+                .as_deref()
+                != Some(allocation.provider_customer_id.as_str())
+            || row
+                .try_get::<String, _>("provider_subscription_id")
+                .ok()
+                .as_deref()
+                != Some(allocation.subscription_id.as_str())
+            || row.try_get::<String, _>("provider_item_id").ok().as_deref()
+                != Some(allocation.provider_item_id.as_str())
+            || row.try_get::<String, _>("payer_kind").ok().as_deref() != Some("personal")
+            || row
+                .try_get::<String, _>("provider_account_id")
+                .ok()
+                .as_deref()
+                != Some(context.account_id.as_str())
+            || row
+                .try_get::<String, _>("provider_environment")
+                .ok()
+                .as_deref()
+                != Some(context.environment.as_str())
+    }) {
+        return Err(Error::Internal(
+            "personal provider allocation ownership changed".into(),
+        ));
+    }
+    Ok(Some(PreparedPersonalInvoiceCoverage {
+        context,
+        event: evidence.event,
+        allocation,
+        payment_reference: evidence.payment_intent_id,
+        period_end: evidence.period_end,
+    }))
+}
+
+fn parse_allocation_state(value: &str) -> Result<AllocationState> {
+    match value {
+        "pending" => Ok(AllocationState::Pending),
+        "active" => Ok(AllocationState::Active),
+        "ended" => Ok(AllocationState::Ended),
+        _ => Err(Error::Internal(
+            "personal provider allocation state is invalid".into(),
+        )),
+    }
+}
+
+async fn accept_personal_invoice_coverage(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &crate::cloud_provider::VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    ingest_enabled: bool,
+) -> Result<()> {
+    record_verified_event(tx, context, event)
+        .await
+        .map_err(|_| Error::Internal("personal provider event receipt failed".into()))?;
+    register_verified_allocation(tx, context, allocation)
+        .await
+        .map_err(|_| Error::Internal("personal provider source registration failed".into()))?;
+    accept_provider_invalidation(tx, context, event, allocation, ingest_enabled)
+        .await
+        .map_err(|_| Error::Internal("personal provider invalidation failed".into()))?;
+    Ok(())
+}
+
+fn invoice_allocation_reference_claim(invoice: &serde_json::Value) -> Option<String> {
+    let root = invoice.get("metadata");
+    let parent = invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"));
+    let line = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+        .and_then(|line| line.get("metadata"));
+    [line, parent, root]
+        .into_iter()
+        .flatten()
+        .find_map(|metadata| metadata.get("sotto_allocation_reference"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn invoice_metadata_claim<'a>(invoice: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"))
+        .and_then(|metadata| metadata.get(key))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn invoice_subscription_id_claim(invoice: &serde_json::Value) -> Option<String> {
+    invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("subscription"))
+        .and_then(stripe_reference)
+        .or_else(|| invoice.get("subscription").and_then(stripe_reference))
+}
+
+fn stripe_reference(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+}
+
+fn billing_offer_matches_price(
+    catalogue: Option<&BillingPriceIds>,
+    offer: &str,
+    price_id: &str,
+) -> bool {
+    catalogue.is_some_and(|catalogue| {
+        BillingOffer::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == offer)
+            .is_some_and(|candidate| catalogue.id_for(candidate) == price_id)
+    })
+}
+
+fn opaque_provider_id(prefix: &str, parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    let hash = digest.finalize();
+    format!(
+        "{prefix}:{}",
+        hash.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4054,6 +4536,7 @@ async fn invoice_paid(
     object: &serde_json::Value,
     event_created: i64,
     catalogue: Option<&BillingPriceIds>,
+    verified_personal_invoice: Option<&PreparedPersonalInvoiceCoverage>,
 ) -> Result<()> {
     let Some(subscription_id) = invoice_subscription_id(object) else {
         return Ok(());
@@ -4076,13 +4559,19 @@ async fn invoice_paid(
     founding_allocator::lock_capacity(tx)
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
-    let period_end = invoice_period_end(object)
+    let period_end = verified_personal_invoice
+        .map(|evidence| evidence.period_end)
+        .or_else(|| invoice_period_end(object))
         .ok_or_else(|| Error::Config("paid personal invoice has no period end".into()))?;
     let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
         .map_err(|_| Error::Config("paid personal invoice has invalid period end".into()))?;
-    let payment_reference = object["payment_intent"]
-        .as_str()
-        .or_else(|| object["id"].as_str())
+    let payment_reference = verified_personal_invoice
+        .map(|evidence| evidence.payment_reference.as_str())
+        .or_else(|| {
+            object["payment_intent"]
+                .as_str()
+                .or_else(|| object["id"].as_str())
+        })
         .ok_or_else(|| Error::Config("paid personal invoice has no payment reference".into()))?;
     personal_billing::record_invoice_paid(
         tx,
