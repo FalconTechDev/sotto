@@ -3208,13 +3208,18 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         } else {
             false
         };
-    let personal_coverage = if event.kind == "invoice.paid"
+    let (personal_coverage, coverage_rejection) = if event.kind == "invoice.paid"
         && billing.personal_coverage_ingest_enabled()
         && !processed_duplicate
     {
-        prepare_personal_invoice_coverage(&state.pool, billing, &body, signature, now).await?
+        match prepare_personal_invoice_coverage(&state.pool, billing, &body, signature, now).await?
+        {
+            PersonalInvoiceCoveragePreparation::NotApplicable => (None, None),
+            PersonalInvoiceCoveragePreparation::Prepared(coverage) => (Some(*coverage), None),
+            PersonalInvoiceCoveragePreparation::Rejected(reason) => (None, Some(reason)),
+        }
     } else {
-        None
+        (None, None)
     };
 
     let mut tx = state.pool.begin().await?;
@@ -3355,6 +3360,12 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     }
     mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
+    if let Some(reason) = coverage_rejection {
+        eprintln!(
+            "error: accepted Stripe invoice event {} for billing without personal Cloud coverage: {}",
+            event.id, reason
+        );
+    }
     Ok(())
 }
 
@@ -3366,27 +3377,36 @@ struct PreparedPersonalInvoiceCoverage {
     period_end: i64,
 }
 
+enum PersonalInvoiceCoveragePreparation {
+    NotApplicable,
+    Prepared(Box<PreparedPersonalInvoiceCoverage>),
+    Rejected(&'static str),
+}
+
 async fn prepare_personal_invoice_coverage(
     pool: &sqlx::PgPool,
     billing: &BillingState,
     raw_event: &str,
     signature: &str,
     now_epoch: i64,
-) -> Result<Option<PreparedPersonalInvoiceCoverage>> {
+) -> Result<PersonalInvoiceCoveragePreparation> {
     let (coverage_config, stripe) = billing
         .personal_coverage()
         .ok_or_else(|| Error::Internal("personal Stripe coverage is not configured".into()))?;
-    let value: serde_json::Value = serde_json::from_str(raw_event)
-        .map_err(|_| Error::BadRequest("malformed invoice event".into()))?;
-    let invoice = value
-        .get("data")
-        .and_then(|data| data.get("object"))
-        .ok_or_else(|| Error::BadRequest("malformed invoice event".into()))?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_event) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_payload_malformed",
+        ));
+    };
+    let Some(invoice) = value.get("data").and_then(|data| data.get("object")) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_payload_malformed",
+        ));
+    };
     let subscription_claim = invoice_subscription_id_claim(invoice);
     let allocation_reference = invoice_allocation_reference_claim(invoice);
-    let looks_personal = invoice_metadata_claim(invoice, "personal_user_id").is_some()
-        || invoice_metadata_claim(invoice, "operation_id").is_some();
-    let mut binding_required = if let Some(subscription_id) = subscription_claim.as_deref() {
+    let subscription_binding_required = if let Some(subscription_id) = subscription_claim.as_deref()
+    {
         sqlx::query_scalar::<_, bool>(
             "SELECT stripe_coverage_binding_required FROM billing_personal_accounts \
              WHERE stripe_subscription_id = $1",
@@ -3397,37 +3417,41 @@ async fn prepare_personal_invoice_coverage(
     } else {
         None
     };
-    if binding_required.is_none() && looks_personal {
-        if let (Some(user_id), Some(operation_id)) = (
-            invoice_metadata_claim(invoice, "personal_user_id"),
-            invoice_metadata_claim(invoice, "operation_id"),
-        ) {
-            binding_required = sqlx::query_scalar::<_, bool>(
-                "SELECT stripe_coverage_binding_required FROM billing_personal_accounts \
-                 WHERE user_id = $1 AND operation_id = $2",
-            )
-            .bind(user_id)
-            .bind(operation_id)
-            .fetch_optional(pool)
-            .await?;
-        }
-    }
-    let missing_binding_is_error = binding_required.unwrap_or(looks_personal);
+    let metadata_binding = if let (Some(user_id), Some(operation_id)) = (
+        invoice_metadata_claim(invoice, "personal_user_id"),
+        invoice_metadata_claim(invoice, "operation_id"),
+    ) {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT stripe_coverage_binding_required FROM billing_personal_accounts \
+             WHERE user_id = $1 AND operation_id = $2",
+        )
+        .bind(user_id)
+        .bind(operation_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
     let Some(allocation_reference) = allocation_reference else {
-        if missing_binding_is_error {
-            return Err(Error::Internal(
-                "personal invoice allocation reference is missing".into(),
+        if subscription_binding_required == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_missing",
             ));
         }
-        return Ok(None);
+        if metadata_binding == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_missing",
+            ));
+        }
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
     };
     if !allocation_reference.starts_with("alloc_") {
-        if missing_binding_is_error {
-            return Err(Error::Internal(
-                "personal invoice allocation reference is invalid".into(),
+        if subscription_binding_required == Some(true) || metadata_binding == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_invalid",
             ));
         }
-        return Ok(None);
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
     }
 
     let row = sqlx::query(
@@ -3438,46 +3462,67 @@ async fn prepare_personal_invoice_coverage(
     )
     .bind(&allocation_reference)
     .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| Error::Internal("personal invoice binding is unavailable".into()))?;
+    .await?;
+    let Some(row) = row else {
+        if subscription_binding_required == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_unrecognised",
+            ));
+        }
+        if metadata_binding == Some(true) {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "allocation_reference_unrecognised",
+            ));
+        }
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
+    };
     if !row.try_get::<bool, _>("stripe_coverage_binding_required")? {
-        return Ok(None);
+        return Ok(PersonalInvoiceCoveragePreparation::NotApplicable);
     }
     let user_id: String = row.try_get("user_id")?;
     let operation_id: String = row.try_get("operation_id")?;
     let stored_reference: String = row.try_get("allocation_reference")?;
     let offer: String = row.try_get("offer")?;
-    let customer_id: String = row
-        .try_get::<Option<String>, _>("stripe_customer_id")?
-        .ok_or_else(|| Error::Internal("personal invoice checkout is not settled".into()))?;
-    let subscription_id: String = row
-        .try_get::<Option<String>, _>("stripe_subscription_id")?
-        .ok_or_else(|| Error::Internal("personal invoice checkout is not settled".into()))?;
+    let Some(customer_id) = row.try_get::<Option<String>, _>("stripe_customer_id")? else {
+        return Err(Error::Internal(
+            "personal invoice checkout is not yet linked".into(),
+        ));
+    };
+    let Some(subscription_id) = row.try_get::<Option<String>, _>("stripe_subscription_id")? else {
+        return Err(Error::Internal(
+            "personal invoice checkout is not yet linked".into(),
+        ));
+    };
     if stored_reference != allocation_reference
         || invoice_metadata_claim(invoice, "personal_user_id").is_some_and(|claim| claim != user_id)
         || invoice_metadata_claim(invoice, "operation_id")
             .is_some_and(|claim| claim != operation_id)
     {
-        return Err(Error::Internal(
-            "personal invoice ownership is inconsistent".into(),
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_binding_mismatch",
         ));
     }
-    let invoice_id = invoice
-        .get("id")
-        .and_then(stripe_reference)
-        .ok_or_else(|| Error::Internal("personal invoice identity is missing".into()))?;
-    let customer_claim = invoice
-        .get("customer")
-        .and_then(stripe_reference)
-        .ok_or_else(|| Error::Internal("personal invoice customer is missing".into()))?;
-    let subscription_claim = invoice_subscription_id_claim(invoice)
-        .ok_or_else(|| Error::Internal("personal invoice subscription is missing".into()))?;
+    let Some(invoice_id) = invoice.get("id").and_then(stripe_reference) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_id_missing",
+        ));
+    };
+    let Some(customer_claim) = invoice.get("customer").and_then(stripe_reference) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_customer_missing",
+        ));
+    };
+    let Some(subscription_claim) = invoice_subscription_id_claim(invoice) else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_subscription_missing",
+        ));
+    };
     if customer_claim != customer_id || subscription_claim != subscription_id {
-        return Err(Error::Internal(
-            "personal invoice ownership is inconsistent".into(),
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_binding_mismatch",
         ));
     }
-    let provider_item_id = invoice
+    let Some(provider_item_id) = invoice
         .get("lines")
         .and_then(|lines| lines.get("data"))
         .and_then(serde_json::Value::as_array)
@@ -3486,33 +3531,69 @@ async fn prepare_personal_invoice_coverage(
         .and_then(|parent| parent.get("subscription_item_details"))
         .and_then(|details| details.get("subscription_item"))
         .and_then(stripe_reference)
-        .ok_or_else(|| Error::Internal("personal invoice item is missing".into()))?;
-    let binding = StripeAllocationBinding::new(
+    else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_item_missing",
+        ));
+    };
+    let binding = match StripeAllocationBinding::new(
         allocation_reference.clone(),
         customer_id.clone(),
         subscription_id.clone(),
         provider_item_id,
         ProviderPayerKind::Personal,
-    )
-    .map_err(|_| Error::Internal("personal invoice binding is invalid".into()))?;
+    ) {
+        Ok(binding) => binding,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "invoice_binding_invalid",
+            ));
+        }
+    };
     let mut session = stripe.session();
-    let observation = stripe
+    let observation = match stripe
         .personal_invoice_observation(&mut session, &invoice_id, &binding)
         .await
-        .map_err(|_| Error::Internal("personal Stripe invoice read failed".into()))?;
-    let payments = stripe
-        .invoice_payments(&mut session, &invoice_id)
-        .await
-        .map_err(|_| Error::Internal("personal Stripe payment read failed".into()))?;
+    {
+        Ok(observation) => observation,
+        Err(error) if error.is_retryable() => {
+            return Err(Error::Internal(
+                "personal Stripe invoice read failed".into(),
+            ));
+        }
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_invoice_evidence_rejected",
+            ));
+        }
+    };
+    let payments = match stripe.invoice_payments(&mut session, &invoice_id).await {
+        Ok(payments) => payments,
+        Err(error) if error.is_retryable() => {
+            return Err(Error::Internal(
+                "personal Stripe payment read failed".into(),
+            ));
+        }
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_payment_evidence_rejected",
+            ));
+        }
+    };
     if payments.len() != 1 {
-        return Err(Error::Internal(
-            "personal Stripe payment is ambiguous".into(),
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "payment_count_unsupported",
         ));
     }
-    let settlement = payments[0]
-        .settlement(coverage_config)
-        .map_err(|_| Error::Internal("personal Stripe payment is invalid".into()))?;
-    let evidence = decode_paid_invoice(
+    let settlement = match payments[0].settlement(coverage_config) {
+        Ok(settlement) => settlement,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "payment_settlement_unsupported",
+            ));
+        }
+    };
+    let evidence = match decode_paid_invoice(
         raw_event.as_bytes(),
         signature,
         &billing.webhook_secret,
@@ -3520,8 +3601,14 @@ async fn prepare_personal_invoice_coverage(
         coverage_config,
         &binding,
         &settlement,
-    )
-    .map_err(|_| Error::Internal("personal Stripe invoice evidence is invalid".into()))?;
+    ) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "invoice_evidence_unsupported",
+            ));
+        }
+    };
     if evidence.invoice_id != observation.invoice_id()
         || evidence.customer_id != observation.customer_id()
         || evidence.subscription_id != observation.subscription_id()
@@ -3535,14 +3622,19 @@ async fn prepare_personal_invoice_coverage(
         || evidence.payment_intent_id != settlement.payment_intent_id()
         || !billing_offer_matches_price(billing.price_catalogue(), &offer, &evidence.price_id)
     {
-        return Err(Error::Internal(
-            "personal Stripe invoice evidence changed during read".into(),
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_evidence_changed",
         ));
     }
 
-    let context = coverage_config
-        .provider_context()
-        .map_err(|_| Error::Internal("personal Stripe context is invalid".into()))?;
+    let context = match coverage_config.provider_context() {
+        Ok(context) => context,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "stripe_context_invalid",
+            ));
+        }
+    };
     let stored = sqlx::query(
         "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
                 payer.provider_customer_id, allocation.provider_subscription_id, \
@@ -3560,7 +3652,7 @@ async fn prepare_personal_invoice_coverage(
     .bind(&allocation_reference)
     .fetch_optional(pool)
     .await?;
-    let allocation = VerifiedAllocation::new(
+    let allocation = match VerifiedAllocation::new(
         stored
             .as_ref()
             .map(|row| row.try_get::<String, _>("allocation_id"))
@@ -3622,8 +3714,14 @@ async fn prepare_personal_invoice_coverage(
             .map(|row| row.try_get::<String, _>("ownership_evidence_reference"))
             .transpose()?
             .unwrap_or_else(|| format!("stripe:personal-operation:{operation_id}")),
-    )
-    .map_err(|_| Error::Internal("personal provider allocation is invalid".into()))?;
+    ) {
+        Ok(allocation) => allocation,
+        Err(_) => {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "provider_allocation_invalid",
+            ));
+        }
+    };
     if stored.as_ref().is_some_and(|row| {
         row.try_get::<String, _>("beneficiary_id").ok().as_deref()
             != Some(allocation.beneficiary_id.as_str())
@@ -3651,17 +3749,19 @@ async fn prepare_personal_invoice_coverage(
                 .as_deref()
                 != Some(context.environment.as_str())
     }) {
-        return Err(Error::Internal(
-            "personal provider allocation ownership changed".into(),
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "provider_allocation_mismatch",
         ));
     }
-    Ok(Some(PreparedPersonalInvoiceCoverage {
-        context,
-        event: evidence.event,
-        allocation,
-        payment_reference: evidence.payment_intent_id,
-        period_end: evidence.period_end,
-    }))
+    Ok(PersonalInvoiceCoveragePreparation::Prepared(Box::new(
+        PreparedPersonalInvoiceCoverage {
+            context,
+            event: evidence.event,
+            allocation,
+            payment_reference: evidence.payment_intent_id,
+            period_end: evidence.period_end,
+        },
+    )))
 }
 
 fn parse_allocation_state(value: &str) -> Result<AllocationState> {

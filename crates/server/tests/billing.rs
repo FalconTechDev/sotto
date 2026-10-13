@@ -944,7 +944,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
     );
 
     let invoice_event = serde_json::json!({
-        "id":format!("evt_coverage_invoice_{fixture}"), "created":now + 1,
+        "id":format!("evt_coverage_invoice_{fixture}"), "created":now + 3,
         "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
         "data":{"object":invoice}
     })
@@ -1018,15 +1018,72 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
             Some(&stripe_signature(&missing_binding_event))
         )
         .await,
-        StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::OK
     );
-    let missing_binding_receipts: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM stripe_webhook_events WHERE event_id = $1")
-            .bind(missing_binding_event_id)
-            .fetch_one(&pool)
-            .await
-            .expect("missing-binding webhook receipt count");
-    assert_eq!(missing_binding_receipts, 0);
+    let missing_binding_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(missing_binding_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("missing-binding webhook receipt count");
+    assert_eq!(missing_binding_receipt.0, 1);
+    assert_eq!(missing_binding_receipt.1, 1);
+    let paid_through_after_missing_binding: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("billing update despite missing coverage binding");
+    assert_eq!(paid_through_after_missing_binding, period_end);
+
+    // A fully credited invoice cannot prove Cloud coverage, but its signed paid event still
+    // advances billing and is acknowledged so Stripe does not retry a permanent evidence gap.
+    let credited_event_id = format!("evt_coverage_credited_invoice_{fixture}");
+    let mut credited_invoice = invoice.clone();
+    credited_invoice["amount_paid"] = serde_json::json!(0);
+    credited_invoice["amount_due"] = serde_json::json!(0);
+    let credited_event = serde_json::json!({
+        "id":credited_event_id, "created":now + 2,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":credited_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &credited_event,
+            Some(&stripe_signature(&credited_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let credited_receipt: (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(processed_at) FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&credited_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("credited invoice receipt");
+    assert_eq!(credited_receipt.0, 1);
+    assert_eq!(credited_receipt.1, 1);
+    let credited_coverage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&credited_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("no coverage receipt for unsupported settlement");
+    assert_eq!(credited_coverage_rows, 0);
+    let paid_through_after_credit: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("billing update despite unsupported coverage settlement");
+    assert_eq!(paid_through_after_credit, period_end);
 
     assert_eq!(
         post_webhook(

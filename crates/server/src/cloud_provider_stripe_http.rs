@@ -141,7 +141,7 @@ pub enum StripeReadError {
 }
 
 impl StripeReadError {
-    fn retryable(&self) -> bool {
+    pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
             Self::Transport | Self::Timeout | Self::RateLimited { .. } | Self::Retryable { .. }
@@ -1406,7 +1406,7 @@ impl StripeReadClient {
                 Ok(value) => return Ok(value),
                 Err(error)
                     if method == Method::GET
-                        && error.retryable()
+                        && error.is_retryable()
                         && retries < self.limits.max_retries =>
                 {
                     let backoff = error
