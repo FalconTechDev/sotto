@@ -3196,12 +3196,26 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         )));
     }
 
-    let personal_coverage =
+    let processed_duplicate =
         if event.kind == "invoice.paid" && billing.personal_coverage_ingest_enabled() {
-            prepare_personal_invoice_coverage(&state.pool, billing, &body, signature, now).await?
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events \
+             WHERE event_id = $1 AND processed_at IS NOT NULL)",
+            )
+            .bind(&event.id)
+            .fetch_one(&state.pool)
+            .await?
         } else {
-            None
+            false
         };
+    let personal_coverage = if event.kind == "invoice.paid"
+        && billing.personal_coverage_ingest_enabled()
+        && !processed_duplicate
+    {
+        prepare_personal_invoice_coverage(&state.pool, billing, &body, signature, now).await?
+    } else {
+        None
+    };
 
     let mut tx = state.pool.begin().await?;
     prune_webhook_events(&mut tx).await?;
@@ -3372,19 +3386,35 @@ async fn prepare_personal_invoice_coverage(
     let allocation_reference = invoice_allocation_reference_claim(invoice);
     let looks_personal = invoice_metadata_claim(invoice, "personal_user_id").is_some()
         || invoice_metadata_claim(invoice, "operation_id").is_some();
-    let known_personal_subscription = if let Some(subscription_id) = subscription_claim.as_deref() {
+    let mut binding_required = if let Some(subscription_id) = subscription_claim.as_deref() {
         sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
-             WHERE stripe_subscription_id = $1)",
+            "SELECT stripe_coverage_binding_required FROM billing_personal_accounts \
+             WHERE stripe_subscription_id = $1",
         )
         .bind(subscription_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await?
     } else {
-        false
+        None
     };
+    if binding_required.is_none() && looks_personal {
+        if let (Some(user_id), Some(operation_id)) = (
+            invoice_metadata_claim(invoice, "personal_user_id"),
+            invoice_metadata_claim(invoice, "operation_id"),
+        ) {
+            binding_required = sqlx::query_scalar::<_, bool>(
+                "SELECT stripe_coverage_binding_required FROM billing_personal_accounts \
+                 WHERE user_id = $1 AND operation_id = $2",
+            )
+            .bind(user_id)
+            .bind(operation_id)
+            .fetch_optional(pool)
+            .await?;
+        }
+    }
+    let missing_binding_is_error = binding_required.unwrap_or(looks_personal);
     let Some(allocation_reference) = allocation_reference else {
-        if known_personal_subscription || looks_personal {
+        if missing_binding_is_error {
             return Err(Error::Internal(
                 "personal invoice allocation reference is missing".into(),
             ));
@@ -3392,7 +3422,7 @@ async fn prepare_personal_invoice_coverage(
         return Ok(None);
     };
     if !allocation_reference.starts_with("alloc_") {
-        if known_personal_subscription || looks_personal {
+        if missing_binding_is_error {
             return Err(Error::Internal(
                 "personal invoice allocation reference is invalid".into(),
             ));
@@ -3401,7 +3431,8 @@ async fn prepare_personal_invoice_coverage(
     }
 
     let row = sqlx::query(
-        "SELECT user_id, operation_id, allocation_reference, offer, stripe_customer_id, \
+        "SELECT user_id, operation_id, allocation_reference, stripe_coverage_binding_required, \
+                offer, stripe_customer_id, \
                 stripe_subscription_id FROM billing_personal_accounts \
          WHERE allocation_reference = $1",
     )
@@ -3409,6 +3440,9 @@ async fn prepare_personal_invoice_coverage(
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| Error::Internal("personal invoice binding is unavailable".into()))?;
+    if !row.try_get::<bool, _>("stripe_coverage_binding_required")? {
+        return Ok(None);
+    }
     let user_id: String = row.try_get("user_id")?;
     let operation_id: String = row.try_get("operation_id")?;
     let stored_reference: String = row.try_get("allocation_reference")?;

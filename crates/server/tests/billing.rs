@@ -1093,6 +1093,85 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         sotto_server::cloud_action_policy::ShadowDecision::Allowed
     );
 
+    // A processed redelivery must be acknowledged from its durable receipt without depending
+    // on the current Stripe binding or making another provider read.
+    let replaced_reference = format!("alloc_replaced_{fixture}");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET allocation_reference = $2 WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(replaced_reference)
+    .execute(&pool)
+    .await
+    .expect("replace personal binding after accepted invoice");
+    assert_eq!(
+        post_webhook(
+            &app,
+            &invoice_event,
+            Some(&stripe_signature(&invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET allocation_reference = $2, \
+         stripe_coverage_binding_required = FALSE WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(&allocation_reference)
+    .execute(&pool)
+    .await
+    .expect("mark migrated personal account as legacy-bound");
+
+    // Accounts created before coverage binding was introduced cannot have the new reference in
+    // Stripe metadata. They still receive their billing update, without creating coverage work.
+    let mut legacy_invoice = invoice.clone();
+    legacy_invoice
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("metadata");
+    legacy_invoice["parent"]["subscription_details"]["metadata"] = serde_json::json!({
+        "personal_user_id": user_id,
+        "operation_id": operation_id
+    });
+    legacy_invoice["lines"]["data"][0]
+        .as_object_mut()
+        .expect("invoice line")
+        .remove("metadata");
+    let legacy_event_id = format!("evt_coverage_legacy_invoice_{fixture}");
+    let legacy_invoice_event = serde_json::json!({
+        "id":legacy_event_id, "created":now + 2,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":legacy_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &legacy_invoice_event,
+            Some(&stripe_signature(&legacy_invoice_event))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let legacy_provider_work: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1), \
+                (SELECT count(*) FROM cloud_provider_refresh_jobs WHERE event_id = $1)",
+    )
+    .bind(&legacy_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy invoice must not enqueue provider work");
+    assert_eq!(legacy_provider_work, (0, 0));
+    let legacy_receipt_processed: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+    )
+    .bind(&legacy_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy invoice webhook receipt");
+    assert!(legacy_receipt_processed);
+
     // Remove the queue-owned and provider rows first; the beneficiary/source FKs deliberately
     // prevent ordinary user deletion while evidence exists.
     sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
@@ -1138,6 +1217,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         .bind(vec![
             format!("evt_coverage_invoice_{fixture}"),
             format!("evt_coverage_checkout_{fixture}"),
+            format!("evt_coverage_legacy_invoice_{fixture}"),
         ])
         .execute(&pool)
         .await
@@ -1146,6 +1226,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         .bind(vec![
             format!("evt_coverage_invoice_{fixture}"),
             format!("evt_coverage_checkout_{fixture}"),
+            format!("evt_coverage_legacy_invoice_{fixture}"),
         ])
         .execute(&pool)
         .await

@@ -117,6 +117,7 @@ pub async fn begin_account(
                 "UPDATE billing_personal_accounts SET operation_id = $2, offer = $3, \
                  stripe_customer_id = NULL, stripe_subscription_id = NULL, state = 'pending', \
                  allocation_reference = $5, \
+                 stripe_coverage_binding_required = TRUE, \
                  pending_expires_at_epoch = $4, paid_through_epoch = NULL, \
                  paid_through_date = NULL, payment_reference = NULL, cancel_at_period_end = FALSE, \
                  cancellation_requested_at = NULL, updated_at = now() WHERE user_id = $1",
@@ -135,8 +136,9 @@ pub async fn begin_account(
     let allocation_reference = new_allocation_reference();
     sqlx::query(
         "INSERT INTO billing_personal_accounts \
-         (user_id, operation_id, allocation_reference, offer, pending_expires_at_epoch) \
-         VALUES ($1, $2, $3, $4, $5)",
+         (user_id, operation_id, allocation_reference, stripe_coverage_binding_required, offer, \
+          pending_expires_at_epoch) \
+         VALUES ($1, $2, $3, TRUE, $4, $5)",
     )
     .bind(user_id)
     .bind(operation_id)
