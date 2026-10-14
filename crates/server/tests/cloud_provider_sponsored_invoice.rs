@@ -808,4 +808,168 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     assert_eq!((rejected_state.2, rejected_state.3), (1, 0));
 
     stripe_task.abort();
+
+    let beneficiary_ids = vec![monthly_user.clone(), founding_user.clone()];
+    let event_ids = vec![event_id.clone(), rejected_event_id];
+    let subscription_ids = vec![
+        subscription_id.clone(),
+        personal_subscription.clone(),
+        previous_sponsor_subscription.clone(),
+    ];
+    let customer_ids = vec![
+        customer_id.clone(),
+        personal_customer.clone(),
+        previous_sponsor_customer.clone(),
+    ];
+    let mut cleanup = pool.begin().await.unwrap();
+    sqlx::query(
+        "DELETE FROM stripe_subscription_watermarks \
+         WHERE event_id = ANY($1) OR subscription_id = ANY($2)",
+    )
+    .bind(&event_ids)
+    .bind(&subscription_ids)
+    .execute(&mut *cleanup)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = ANY($1)")
+        .bind(&event_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM billing_founding_reservations \
+         WHERE beneficiary_id = $1 OR payer_id = $2",
+    )
+    .bind(&founding_user)
+    .bind(&organization_id)
+    .execute(&mut *cleanup)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
+        .bind(&founding_user)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_sponsored_seats WHERE organization_id = $1")
+        .bind(&organization_id)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_sponsored_operations WHERE organization_id = $1")
+        .bind(&organization_id)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_sponsored_subscription_items WHERE organization_id = $1")
+        .bind(&organization_id)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id = $1")
+        .bind(&organization_id)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL \
+         WHERE beneficiary_id = ANY($1)",
+    )
+    .bind(&beneficiary_ids)
+    .execute(&mut *cleanup)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE cloud_coverage_heads SET current_revision = NULL WHERE beneficiary_id = ANY($1)",
+    )
+    .bind(&beneficiary_ids)
+    .execute(&mut *cleanup)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = ANY($1)")
+        .bind(&beneficiary_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_collection_attempts WHERE beneficiary_id = ANY($1)")
+        .bind(&beneficiary_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query(
+        "DELETE FROM cloud_provider_stripe_renewal_failures WHERE beneficiary_id = ANY($1)",
+    )
+    .bind(&beneficiary_ids)
+    .execute(&mut *cleanup)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM cloud_provider_sponsored_allocation_terms \
+         WHERE allocation_id IN (SELECT allocation_id FROM cloud_provider_allocations \
+             WHERE beneficiary_id = ANY($1))",
+    )
+    .bind(&beneficiary_ids)
+    .execute(&mut *cleanup)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE beneficiary_id = ANY($1)")
+        .bind(&beneficiary_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = ANY($1)")
+        .bind(&beneficiary_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = ANY($1)")
+        .bind(&beneficiary_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = ANY($1)")
+        .bind(&beneficiary_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = ANY($1)")
+        .bind(&beneficiary_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE provider_customer_id = ANY($1)")
+        .bind(&customer_ids)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1")
+        .bind(&organization_id)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(&organization_id)
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind(vec![owner_id, monthly_user, founding_user])
+        .execute(&mut *cleanup)
+        .await
+        .unwrap();
+    cleanup.commit().await.unwrap();
 }

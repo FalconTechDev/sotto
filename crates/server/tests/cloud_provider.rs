@@ -604,6 +604,16 @@ async fn one_provider_event_tracks_and_completes_each_beneficiary_scope_independ
             InvalidationDisposition::Accepted { generation: 1 }
         );
     }
+    // This test checks fan-out state, not worker claim order. Keep these pending jobs future-due
+    // so the parallel retry test cannot claim them through the global claim_due helper.
+    sqlx::query(
+        "UPDATE cloud_provider_refresh_jobs \
+         SET available_at = now() + interval '1 day' WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .execute(&mut *accept)
+    .await
+    .unwrap();
     accept.commit().await.unwrap();
 
     let scope_count: i64 =
@@ -620,6 +630,15 @@ async fn one_provider_event_tracks_and_completes_each_beneficiary_scope_independ
             .unwrap();
     assert_eq!(scope_count, 2);
     assert_eq!(job_count, 2);
+    let due_job_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_refresh_jobs \
+         WHERE event_id = $1 AND available_at <= now()",
+    )
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(due_job_count, 0);
 
     let collections = allocations
         .iter()
