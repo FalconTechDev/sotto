@@ -6539,6 +6539,158 @@ mod tests {
         .expect("remove webhook fixtures");
     }
 
+    #[tokio::test]
+    async fn authenticated_paid_repair_settles_once_and_duplicate_is_harmless() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+        let options =
+            sqlx::postgres::PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing to write test fixtures to non-local database: {}",
+            options.get_host()
+        );
+        let pool = crate::db::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+
+        let fixture = Uuid::new_v4().simple().to_string();
+        let user_id = format!("user_repair_paid_{fixture}");
+        let operation_id = format!("op_repair_paid_{fixture}");
+        let subscription_id = format!("sub_repair_paid_{fixture}");
+        let event_id = format!("evt_repair_paid_{fixture}");
+        let invoice_id = format!("in_repair_paid_{fixture}");
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'github', $1)",
+        )
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("seed personal billing user");
+        sqlx::query(
+            "INSERT INTO billing_operations \
+             (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
+              offer, quote_version, quote_expires_at_epoch, provider_idempotency_key) \
+             VALUES ($1, $2, $3, $4, $4, $4, 'standard_monthly', 1, 1, $5)",
+        )
+        .bind(&operation_id)
+        .bind(format!("key_{fixture}"))
+        .bind("a".repeat(64))
+        .bind(&user_id)
+        .bind(format!("provider_key_{fixture}"))
+        .execute(&pool)
+        .await
+        .expect("seed billing operation");
+        sqlx::query(
+            "INSERT INTO billing_personal_accounts \
+             (user_id, operation_id, offer, stripe_subscription_id, pending_expires_at_epoch, state) \
+             VALUES ($1, $2, 'standard_monthly', $3, 1, 'active')",
+        )
+        .bind(&user_id)
+        .bind(&operation_id)
+        .bind(&subscription_id)
+        .execute(&pool)
+        .await
+        .expect("seed active personal billing subscription");
+
+        let event_created = 1_950_000_000;
+        let invoice = serde_json::json!({
+            "id": invoice_id,
+            "payment_intent": format!("pi_repair_paid_{fixture}"),
+            "period_end": 1_980_000_000,
+            "parent": {"subscription_details": {"subscription": subscription_id}}
+        });
+        let authenticated = AuthenticatedStripeEvent::for_test(
+            &event_id,
+            "acct_repair_test",
+            ProviderEnvironment::Test,
+            serde_json::json!({
+                "id": event_id,
+                "created": event_created,
+                "api_version": STRIPE_API_VERSION,
+                "type": "invoice.paid",
+                "data": {"object": invoice}
+            }),
+        );
+        let billing = BillingState::from_config(BillingConfig {
+            api_key: "sk_test_repair".into(),
+            webhook_secret: "whsec_repair".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: None,
+            cloud_sales_enabled: false,
+            return_url: "https://getsotto.test".into(),
+        });
+
+        assert_eq!(
+            repair_authenticated_stripe_event(&pool, &billing, &authenticated, event_created)
+                .await
+                .expect("repair paid event through billing handler"),
+            StripeEventRepairDisposition::Applied
+        );
+        assert_eq!(
+            repair_authenticated_stripe_event(&pool, &billing, &authenticated, event_created)
+                .await
+                .expect("replay the already processed paid event"),
+            StripeEventRepairDisposition::AlreadyApplied
+        );
+        let account: (String, i64, String) = sqlx::query_as(
+            "SELECT payment_reference, paid_through_epoch, paid_through_date \
+             FROM billing_personal_accounts WHERE user_id = $1",
+        )
+        .bind(&user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read repaired billing settlement");
+        assert_eq!(account.0, format!("pi_repair_paid_{fixture}"));
+        assert_eq!(account.1, 1_980_000_000);
+        assert_eq!(
+            account.2,
+            FoundingDate::from_unix_seconds(1_980_000_000)
+                .unwrap()
+                .to_string()
+        );
+        let watermark: (i64, String) = sqlx::query_as(
+            "SELECT stripe_created, event_id FROM stripe_subscription_watermarks \
+             WHERE subscription_id = $1",
+        )
+        .bind(&subscription_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read repaired event watermark");
+        assert_eq!(watermark, (event_created, event_id.clone()));
+
+        sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE subscription_id = $1")
+            .bind(&subscription_id)
+            .execute(&pool)
+            .await
+            .expect("remove watermark fixture");
+        sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(&event_id)
+            .execute(&pool)
+            .await
+            .expect("remove webhook fixture");
+        sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("remove personal billing fixture");
+        sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+            .bind(&operation_id)
+            .execute(&pool)
+            .await
+            .expect("remove operation fixture");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("remove user fixture");
+    }
+
     #[test]
     fn sales_gate_blocks_new_purchase_actions_without_blocking_billing_config() {
         assert!(matches!(

@@ -87,6 +87,21 @@ pub struct AuthenticatedStripeEvent {
 }
 
 impl AuthenticatedStripeEvent {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        event_id: &str,
+        account_id: &str,
+        environment: ProviderEnvironment,
+        payload: Value,
+    ) -> Self {
+        Self {
+            event_id: event_id.into(),
+            account_id: account_id.into(),
+            environment,
+            payload,
+        }
+    }
+
     #[doc(hidden)]
     pub fn event_id(&self) -> &str {
         &self.event_id
