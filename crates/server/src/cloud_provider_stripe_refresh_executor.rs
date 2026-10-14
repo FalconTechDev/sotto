@@ -57,12 +57,12 @@ impl StripeRefreshExecutor {
 
     async fn execute_inner(&self, inputs: &RefreshJobInputs) -> Result<(), &'static str> {
         let context = &inputs.lease.context;
-        if inputs.event.event_type != "invoice.paid"
-            || context.account_id != self.personal_coverage.account_id
-            || context.account_id != self.sponsored_coverage.account_id()
-            || context.environment != self.personal_coverage.environment
-            || context.environment != self.sponsored_coverage.environment()
-        {
+        if !refresh_input_matches_stripe(
+            context,
+            &inputs.event.event_type,
+            &self.personal_coverage,
+            &self.sponsored_coverage,
+        ) {
             return Err("refresh_input_invalid");
         }
 
@@ -246,6 +246,20 @@ impl StripeRefreshExecutor {
     }
 }
 
+fn refresh_input_matches_stripe(
+    context: &ProviderContext,
+    event_type: &str,
+    personal_coverage: &StripeCoverageConfig,
+    sponsored_coverage: &SponsoredStripeCoverageConfig,
+) -> bool {
+    event_type == "invoice.paid"
+        && context.namespace == crate::cloud_provider_stripe::STRIPE_NAMESPACE
+        && context.account_id == personal_coverage.account_id
+        && context.account_id == sponsored_coverage.account_id()
+        && context.environment == personal_coverage.environment
+        && context.environment == sponsored_coverage.environment()
+}
+
 #[async_trait]
 impl RefreshJobExecutor for StripeRefreshExecutor {
     async fn execute(&mut self, inputs: &RefreshJobInputs) -> Result<(), RefreshExecutionError> {
@@ -412,4 +426,48 @@ fn add_observations(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn personal_config() -> StripeCoverageConfig {
+        StripeCoverageConfig::new(
+            "acct_test",
+            crate::cloud_provider::ProviderEnvironment::Test,
+            "price_month",
+            "price_year",
+        )
+        .unwrap()
+    }
+
+    fn sponsored_config() -> SponsoredStripeCoverageConfig {
+        SponsoredStripeCoverageConfig::new(
+            "acct_test",
+            crate::cloud_provider::ProviderEnvironment::Test,
+            "price_month",
+            "price_year",
+            "price_found_month",
+            "price_found_year",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn refresh_input_rejects_other_provider_namespaces_before_preparation() {
+        let context = ProviderContext::new(
+            "other-provider",
+            "acct_test",
+            crate::cloud_provider::ProviderEnvironment::Test,
+        )
+        .unwrap();
+
+        assert!(!refresh_input_matches_stripe(
+            &context,
+            "invoice.paid",
+            &personal_config(),
+            &sponsored_config(),
+        ));
+    }
 }
