@@ -3432,14 +3432,6 @@ async fn repair_event_already_completed(
                    AND receipt.provider_environment = $2 \
                    AND receipt.event_id = $3 \
                    AND receipt.status IN ('applied', 'rejected') \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM cloud_provider_event_scopes scope \
-                       WHERE scope.provider_namespace = receipt.provider_namespace \
-                         AND scope.provider_account_id = receipt.provider_account_id \
-                         AND scope.provider_environment = receipt.provider_environment \
-                         AND scope.event_id = receipt.event_id \
-                         AND scope.status = 'pending' \
-                   ) \
              )",
         )
         .bind(account_id)
@@ -6362,6 +6354,17 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert completed coverage receipt");
+        sqlx::query(
+            "INSERT INTO cloud_provider_event_scopes \
+             (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
+             VALUES ('stripe', $1, 'test', $2, $3)",
+        )
+        .bind(&account_id)
+        .bind(&paid_event_id)
+        .bind(format!("user_repair_{fixture}"))
+        .execute(&pool)
+        .await
+        .expect("insert pending coverage scope");
 
         let paid = Event {
             id: paid_event_id.clone(),
