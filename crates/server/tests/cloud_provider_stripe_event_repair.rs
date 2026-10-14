@@ -1,0 +1,452 @@
+//! Durable bounded-window tests for missed Stripe event repair.
+
+use axum::extract::State;
+use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use axum::routing::any;
+use axum::{body::Body, Router};
+use serde_json::json;
+use sotto_server::billing::STRIPE_API_VERSION;
+use sotto_server::cloud_provider::ProviderEnvironment;
+use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
+use sotto_server::cloud_provider_stripe_event_repair::{
+    claim_window, finish_page, record_event_disposition, run_once, status_snapshot,
+    StripeEventRepairDisposition, StripeEventRepairError, StripeEventRepairReceipt,
+    StripeEventRepairRunOutcome,
+};
+use sotto_server::cloud_provider_stripe_http::{StripeReadClient, StripeReadLimits};
+use sotto_server::db;
+use sqlx::{PgPool, Row};
+use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
+use url::Url;
+
+mod support {
+    #[allow(dead_code)]
+    pub mod migrations;
+}
+
+use support::migrations::DisposableDatabase;
+
+const NOW: i64 = 2_000_000_000;
+
+#[derive(Clone)]
+struct EventApiState {
+    account_id: String,
+    event_id: String,
+    created: i64,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+struct EventApiServer {
+    origin: Url,
+    calls: Arc<Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for EventApiServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn event_api_handler(
+    State(state): State<EventApiState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let path = request.uri().path().to_owned();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str().to_owned())
+        .unwrap_or(path.clone());
+    state.calls.lock().unwrap().push(path_and_query);
+    let value = match path.as_str() {
+        "/v1/account" => json!({
+            "object": "account",
+            "id": state.account_id,
+            "livemode": false
+        }),
+        "/v1/events" => json!({
+            "object": "list",
+            "has_more": false,
+            "data": [{
+                "id": state.event_id,
+                "type": "invoice.paid",
+                "created": state.created,
+                "livemode": false
+            }]
+        }),
+        path if path == format!("/v1/events/{}", state.event_id) => json!({
+            "object": "event",
+            "id": state.event_id,
+            "type": "invoice.paid",
+            "created": state.created,
+            "api_version": STRIPE_API_VERSION,
+            "livemode": false,
+            "data": { "object": { "id": "in_scan_fixture", "object": "invoice" } }
+        }),
+        _ => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+        .unwrap()
+}
+
+async fn event_api_server(account_id: &str, event_id: &str, created: i64) -> EventApiServer {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = EventApiState {
+        account_id: account_id.to_owned(),
+        event_id: event_id.to_owned(),
+        created,
+        calls: Arc::clone(&calls),
+    };
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(any(event_api_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    EventApiServer {
+        origin: Url::parse(&format!("http://{address}/")).unwrap(),
+        calls,
+        task,
+    }
+}
+
+fn stripe_config(account_id: &str) -> StripeCoverageConfig {
+    StripeCoverageConfig::new(
+        account_id,
+        ProviderEnvironment::Test,
+        "price_month",
+        "price_year",
+    )
+    .expect("valid Stripe coverage config")
+}
+
+async fn migrate(pool: &PgPool) {
+    db::migrate(pool).await.expect("apply all migrations");
+}
+
+#[tokio::test]
+async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
+    let created = NOW - 30 * 24 * 60 * 60 + 100;
+    let server = event_api_server(&account, &event_id, created).await;
+    let config = stripe_config(&account);
+    let stripe = StripeReadClient::for_test(
+        "sk_test_event_repair",
+        &config,
+        server.origin.clone(),
+        StripeReadLimits::default(),
+    )
+    .expect("construct bounded test Stripe client");
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_for_apply = Arc::clone(&seen);
+    let expected_event_id = event_id.clone();
+    let expected_account = account.clone();
+
+    let outcome = run_once(
+        &pool,
+        &stripe,
+        &account,
+        ProviderEnvironment::Test,
+        NOW,
+        move |event, _retrieved_at| {
+            let seen = Arc::clone(&seen_for_apply);
+            let expected_event_id = expected_event_id.clone();
+            let expected_account = expected_account.clone();
+            async move {
+                assert_eq!(event.event_id(), expected_event_id);
+                assert_eq!(event.account_id(), expected_account);
+                assert_eq!(event.environment(), ProviderEnvironment::Test);
+                assert_eq!(event.payload()["type"], "invoice.paid");
+                seen.lock().unwrap().push(event.event_id().to_owned());
+                Ok(StripeEventRepairDisposition::Applied)
+            }
+        },
+    )
+    .await
+    .expect("scan and apply one authenticated event");
+    assert!(matches!(
+        outcome,
+        StripeEventRepairRunOutcome::PageCompleted {
+            events: 1,
+            applied: 1,
+            window_completed: true,
+            ..
+        }
+    ));
+    assert_eq!(seen.lock().unwrap().as_slice(), &[event_id.clone()]);
+    let calls = server.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0], "/v1/account");
+    assert!(calls[1].starts_with("/v1/events?"));
+    assert!(calls[1].contains("types%5B%5D=invoice.paid"));
+    assert!(calls[1].contains("created%5Bgte%5D="));
+    assert_eq!(calls[2], format!("/v1/events/{event_id}"));
+    drop(calls);
+    let receipt = sqlx::query(
+        "SELECT disposition, event_type, provider_created_at, api_version, payload_hash \
+         FROM stripe_event_repair_receipts WHERE provider_account_id = $1 AND event_id = $2",
+    )
+    .bind(&account)
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("durable API-read receipt exists");
+    assert_eq!(
+        receipt.try_get::<String, _>("disposition").unwrap(),
+        "applied"
+    );
+    assert_eq!(
+        receipt.try_get::<String, _>("event_type").unwrap(),
+        "invoice.paid"
+    );
+    assert_eq!(
+        receipt.try_get::<i64, _>("provider_created_at").unwrap(),
+        created
+    );
+    assert_eq!(
+        receipt.try_get::<String, _>("api_version").unwrap(),
+        STRIPE_API_VERSION
+    );
+    assert_eq!(
+        receipt.try_get::<String, _>("payload_hash").unwrap().len(),
+        64
+    );
+    let status = status_snapshot(&pool, &account, ProviderEnvironment::Test)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.completed_through, Some(NOW - 29 * 24 * 60 * 60));
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn event_repair_resumes_a_page_and_only_completes_after_its_final_receipt() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+
+    let first = claim_window(&pool, &account, ProviderEnvironment::Test, NOW)
+        .await
+        .expect("claim first window")
+        .expect("window is available");
+    assert_eq!(first.start(), NOW - 30 * 24 * 60 * 60);
+    assert_eq!(first.end(), first.start() + 24 * 60 * 60);
+    record_event_disposition(
+        &pool,
+        &first,
+        &StripeEventRepairReceipt {
+            event_id: "evt_repair_first".into(),
+            event_type: "invoice.paid".into(),
+            created_at: first.start() + 1,
+            api_version: "2026-07-29.dahlia".into(),
+            payload_hash: "a".repeat(64),
+            retrieved_at: NOW,
+        },
+        StripeEventRepairDisposition::Applied,
+    )
+    .await
+    .expect("record first event before moving cursor");
+    let conflicting = record_event_disposition(
+        &pool,
+        &first,
+        &StripeEventRepairReceipt {
+            event_id: "evt_repair_first".into(),
+            event_type: "invoice.paid".into(),
+            created_at: first.start() + 1,
+            api_version: "2026-07-29.dahlia".into(),
+            payload_hash: "c".repeat(64),
+            retrieved_at: NOW + 2,
+        },
+        StripeEventRepairDisposition::Applied,
+    )
+    .await;
+    assert!(matches!(
+        conflicting,
+        Err(StripeEventRepairError::ReceiptConflict)
+    ));
+    finish_page(&pool, &first, true)
+        .await
+        .expect("release the unfinished window");
+
+    let resumed = claim_window(&pool, &account, ProviderEnvironment::Test, NOW + 1)
+        .await
+        .expect("resume existing window")
+        .expect("window is available after release");
+    assert_eq!(resumed.start(), first.start() + 1);
+    assert_eq!(resumed.end(), first.end());
+    assert_eq!(resumed.cursor(), None);
+    record_event_disposition(
+        &pool,
+        &resumed,
+        &StripeEventRepairReceipt {
+            event_id: "evt_repair_second".into(),
+            event_type: "invoice.payment_failed".into(),
+            created_at: resumed.start() + 2,
+            api_version: "2026-07-29.dahlia".into(),
+            payload_hash: "b".repeat(64),
+            retrieved_at: NOW + 1,
+        },
+        StripeEventRepairDisposition::Unresolved("renewal_predecessor_missing"),
+    )
+    .await
+    .expect("record unresolved evidence before advancing cursor");
+    finish_page(&pool, &resumed, false)
+        .await
+        .expect("complete only after final event receipt");
+
+    let row = sqlx::query(
+        "SELECT completed_through, window_start, window_end, starting_after, \
+                history_gap_start, history_gap_end, oldest_unresolved_created \
+         FROM stripe_event_reconciliation_state WHERE provider_account_id = $1 \
+           AND provider_environment = 'test'",
+    )
+    .bind(&account)
+    .fetch_one(&pool)
+    .await
+    .expect("read completed checkpoint");
+    assert_eq!(
+        row.try_get::<i64, _>("completed_through").unwrap(),
+        first.end()
+    );
+    assert!(row
+        .try_get::<Option<i64>, _>("window_start")
+        .unwrap()
+        .is_none());
+    assert!(row
+        .try_get::<Option<i64>, _>("window_end")
+        .unwrap()
+        .is_none());
+    assert!(row
+        .try_get::<Option<String>, _>("starting_after")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("history_gap_start").unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("history_gap_end").unwrap(),
+        Some(first.start() + 1)
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("oldest_unresolved_created")
+            .unwrap(),
+        Some(0)
+    );
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM stripe_event_repair_receipts WHERE provider_account_id = $1",
+    )
+    .bind(&account)
+    .fetch_one(&pool)
+    .await
+    .expect("count durable event receipts");
+    assert_eq!(receipts, 2);
+    let status = status_snapshot(&pool, &account, ProviderEnvironment::Test)
+        .await
+        .expect("read aggregate status")
+        .expect("status exists after first claim");
+    assert!(!status.scan_pending);
+    assert!(status.history_gap.is_some());
+    assert_eq!(status.last_outcome.as_deref(), Some("complete"));
+    assert_eq!(status.unresolved_count, 1);
+    assert_eq!(status.unsupported_count, 0);
+    assert_eq!(status.pending_scope_count, 0);
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_event_repair_claims_have_one_lease_owner() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    let (left, right) = tokio::join!(
+        claim_window(&pool, &account, ProviderEnvironment::Live, NOW),
+        claim_window(&pool, &account, ProviderEnvironment::Live, NOW),
+    );
+    let left = left.expect("first claimant");
+    let right = right.expect("second claimant");
+    assert_eq!(
+        usize::from(left.is_some()) + usize::from(right.is_some()),
+        1
+    );
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn expired_provider_history_becomes_a_durable_gap() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO stripe_event_reconciliation_state \
+         (provider_account_id, provider_environment, completed_through) VALUES ($1, 'live', $2)",
+    )
+    .bind(&account)
+    .bind(NOW - 31 * 24 * 60 * 60)
+    .execute(&pool)
+    .await
+    .expect("seed an old checkpoint");
+
+    let window = claim_window(&pool, &account, ProviderEnvironment::Live, NOW)
+        .await
+        .expect("claim after horizon loss")
+        .expect("newest window can be scanned");
+    assert_eq!(window.start(), NOW - 30 * 24 * 60 * 60);
+    let row = sqlx::query(
+        "SELECT history_gap_start, history_gap_end, oldest_unresolved_created \
+         FROM stripe_event_reconciliation_state WHERE provider_account_id = $1 \
+           AND provider_environment = 'live'",
+    )
+    .bind(&account)
+    .fetch_one(&pool)
+    .await
+    .expect("read durable gap");
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("history_gap_start").unwrap(),
+        Some(NOW - 31 * 24 * 60 * 60)
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("history_gap_end").unwrap(),
+        Some(NOW - 30 * 24 * 60 * 60)
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("oldest_unresolved_created")
+            .unwrap(),
+        Some(NOW - 31 * 24 * 60 * 60)
+    );
+    drop(pool);
+    database.cleanup().await;
+}
