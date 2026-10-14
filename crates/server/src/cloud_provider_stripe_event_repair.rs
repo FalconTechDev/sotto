@@ -703,6 +703,7 @@ fn stripe_error_outcome(code: &str) -> &'static str {
 fn event_detail_unavailable_reason(error: &StripeReadError) -> Option<&'static str> {
     match error {
         StripeReadError::MalformedResponse(_) => Some("event_detail_malformed"),
+        StripeReadError::ResourceMissing => Some("event_detail_missing"),
         StripeReadError::ContextMismatch | StripeReadError::AccountMismatch => {
             Some("event_detail_context_mismatch")
         }
@@ -723,7 +724,8 @@ fn epoch_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::stripe_error_outcome;
+    use super::{event_detail_unavailable_reason, stripe_error_outcome};
+    use crate::cloud_provider_stripe_http::StripeReadError;
 
     #[test]
     fn scan_failures_keep_bounds_and_invalid_shapes_distinct() {
@@ -735,6 +737,14 @@ mod tests {
         assert_eq!(
             stripe_error_outcome("stripe_read_retryable"),
             "retryable_failure"
+        );
+    }
+
+    #[test]
+    fn missing_event_details_are_durable_unresolved_candidates() {
+        assert_eq!(
+            event_detail_unavailable_reason(&StripeReadError::ResourceMissing),
+            Some("event_detail_missing")
         );
     }
 }

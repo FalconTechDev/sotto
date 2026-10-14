@@ -36,6 +36,7 @@ struct EventApiState {
     event_id: String,
     created: i64,
     detail_available: bool,
+    detail_missing: bool,
     calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -79,6 +80,12 @@ async fn event_api_handler(
             }]
         }),
         path if path == format!("/v1/events/{}", state.event_id) => {
+            if state.detail_missing {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap();
+            }
             if state.detail_available {
                 json!({
                     "object": "event",
@@ -118,6 +125,7 @@ async fn event_api_server(
     event_id: &str,
     created: i64,
     detail_available: bool,
+    detail_missing: bool,
 ) -> EventApiServer {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let state = EventApiState {
@@ -125,6 +133,7 @@ async fn event_api_server(
         event_id: event_id.to_owned(),
         created,
         detail_available,
+        detail_missing,
         calls: Arc::clone(&calls),
     };
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -168,7 +177,7 @@ async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
     let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let created = NOW - 30 * 24 * 60 * 60 + 100;
-    let server = event_api_server(&account, &event_id, created, true).await;
+    let server = event_api_server(&account, &event_id, created, true, false).await;
     let config = stripe_config(&account);
     let stripe = StripeReadClient::for_test(
         "sk_test_event_repair",
@@ -276,7 +285,7 @@ async fn malformed_event_detail_becomes_a_durable_unresolved_receipt() {
     let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let created = NOW - 30 * 24 * 60 * 60 + 200;
-    let server = event_api_server(&account, &event_id, created, false).await;
+    let server = event_api_server(&account, &event_id, created, false, false).await;
     let config = stripe_config(&account);
     let stripe = StripeReadClient::for_test(
         "sk_test_event_repair",
