@@ -36,8 +36,9 @@ CREATE TABLE stripe_event_repair_receipts (
     event_id               TEXT NOT NULL CHECK (btrim(event_id) <> ''),
     event_type             TEXT NOT NULL CHECK (event_type IN ('invoice.paid', 'invoice.payment_failed')),
     provider_created_at    BIGINT NOT NULL CHECK (provider_created_at >= 0),
-    api_version            TEXT NOT NULL CHECK (btrim(api_version) <> ''),
-    payload_hash           TEXT NOT NULL CHECK (payload_hash ~ '^[0-9a-f]{64}$'),
+    retrieval_status       TEXT NOT NULL CHECK (retrieval_status IN ('retrieved', 'detail_unavailable')),
+    api_version            TEXT CHECK (api_version IS NULL OR btrim(api_version) <> ''),
+    payload_hash           TEXT CHECK (payload_hash IS NULL OR payload_hash ~ '^[0-9a-f]{64}$'),
     retrieved_at            BIGINT NOT NULL CHECK (retrieved_at >= 0),
     disposition             TEXT NOT NULL CHECK (disposition IN
                                 ('applied', 'already_applied', 'unrelated', 'rejected', 'unresolved')),
@@ -46,7 +47,11 @@ CREATE TABLE stripe_event_repair_receipts (
     PRIMARY KEY (provider_account_id, provider_environment, event_id),
     CONSTRAINT stripe_event_repair_reason_check
         CHECK ((disposition IN ('rejected', 'unresolved') AND reason_code IS NOT NULL)
-            OR (disposition IN ('applied', 'already_applied', 'unrelated') AND reason_code IS NULL))
+            OR (disposition IN ('applied', 'already_applied', 'unrelated') AND reason_code IS NULL)),
+    CONSTRAINT stripe_event_repair_payload_provenance_check
+        CHECK ((retrieval_status = 'retrieved' AND api_version IS NOT NULL AND payload_hash IS NOT NULL)
+            OR (retrieval_status = 'detail_unavailable' AND api_version IS NULL AND payload_hash IS NULL
+                AND disposition = 'unresolved'))
 );
 
 CREATE INDEX stripe_event_repair_receipts_created_idx

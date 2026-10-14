@@ -11,8 +11,8 @@ use sotto_server::cloud_provider::ProviderEnvironment;
 use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
 use sotto_server::cloud_provider_stripe_event_repair::{
     claim_window, fail_window, finish_page, record_event_disposition, run_once, status_snapshot,
-    StripeEventRepairDisposition, StripeEventRepairError, StripeEventRepairReceipt,
-    StripeEventRepairRunOutcome,
+    StripeEventRepairDisposition, StripeEventRepairError, StripeEventRepairPayloadProvenance,
+    StripeEventRepairReceipt, StripeEventRepairRunOutcome,
 };
 use sotto_server::cloud_provider_stripe_http::{StripeReadClient, StripeReadLimits};
 use sotto_server::db;
@@ -35,6 +35,7 @@ struct EventApiState {
     account_id: String,
     event_id: String,
     created: i64,
+    detail_available: bool,
     calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -77,15 +78,27 @@ async fn event_api_handler(
                 "livemode": false
             }]
         }),
-        path if path == format!("/v1/events/{}", state.event_id) => json!({
-            "object": "event",
-            "id": state.event_id,
-            "type": "invoice.paid",
-            "created": state.created,
-            "api_version": STRIPE_API_VERSION,
-            "livemode": false,
-            "data": { "object": { "id": "in_scan_fixture", "object": "invoice" } }
-        }),
+        path if path == format!("/v1/events/{}", state.event_id) => {
+            if state.detail_available {
+                json!({
+                    "object": "event",
+                    "id": state.event_id,
+                    "type": "invoice.paid",
+                    "created": state.created,
+                    "api_version": STRIPE_API_VERSION,
+                    "livemode": false,
+                    "data": { "object": { "id": "in_scan_fixture", "object": "invoice" } }
+                })
+            } else {
+                json!({
+                    "object": "event",
+                    "id": state.event_id,
+                    "type": "invoice.paid",
+                    "created": state.created,
+                    "livemode": false
+                })
+            }
+        }
         _ => {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -100,12 +113,18 @@ async fn event_api_handler(
         .unwrap()
 }
 
-async fn event_api_server(account_id: &str, event_id: &str, created: i64) -> EventApiServer {
+async fn event_api_server(
+    account_id: &str,
+    event_id: &str,
+    created: i64,
+    detail_available: bool,
+) -> EventApiServer {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let state = EventApiState {
         account_id: account_id.to_owned(),
         event_id: event_id.to_owned(),
         created,
+        detail_available,
         calls: Arc::clone(&calls),
     };
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -149,7 +168,7 @@ async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
     let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let created = NOW - 30 * 24 * 60 * 60 + 100;
-    let server = event_api_server(&account, &event_id, created).await;
+    let server = event_api_server(&account, &event_id, created, true).await;
     let config = stripe_config(&account);
     let stripe = StripeReadClient::for_test(
         "sk_test_event_repair",
@@ -206,7 +225,7 @@ async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
     assert!(calls[1].contains("created%5Bgte%5D="));
     assert_eq!(calls[2], format!("/v1/events/{event_id}"));
     let receipt = sqlx::query(
-        "SELECT disposition, event_type, provider_created_at, api_version, payload_hash \
+        "SELECT disposition, event_type, provider_created_at, retrieval_status, api_version, payload_hash \
          FROM stripe_event_repair_receipts WHERE provider_account_id = $1 AND event_id = $2",
     )
     .bind(&account)
@@ -227,6 +246,10 @@ async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
         created
     );
     assert_eq!(
+        receipt.try_get::<String, _>("retrieval_status").unwrap(),
+        "retrieved"
+    );
+    assert_eq!(
         receipt.try_get::<String, _>("api_version").unwrap(),
         STRIPE_API_VERSION
     );
@@ -239,6 +262,84 @@ async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
         .unwrap()
         .unwrap();
     assert_eq!(status.completed_through, Some(NOW - 29 * 24 * 60 * 60));
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn malformed_event_detail_becomes_a_durable_unresolved_receipt() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
+    let created = NOW - 30 * 24 * 60 * 60 + 200;
+    let server = event_api_server(&account, &event_id, created, false).await;
+    let config = stripe_config(&account);
+    let stripe = StripeReadClient::for_test(
+        "sk_test_event_repair",
+        &config,
+        server.origin.clone(),
+        StripeReadLimits::default(),
+    )
+    .expect("construct bounded test Stripe client");
+    let outcome = run_once(
+        &pool,
+        &stripe,
+        &account,
+        ProviderEnvironment::Test,
+        NOW,
+        |_event, _retrieved_at| async {
+            panic!("malformed detail must not enter the event application callback")
+        },
+    )
+    .await
+    .expect("persist malformed event as unresolved and continue");
+    assert!(matches!(
+        outcome,
+        StripeEventRepairRunOutcome::PageCompleted {
+            events: 1,
+            unresolved: 1,
+            window_completed: true,
+            ..
+        }
+    ));
+    let receipt = sqlx::query(
+        "SELECT retrieval_status, api_version, payload_hash, disposition, reason_code \
+         FROM stripe_event_repair_receipts WHERE provider_account_id = $1 AND event_id = $2",
+    )
+    .bind(&account)
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("unresolved receipt is durable");
+    assert_eq!(
+        receipt.try_get::<String, _>("retrieval_status").unwrap(),
+        "detail_unavailable"
+    );
+    assert!(receipt
+        .try_get::<Option<String>, _>("api_version")
+        .unwrap()
+        .is_none());
+    assert!(receipt
+        .try_get::<Option<String>, _>("payload_hash")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        receipt.try_get::<String, _>("disposition").unwrap(),
+        "unresolved"
+    );
+    assert_eq!(
+        receipt.try_get::<String, _>("reason_code").unwrap(),
+        "event_detail_malformed"
+    );
+    let status = status_snapshot(&pool, &account, ProviderEnvironment::Test)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.unresolved_count, 1);
     drop(pool);
     database.cleanup().await;
 }
@@ -265,9 +366,11 @@ async fn event_repair_resumes_a_page_and_only_completes_after_its_final_receipt(
             event_id: "evt_repair_first".into(),
             event_type: "invoice.paid".into(),
             created_at: first.start() + 1,
-            api_version: "2026-07-29.dahlia".into(),
-            payload_hash: "a".repeat(64),
             retrieved_at: NOW,
+            payload: StripeEventRepairPayloadProvenance::Retrieved {
+                api_version: "2026-07-29.dahlia".into(),
+                payload_hash: "a".repeat(64),
+            },
         },
         StripeEventRepairDisposition::Applied,
     )
@@ -280,9 +383,11 @@ async fn event_repair_resumes_a_page_and_only_completes_after_its_final_receipt(
             event_id: "evt_repair_first".into(),
             event_type: "invoice.paid".into(),
             created_at: first.start() + 1,
-            api_version: "2026-07-29.dahlia".into(),
-            payload_hash: "c".repeat(64),
             retrieved_at: NOW + 2,
+            payload: StripeEventRepairPayloadProvenance::Retrieved {
+                api_version: "2026-07-29.dahlia".into(),
+                payload_hash: "c".repeat(64),
+            },
         },
         StripeEventRepairDisposition::Applied,
     )
@@ -309,9 +414,11 @@ async fn event_repair_resumes_a_page_and_only_completes_after_its_final_receipt(
             event_id: "evt_repair_second".into(),
             event_type: "invoice.payment_failed".into(),
             created_at: resumed.start() + 2,
-            api_version: "2026-07-29.dahlia".into(),
-            payload_hash: "b".repeat(64),
             retrieved_at: NOW + 1,
+            payload: StripeEventRepairPayloadProvenance::Retrieved {
+                api_version: "2026-07-29.dahlia".into(),
+                payload_hash: "b".repeat(64),
+            },
         },
         StripeEventRepairDisposition::Unresolved("renewal_predecessor_missing"),
     )

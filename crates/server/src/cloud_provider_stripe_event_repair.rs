@@ -53,13 +53,21 @@ pub enum StripeEventRepairDisposition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeEventRepairPayloadProvenance {
+    Retrieved {
+        api_version: String,
+        payload_hash: String,
+    },
+    DetailUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeEventRepairReceipt {
     pub event_id: String,
     pub event_type: String,
     pub created_at: i64,
-    pub api_version: String,
-    pub payload_hash: String,
     pub retrieved_at: i64,
+    pub payload: StripeEventRepairPayloadProvenance,
 }
 
 #[derive(Debug, Error)]
@@ -250,15 +258,25 @@ pub async fn record_event_disposition(
     receipt: &StripeEventRepairReceipt,
     disposition: StripeEventRepairDisposition,
 ) -> Result<(), StripeEventRepairError> {
+    let payload_provenance_valid = match &receipt.payload {
+        StripeEventRepairPayloadProvenance::Retrieved {
+            api_version,
+            payload_hash,
+        } => {
+            !api_version.trim().is_empty()
+                && payload_hash.len() == 64
+                && payload_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        }
+        StripeEventRepairPayloadProvenance::DetailUnavailable => {
+            matches!(&disposition, StripeEventRepairDisposition::Unresolved(_))
+        }
+    };
     if receipt.event_id.trim().is_empty()
         || receipt.created_at < window.start
         || receipt.created_at >= window.end
-        || receipt.api_version.trim().is_empty()
-        || receipt.payload_hash.len() != 64
-        || !receipt
-            .payload_hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !payload_provenance_valid
         || receipt.retrieved_at < 0
         || !matches!(
             receipt.event_type.as_str(),
@@ -274,12 +292,23 @@ pub async fn record_event_disposition(
         StripeEventRepairDisposition::Rejected(code) => ("rejected", Some(code)),
         StripeEventRepairDisposition::Unresolved(code) => ("unresolved", Some(code)),
     };
+    let (retrieval_status, api_version, payload_hash) = match &receipt.payload {
+        StripeEventRepairPayloadProvenance::Retrieved {
+            api_version,
+            payload_hash,
+        } => (
+            "retrieved",
+            Some(api_version.as_str()),
+            Some(payload_hash.as_str()),
+        ),
+        StripeEventRepairPayloadProvenance::DetailUnavailable => ("detail_unavailable", None, None),
+    };
     let mut tx = pool.begin().await?;
     let insert = sqlx::query(
         "INSERT INTO stripe_event_repair_receipts \
          (provider_account_id, provider_environment, event_id, event_type, provider_created_at, \
-          api_version, payload_hash, retrieved_at, disposition, reason_code) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+          retrieval_status, api_version, payload_hash, retrieved_at, disposition, reason_code) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (provider_account_id, provider_environment, event_id) DO NOTHING",
     )
     .bind(&window.account_id)
@@ -287,8 +316,9 @@ pub async fn record_event_disposition(
     .bind(&receipt.event_id)
     .bind(&receipt.event_type)
     .bind(receipt.created_at)
-    .bind(&receipt.api_version)
-    .bind(&receipt.payload_hash)
+    .bind(retrieval_status)
+    .bind(api_version)
+    .bind(payload_hash)
     .bind(receipt.retrieved_at)
     .bind(disposition)
     .bind(reason)
@@ -296,8 +326,9 @@ pub async fn record_event_disposition(
     .await?;
     if insert.rows_affected() == 0 {
         let same: bool = sqlx::query_scalar(
-            "SELECT event_type = $4 AND provider_created_at = $5 AND api_version = $6 \
-                AND payload_hash = $7 \
+            "SELECT event_type = $4 AND provider_created_at = $5 AND retrieval_status = $6 \
+                AND api_version IS NOT DISTINCT FROM $7 \
+                AND payload_hash IS NOT DISTINCT FROM $8 \
              FROM stripe_event_repair_receipts \
              WHERE provider_account_id = $1 AND provider_environment = $2 AND event_id = $3",
         )
@@ -306,8 +337,9 @@ pub async fn record_event_disposition(
         .bind(&receipt.event_id)
         .bind(&receipt.event_type)
         .bind(receipt.created_at)
-        .bind(&receipt.api_version)
-        .bind(&receipt.payload_hash)
+        .bind(retrieval_status)
+        .bind(api_version)
+        .bind(payload_hash)
         .fetch_one(&mut *tx)
         .await?;
         if !same {
@@ -530,6 +562,34 @@ where
         let event = match stripe.event_payload(&mut session, &summary.id).await {
             Ok(event) => event,
             Err(error) => {
+                if let Some(reason) = event_detail_unavailable_reason(&error) {
+                    let disposition = StripeEventRepairDisposition::Unresolved(reason);
+                    unresolved += 1;
+                    if let Err(error) = record_event_disposition(
+                        pool,
+                        &window,
+                        &StripeEventRepairReceipt {
+                            event_id: summary.id.clone(),
+                            event_type: summary.event_type.clone(),
+                            created_at: summary.created,
+                            retrieved_at: epoch_now(),
+                            payload: StripeEventRepairPayloadProvenance::DetailUnavailable,
+                        },
+                        disposition,
+                    )
+                    .await
+                    {
+                        let _ = fail_window(
+                            pool,
+                            &window,
+                            "event_receipt_persistence",
+                            "retryable_failure",
+                        )
+                        .await;
+                        return Err(error.into());
+                    }
+                    continue;
+                }
                 let code = stripe_error_code(&error);
                 fail_window(pool, &window, code, stripe_error_outcome(code)).await?;
                 return Err(error.into());
@@ -585,9 +645,11 @@ where
                 event_id: summary.id.clone(),
                 event_type: summary.event_type.clone(),
                 created_at: summary.created,
-                api_version,
-                payload_hash,
                 retrieved_at,
+                payload: StripeEventRepairPayloadProvenance::Retrieved {
+                    api_version,
+                    payload_hash,
+                },
             },
             disposition,
         )
@@ -635,6 +697,16 @@ fn stripe_error_outcome(code: &str) -> &'static str {
         "stripe_bound_exceeded" => "bound_exceeded",
         "stripe_read_invalid" => "unresolved",
         _ => "retryable_failure",
+    }
+}
+
+fn event_detail_unavailable_reason(error: &StripeReadError) -> Option<&'static str> {
+    match error {
+        StripeReadError::MalformedResponse(_) => Some("event_detail_malformed"),
+        StripeReadError::ContextMismatch | StripeReadError::AccountMismatch => {
+            Some("event_detail_context_mismatch")
+        }
+        _ => None,
     }
 }
 
