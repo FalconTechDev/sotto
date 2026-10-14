@@ -3610,10 +3610,7 @@ pub(crate) async fn repair_authenticated_stripe_event(
         )
         .await?;
     }
-    if let Some(subscription_id) = event_subscription_id(&event) {
-        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
-    }
-    mark_webhook_event_processed(&mut tx, &event.id).await?;
+    complete_repaired_invoice_event(&mut tx, &event).await?;
     tx.commit().await?;
 
     if let Some(reason) = personal_rejection {
@@ -5083,6 +5080,16 @@ async fn update_subscription_watermark(
     Ok(())
 }
 
+async fn complete_repaired_invoice_event(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+) -> Result<()> {
+    if let Some(subscription_id) = event_subscription_id(event) {
+        update_subscription_watermark(tx, event, &subscription_id).await?;
+    }
+    mark_webhook_event_processed(tx, &event.id).await
+}
+
 fn event_subscription_id(event: &Event) -> Option<String> {
     match event.kind.as_str() {
         "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
@@ -6404,6 +6411,95 @@ mod tests {
             .execute(&pool)
             .await
             .expect("remove webhook fixtures");
+    }
+
+    #[tokio::test]
+    async fn repaired_paid_invoice_advances_subscription_event_watermark() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+        let options =
+            sqlx::postgres::PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing to write test fixtures to non-local database: {}",
+            options.get_host()
+        );
+        let pool = crate::db::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+
+        let fixture = Uuid::new_v4().simple().to_string();
+        let subscription_id = format!("sub_repaired_invoice_{fixture}");
+        let paid = Event {
+            id: format!("evt_paid_repair_watermark_{fixture}"),
+            created: 100,
+            api_version: Some(STRIPE_API_VERSION.into()),
+            kind: "invoice.paid".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "parent": {"subscription_details": {"subscription": subscription_id}}
+                }),
+            },
+        };
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin repaired event transaction");
+        record_webhook_receipt(&mut tx, &paid, Some(&subscription_id))
+            .await
+            .expect("persist paid webhook receipt");
+        complete_repaired_invoice_event(&mut tx, &paid)
+            .await
+            .expect("advance watermark and complete paid event");
+        tx.commit().await.expect("commit repaired paid event");
+
+        let older = Event {
+            id: format!("evt_older_subscription_update_{fixture}"),
+            created: 99,
+            api_version: Some(STRIPE_API_VERSION.into()),
+            kind: "customer.subscription.updated".into(),
+            data: EventData {
+                object: serde_json::json!({"id": subscription_id}),
+            },
+        };
+        let mut tx = pool.begin().await.expect("begin older webhook transaction");
+        assert_eq!(
+            record_webhook_event(&mut tx, &older)
+                .await
+                .expect("compare older event with repaired watermark"),
+            EventDisposition::Ignore
+        );
+        tx.commit().await.expect("commit older event receipt");
+
+        let watermark: (i64, String) = sqlx::query_as(
+            "SELECT stripe_created, event_id FROM stripe_subscription_watermarks \
+             WHERE subscription_id = $1",
+        )
+        .bind(&subscription_id)
+        .fetch_one(&pool)
+        .await
+        .expect("repaired paid event remains the watermark");
+        assert_eq!(watermark.0, paid.created);
+        assert_eq!(watermark.1, paid.id);
+
+        sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE subscription_id = $1")
+            .bind(&subscription_id)
+            .execute(&pool)
+            .await
+            .expect("remove watermark fixture");
+        sqlx::query(
+            "DELETE FROM stripe_webhook_events WHERE subscription_id = $1 OR event_id = $2",
+        )
+        .bind(&subscription_id)
+        .bind(&older.id)
+        .execute(&pool)
+        .await
+        .expect("remove webhook fixtures");
     }
 
     #[test]
