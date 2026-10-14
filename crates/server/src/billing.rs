@@ -3624,8 +3624,13 @@ async fn prepare_sponsored_invoice_coverage(
                     reason: "sponsored_invoice_item_binding_mismatch",
                 });
             }
-            if seat_item.as_deref().or(operation_item.as_deref()) != Some(line.provider_item_id()) {
-                continue;
+            match seat_item.as_deref().or(operation_item.as_deref()) {
+                Some(item_id) if item_id != line.provider_item_id() => continue,
+                // A newly scheduled seat is not bound to an item until this invoice is
+                // accepted. The query above already scopes it to this subscription, and the
+                // composer verifies the complete named-seat count against the line quantity.
+                None => {}
+                Some(_) => {}
             }
             let seat_id: String = seat.try_get("seat_id")?;
             if !seen_seat_ids.insert(seat_id.clone()) {

@@ -161,7 +161,7 @@ struct SponsoredOperationFixture<'a> {
     owner_id: &'a str,
     beneficiary_id: &'a str,
     offer: BillingOffer,
-    item_id: &'a str,
+    item_id: Option<&'a str>,
     customer_id: &'a str,
     subscription_id: &'a str,
     start: i64,
@@ -232,7 +232,7 @@ async fn seed_sponsored_operation(pool: &PgPool, fixture: SponsoredOperationFixt
         subscription_id,
         None,
         Some(start),
-        Some(item_id),
+        item_id,
     )
     .await
     .unwrap();
@@ -360,7 +360,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             owner_id: &owner_id,
             beneficiary_id: &monthly_user,
             offer: BillingOffer::StandardMonthly,
-            item_id: &monthly_item,
+            item_id: Some(&monthly_item),
             customer_id: &customer_id,
             subscription_id: &subscription_id,
             start: period_start,
@@ -369,14 +369,15 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         },
     )
     .await;
-    let unbound_operation = seed_sponsored_operation(
+    seed_sponsored_operation(
         &pool,
         SponsoredOperationFixture {
             organization_id: &organization_id,
             owner_id: &owner_id,
             beneficiary_id: &unbound_item_user,
             offer: BillingOffer::StandardMonthly,
-            item_id: &monthly_item,
+            // Production records a provider update before Stripe returns an item binding.
+            item_id: None,
             customer_id: &customer_id,
             subscription_id: &subscription_id,
             start: period_start,
@@ -385,20 +386,6 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         },
     )
     .await;
-    sqlx::query(
-        "UPDATE billing_sponsored_seats SET provider_item_id = NULL WHERE operation_id = $1",
-    )
-    .bind(&unbound_operation)
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE billing_sponsored_operations SET provider_item_id = NULL WHERE operation_id = $1",
-    )
-    .bind(&unbound_operation)
-    .execute(&pool)
-    .await
-    .unwrap();
     let old_subscription_id = format!("sub_old_{fixture}");
     seed_sponsored_operation(
         &pool,
@@ -407,7 +394,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             owner_id: &owner_id,
             beneficiary_id: &other_subscription_user,
             offer: BillingOffer::StandardMonthly,
-            item_id: &monthly_item,
+            item_id: Some(&monthly_item),
             customer_id: &customer_id,
             subscription_id: &old_subscription_id,
             start: period_start,
@@ -423,7 +410,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             owner_id: &owner_id,
             beneficiary_id: &founding_user,
             offer: BillingOffer::FoundingMonthly,
-            item_id: &founding_item,
+            // A multi price first Checkout also has no item binding before this invoice.
+            item_id: None,
             customer_id: &customer_id,
             subscription_id: &subscription_id,
             start: period_start,
@@ -505,10 +493,10 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     };
     let invoice_id = format!("in_sponsored_{fixture}");
     let payment_id = format!("pi_sponsored_{fixture}");
-    let line = |line_id: String, item_id: String, price_id: String| {
+    let line = |line_id: String, item_id: String, price_id: String, quantity: u64| {
         serde_json::json!({
             "id":line_id, "object":"line_item", "invoice":invoice_id,
-            "quantity":1, "livemode":false,
+            "quantity":quantity, "livemode":false,
             "parent":{"type":"subscription_item_details","subscription_item_details":{
                 "subscription":subscription_id, "subscription_item":item_id, "proration":false
             }},
@@ -521,13 +509,13 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         "parent":{"type":"subscription_details","subscription_details":{
             "subscription":subscription_id, "metadata":{"organization_id":organization_id}
         }},
-        "status":"paid", "currency":"gbp", "amount_paid":498, "amount_due":498,
+        "status":"paid", "currency":"gbp", "amount_paid":797, "amount_due":797,
         "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
         "livemode":false,
         "status_transitions":{"paid_at":now + 10},
         "lines":{"data":[
-            line(format!("il_month_{fixture}"),monthly_item.clone(),catalogue.standard_monthly.clone()),
-            line(format!("il_found_{fixture}"),founding_item.clone(),catalogue.founding_monthly.clone())
+            line(format!("il_month_{fixture}"),monthly_item.clone(),catalogue.standard_monthly.clone(), 2),
+            line(format!("il_found_{fixture}"),founding_item.clone(),catalogue.founding_monthly.clone(), 1)
         ]}
     });
     let personal_line = serde_json::json!({
@@ -577,7 +565,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     });
     let payment = serde_json::json!({
         "id":format!("inpay_{fixture}"), "object":"invoice_payment", "invoice":invoice_id,
-        "status":"paid", "amount_paid":498, "amount_requested":498, "currency":"gbp",
+        "status":"paid", "amount_paid":797, "amount_requested":797, "currency":"gbp",
         "livemode":false, "payment":{"type":"payment_intent","payment_intent":payment_id}
     });
     let history_response = serde_json::json!({
@@ -753,7 +741,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(provider_state, (1, 2, 2, 2));
+    assert_eq!(provider_state, (1, 3, 3, 3));
     let scoped_beneficiaries: Vec<String> = sqlx::query_scalar(
         "SELECT beneficiary_id FROM cloud_provider_event_scopes WHERE event_id = $1 ORDER BY beneficiary_id",
     )
@@ -761,7 +749,11 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    let mut expected_beneficiaries = vec![monthly_user.clone(), founding_user.clone()];
+    let mut expected_beneficiaries = vec![
+        monthly_user.clone(),
+        unbound_item_user.clone(),
+        founding_user.clone(),
+    ];
     expected_beneficiaries.sort();
     assert_eq!(scoped_beneficiaries, expected_beneficiaries);
 
@@ -778,6 +770,14 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         &event_id,
         &monthly_user,
         &format!("sponsored-worker-one-{fixture}"),
+        &mut executor,
+    )
+    .await;
+    execute_own_job(
+        &pool,
+        &event_id,
+        &unbound_item_user,
+        &format!("sponsored-worker-unbound-{fixture}"),
         &mut executor,
     )
     .await;
@@ -801,7 +801,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(intermediate, ("pending".into(), 1, 1));
+    assert_eq!(intermediate, ("pending".into(), 2, 1));
 
     execute_own_job(
         &pool,
@@ -820,7 +820,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(final_receipt, ("applied".into(), 2));
+    assert_eq!(final_receipt, ("applied".into(), 3));
 
     // Duplicate delivery reuses the same global event and leaves all beneficiary work unchanged.
     assert_eq!(post_webhook(&app, &event).await, StatusCode::OK);
@@ -834,7 +834,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(replay_counts, (1, 2, 2));
+    assert_eq!(replay_counts, (1, 3, 3));
 
     // Stripe's current invoice snapshot can be permanently unusable even though the signed
     // webhook reports payment. Financial settlement still completes, while coverage records a
