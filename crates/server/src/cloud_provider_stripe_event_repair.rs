@@ -16,6 +16,7 @@ use crate::cloud_provider_stripe_http::{StripeReadClient, StripeReadError};
 
 const EVENT_HISTORY_SECONDS: i64 = 30 * 24 * 60 * 60;
 const WINDOW_SECONDS: i64 = 24 * 60 * 60;
+const SETTLEMENT_LAG_SECONDS: i64 = 3 * 24 * 60 * 60;
 const LEASE_SECONDS: i64 = 240;
 const EVENT_PAGE_SIZE: usize = 100;
 
@@ -137,6 +138,7 @@ pub async fn claim_window(
         return Err(StripeEventRepairError::InvalidWindow);
     }
     let history_floor = now_epoch.saturating_sub(EVENT_HISTORY_SECONDS).max(0);
+    let scan_ceiling = now_epoch.saturating_sub(SETTLEMENT_LAG_SECONDS).max(0);
     let lease_owner = format!("stripe-event-repair:{}", Uuid::new_v4());
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -186,27 +188,27 @@ pub async fn claim_window(
         }
     } else {
         start = Some(scan_start);
-        end = Some(scan_start.saturating_add(WINDOW_SECONDS).min(now_epoch));
+        end = Some(scan_start.saturating_add(WINDOW_SECONDS).min(scan_ceiling));
         cursor = None;
-        if end == start && start == Some(now_epoch) {
+        if end == start && start == Some(scan_ceiling) {
             tx.commit().await?;
             return Ok(None);
         }
     }
     let start = start.ok_or(StripeEventRepairError::InvalidWindow)?;
     let mut end = end.ok_or(StripeEventRepairError::InvalidWindow)?;
-    if end > now_epoch {
-        end = now_epoch;
+    if end > scan_ceiling {
+        end = scan_ceiling;
     }
     if end < start {
         return Err(StripeEventRepairError::InvalidWindow);
     }
-    if start >= now_epoch {
+    if start >= scan_ceiling {
         tx.commit().await?;
         return Ok(None);
     }
     if end == start {
-        end = start.saturating_add(WINDOW_SECONDS).min(now_epoch);
+        end = start.saturating_add(WINDOW_SECONDS).min(scan_ceiling);
     }
     if let Some((gap_start, gap_end)) = gap {
         sqlx::query(
