@@ -477,6 +477,26 @@ async fn event_repair_resumes_a_page_and_only_completes_after_its_final_receipt(
     )
     .await
     .expect("record first event before moving cursor");
+    let changed_disposition = record_event_disposition(
+        &pool,
+        &first,
+        &StripeEventRepairReceipt {
+            event_id: "evt_repair_first".into(),
+            event_type: "invoice.paid".into(),
+            created_at: first.start() + 1,
+            retrieved_at: NOW + 1,
+            payload: StripeEventRepairPayloadProvenance::Retrieved {
+                api_version: "2026-07-29.dahlia".into(),
+                payload_hash: "a".repeat(64),
+            },
+        },
+        StripeEventRepairDisposition::Unrelated,
+    )
+    .await;
+    assert!(matches!(
+        changed_disposition,
+        Err(StripeEventRepairError::ReceiptConflict)
+    ));
     let conflicting = record_event_disposition(
         &pool,
         &first,

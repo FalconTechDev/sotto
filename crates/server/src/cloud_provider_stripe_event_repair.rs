@@ -329,6 +329,8 @@ pub async fn record_event_disposition(
             "SELECT event_type = $4 AND provider_created_at = $5 AND retrieval_status = $6 \
                 AND api_version IS NOT DISTINCT FROM $7 \
                 AND payload_hash IS NOT DISTINCT FROM $8 \
+                AND disposition = $9 \
+                AND reason_code IS NOT DISTINCT FROM $10 \
              FROM stripe_event_repair_receipts \
              WHERE provider_account_id = $1 AND provider_environment = $2 AND event_id = $3",
         )
@@ -340,6 +342,8 @@ pub async fn record_event_disposition(
         .bind(retrieval_status)
         .bind(api_version)
         .bind(payload_hash)
+        .bind(disposition)
+        .bind(reason)
         .fetch_one(&mut *tx)
         .await?;
         if !same {
