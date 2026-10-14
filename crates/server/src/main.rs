@@ -86,7 +86,9 @@ async fn run() -> Result<()> {
             #[cfg(not(feature = "e2e-mock-billing"))]
             {
                 let mut state = BillingState::from_config(billing.clone());
-                if config.provider_refresh_ingest_enabled || config.provider_refresh_worker_enabled
+                if config.provider_refresh_ingest_enabled
+                    || config.provider_refresh_worker_enabled
+                    || config.provider_refresh_reconciliation_enabled
                 {
                     let account_id = config.stripe_account_id.as_deref().ok_or_else(|| {
                         Error::Config("provider refresh requires STRIPE_ACCOUNT_ID".into())
@@ -164,6 +166,8 @@ async fn run() -> Result<()> {
     // AppState owns billing; keep only the provider handle for the optional worker.
     let worker_provider = billing.as_ref().map(BillingState::provider);
 
+    let repair_billing = billing.clone();
+    let repair_runtime = personal_coverage_runtime.clone();
     let state = AppState {
         pool: pool.clone(),
         deployment_mode: config.deployment_mode,
@@ -221,7 +225,7 @@ async fn run() -> Result<()> {
         sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider);
     }
     if config.provider_refresh_worker_enabled {
-        let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime else {
+        let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime.clone() else {
             return Err(Error::Config(
                 "provider refresh worker requires configured personal Stripe coverage".into(),
             ));
@@ -231,6 +235,19 @@ async fn run() -> Result<()> {
             stripe,
             coverage,
             sponsored_coverage,
+        );
+    }
+    if config.provider_refresh_reconciliation_enabled {
+        let (Some((coverage, _, stripe)), Some(billing)) = (repair_runtime, repair_billing) else {
+            return Err(Error::Config(
+                "Stripe event reconciliation requires configured Stripe billing".into(),
+            ));
+        };
+        sotto_server::cloud_provider_stripe_event_repair_executor::spawn(
+            pool.clone(),
+            stripe,
+            coverage,
+            billing,
         );
     }
     sotto_server::telemetry::spawn(pool, config.telemetry.clone());

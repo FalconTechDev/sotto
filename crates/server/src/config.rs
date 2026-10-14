@@ -329,12 +329,7 @@ fn validate_provider_refresh_configuration(
     billing: Option<&BillingConfig>,
     stripe_account_id: Option<&str>,
 ) -> Result<()> {
-    if reconciliation_enabled {
-        return Err(Error::Config(
-            "SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED is not supported yet".into(),
-        ));
-    }
-    if !ingest_enabled && !worker_enabled {
+    if !ingest_enabled && !worker_enabled && !reconciliation_enabled {
         return Ok(());
     }
     let billing =
@@ -614,6 +609,14 @@ mod tests {
             true,
             true,
             false,
+            Some(&complete),
+            Some("acct_test"),
+        )
+        .is_ok());
+        assert!(validate_provider_refresh_configuration(
+            false,
+            false,
+            true,
             Some(&complete),
             Some("acct_test"),
         )
