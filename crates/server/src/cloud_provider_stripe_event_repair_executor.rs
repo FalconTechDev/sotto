@@ -66,9 +66,17 @@ pub fn spawn(
                         "stripe event repair: page completed events={events} applied={applied} \
                          already_applied={already_applied} unrelated={unrelated} rejected={rejected} \
                          unresolved={unresolved} window_completed={window_completed} \
-                         last_outcome={} last_error_code={} history_gap={} pending_scopes={} \
+                         scan_pending={} completed_through={} last_outcome={} last_error_code={} \
+                         history_gap={} pending_scopes={} \
                          unresolved_total={} rejected_total={} unsupported_total={} \
                          oldest_unresolved_present={} oldest_unresolved_age_seconds={}",
+                        status
+                            .as_ref()
+                            .is_some_and(|status| status.scan_pending),
+                        status
+                            .as_ref()
+                            .and_then(|status| status.completed_through)
+                            .unwrap_or(0),
                         status
                             .as_ref()
                             .and_then(|status| status.last_outcome.as_deref())

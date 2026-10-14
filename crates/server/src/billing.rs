@@ -3676,7 +3676,7 @@ async fn repair_authenticated_personal_renewal_failure(
             ));
         }
         Err(crate::cloud_provider_stripe_repair::StripeRepairError::OwnershipMismatch) => {
-            return Ok(StripeEventRepairDisposition::Rejected(
+            return Ok(StripeEventRepairDisposition::Unresolved(
                 "renewal_event_binding_mismatch",
             ));
         }

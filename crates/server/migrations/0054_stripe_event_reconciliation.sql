@@ -14,7 +14,7 @@ CREATE TABLE stripe_event_reconciliation_state (
     history_gap_end            BIGINT CHECK (history_gap_end IS NULL OR history_gap_end >= 0),
     oldest_unresolved_created  BIGINT CHECK (oldest_unresolved_created IS NULL OR oldest_unresolved_created >= 0),
     last_outcome                TEXT CHECK (last_outcome IS NULL OR last_outcome IN
-                                ('complete', 'retryable_failure', 'history_gap', 'bound_exceeded')),
+                                ('complete', 'retryable_failure', 'history_gap', 'bound_exceeded', 'unresolved')),
     last_error_code             TEXT CHECK (last_error_code IS NULL OR
                                 last_error_code ~ '^[a-z][a-z0-9_]{0,63}$'),
     last_attempt_at             TIMESTAMPTZ,

@@ -10,7 +10,7 @@ use sotto_server::billing::STRIPE_API_VERSION;
 use sotto_server::cloud_provider::ProviderEnvironment;
 use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
 use sotto_server::cloud_provider_stripe_event_repair::{
-    claim_window, finish_page, record_event_disposition, run_once, status_snapshot,
+    claim_window, fail_window, finish_page, record_event_disposition, run_once, status_snapshot,
     StripeEventRepairDisposition, StripeEventRepairError, StripeEventRepairReceipt,
     StripeEventRepairRunOutcome,
 };
@@ -449,6 +449,37 @@ async fn expired_provider_history_becomes_a_durable_gap() {
             .unwrap(),
         Some(NOW - 31 * 24 * 60 * 60)
     );
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn bound_failure_remains_visible_without_advancing_the_watermark() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    let window = claim_window(&pool, &account, ProviderEnvironment::Test, NOW)
+        .await
+        .unwrap()
+        .unwrap();
+    fail_window(&pool, &window, "stripe_bound_exceeded", "bound_exceeded")
+        .await
+        .unwrap();
+    let status = status_snapshot(&pool, &account, ProviderEnvironment::Test)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.scan_pending);
+    assert_eq!(status.completed_through, None);
+    assert_eq!(status.last_outcome.as_deref(), Some("bound_exceeded"));
+    assert_eq!(
+        status.last_error_code.as_deref(),
+        Some("stripe_bound_exceeded")
+    );
+    assert_eq!(status.oldest_unresolved_created, Some(0));
     drop(pool);
     database.cleanup().await;
 }

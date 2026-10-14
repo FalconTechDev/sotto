@@ -404,13 +404,16 @@ pub async fn fail_window(
 ) -> Result<(), StripeEventRepairError> {
     if !matches!(
         outcome,
-        "retryable_failure" | "history_gap" | "bound_exceeded"
+        "retryable_failure" | "history_gap" | "bound_exceeded" | "unresolved"
     ) {
         return Err(StripeEventRepairError::InvalidWindow);
     }
     let result = sqlx::query(
         "UPDATE stripe_event_reconciliation_state SET lease_owner = NULL, \
-         lease_expires_at = NULL, last_outcome = $6, last_error_code = $7, updated_at = now() \
+         lease_expires_at = NULL, last_outcome = $6, last_error_code = $7, \
+         oldest_unresolved_created = CASE WHEN $6 IN ('unresolved', 'bound_exceeded') \
+             THEN LEAST(COALESCE(oldest_unresolved_created, $3), $3) \
+             ELSE oldest_unresolved_created END, updated_at = now() \
          WHERE provider_account_id = $1 AND provider_environment = $2 \
            AND window_start = $3 AND window_end = $4 AND lease_owner = $5",
     )
@@ -514,7 +517,7 @@ where
         Ok(page) => page,
         Err(error) => {
             let code = stripe_error_code(&error);
-            fail_window(pool, &window, code, "retryable_failure").await?;
+            fail_window(pool, &window, code, stripe_error_outcome(code)).await?;
             return Err(error.into());
         }
     };
@@ -528,7 +531,7 @@ where
             Ok(event) => event,
             Err(error) => {
                 let code = stripe_error_code(&error);
-                fail_window(pool, &window, code, "retryable_failure").await?;
+                fail_window(pool, &window, code, stripe_error_outcome(code)).await?;
                 return Err(error.into());
             }
         };
@@ -627,6 +630,14 @@ fn stripe_error_code(error: &StripeReadError) -> &'static str {
     }
 }
 
+fn stripe_error_outcome(code: &str) -> &'static str {
+    match code {
+        "stripe_bound_exceeded" => "bound_exceeded",
+        "stripe_read_invalid" => "unresolved",
+        _ => "retryable_failure",
+    }
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -636,4 +647,22 @@ fn epoch_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stripe_error_outcome;
+
+    #[test]
+    fn scan_failures_keep_bounds_and_invalid_shapes_distinct() {
+        assert_eq!(
+            stripe_error_outcome("stripe_bound_exceeded"),
+            "bound_exceeded"
+        );
+        assert_eq!(stripe_error_outcome("stripe_read_invalid"), "unresolved");
+        assert_eq!(
+            stripe_error_outcome("stripe_read_retryable"),
+            "retryable_failure"
+        );
+    }
 }
