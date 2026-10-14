@@ -3496,9 +3496,20 @@ pub(crate) async fn repair_authenticated_stripe_event(
         )
         .await;
     }
-    if invoice_subscription_id_claim(&event.data.object).is_none() {
+    let Some(subscription_id) = invoice_subscription_id_claim(&event.data.object) else {
         return Ok(StripeEventRepairDisposition::Unrelated);
-    }
+    };
+    let (personal_subscription, sponsored_subscription): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
+                          WHERE stripe_subscription_id = $1), \
+                EXISTS(SELECT 1 FROM billing_sponsored_subscriptions \
+                          WHERE provider_subscription_id = $1)",
+    )
+    .bind(&subscription_id)
+    .fetch_one(pool)
+    .await?;
+    let settlement_expected =
+        personal_subscription || (sponsored_billing_enabled() && sponsored_subscription);
 
     let raw_event = serde_json::to_string(authenticated.payload())
         .map_err(|_| Error::BadRequest("malformed authenticated Stripe event".into()))?;
@@ -3528,7 +3539,11 @@ pub(crate) async fn repair_authenticated_stripe_event(
         Some(PreparedPersonalInvoiceCoverage { period_end, .. }) => Some(*period_end),
         _ => None,
     };
-    if let Some(reason) = paid_invoice_repair_shape_error(&event.data.object, prepared_period_end) {
+    if let Some(reason) = paid_invoice_repair_shape_error(
+        &event.data.object,
+        prepared_period_end,
+        settlement_expected,
+    ) {
         return Ok(StripeEventRepairDisposition::Unresolved(reason));
     }
 
@@ -5720,7 +5735,11 @@ fn invoice_period_end(object: &serde_json::Value) -> Option<i64> {
 fn paid_invoice_repair_shape_error(
     object: &serde_json::Value,
     prepared_period_end: Option<i64>,
+    settlement_expected: bool,
 ) -> Option<&'static str> {
+    if !settlement_expected {
+        return None;
+    }
     let period_end = prepared_period_end.or_else(|| invoice_period_end(object));
     if period_end
         .and_then(|period_end| FoundingDate::from_unix_seconds(period_end).ok())
@@ -6272,28 +6291,43 @@ mod tests {
     #[test]
     fn malformed_paid_invoice_shape_becomes_an_unresolved_repair() {
         assert_eq!(
-            paid_invoice_repair_shape_error(&serde_json::json!({"id": "in_1"}), None),
+            paid_invoice_repair_shape_error(&serde_json::json!({"id": "in_1"}), None, true),
             Some("paid_invoice_settlement_shape")
         );
         assert_eq!(
             paid_invoice_repair_shape_error(
                 &serde_json::json!({"id": "in_1", "period_end": -1}),
-                None
+                None,
+                true
+            ),
+            Some("paid_invoice_settlement_shape")
+        );
+        assert_eq!(
+            paid_invoice_repair_shape_error(
+                &serde_json::json!({"period_end": 1_950_000_000}),
+                None,
+                true
             ),
             Some("paid_invoice_settlement_shape")
         );
         assert_eq!(
             paid_invoice_repair_shape_error(
                 &serde_json::json!({"id": "in_1"}),
-                Some(1_950_000_000)
+                Some(1_950_000_000),
+                true
             ),
             None
         );
         assert_eq!(
             paid_invoice_repair_shape_error(
                 &serde_json::json!({"id": "in_1", "period_end": 1_950_000_000}),
-                None
+                None,
+                true
             ),
+            None
+        );
+        assert_eq!(
+            paid_invoice_repair_shape_error(&serde_json::json!({"id": "in_1"}), None, false),
             None
         );
     }
