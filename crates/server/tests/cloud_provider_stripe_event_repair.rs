@@ -586,7 +586,7 @@ async fn event_repair_resumes_a_page_and_only_completes_after_its_final_receipt(
     assert_eq!(
         row.try_get::<Option<i64>, _>("oldest_unresolved_created")
             .unwrap(),
-        Some(0)
+        Some(first.start() + 3)
     );
     let receipts: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM stripe_event_repair_receipts WHERE provider_account_id = $1",
@@ -714,7 +714,7 @@ async fn expired_provider_history_becomes_a_durable_gap() {
     assert_eq!(
         row.try_get::<Option<i64>, _>("oldest_unresolved_created")
             .unwrap(),
-        Some(NOW - 31 * 24 * 60 * 60)
+        None
     );
     drop(pool);
     database.cleanup().await;
@@ -746,7 +746,46 @@ async fn bound_failure_remains_visible_without_advancing_the_watermark() {
         status.last_error_code.as_deref(),
         Some("stripe_bound_exceeded")
     );
-    assert_eq!(status.oldest_unresolved_created, Some(0));
+    assert_eq!(
+        status.oldest_unresolved_created,
+        Some(NOW - 30 * 24 * 60 * 60)
+    );
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn event_repair_waits_for_the_webhook_retry_window_to_pass() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    let safe_through = NOW - 3 * 24 * 60 * 60;
+    sqlx::query(
+        "INSERT INTO stripe_event_reconciliation_state \
+         (provider_account_id, provider_environment, completed_through) \
+         VALUES ($1, 'test', $2)",
+    )
+    .bind(&account)
+    .bind(safe_through)
+    .execute(&pool)
+    .await
+    .expect("seed a caught-up scanner");
+
+    assert!(
+        claim_window(&pool, &account, ProviderEnvironment::Test, NOW)
+            .await
+            .expect("do not scan inside the delivery retry window")
+            .is_none()
+    );
+    let delayed = claim_window(&pool, &account, ProviderEnvironment::Test, NOW + 60 * 60)
+        .await
+        .expect("resume after the safety delay")
+        .expect("newly elapsed repair window is available");
+    assert_eq!(delayed.start(), safe_through);
+    assert_eq!(delayed.end(), safe_through + 60 * 60);
     drop(pool);
     database.cleanup().await;
 }

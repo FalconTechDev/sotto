@@ -214,8 +214,7 @@ pub async fn claim_window(
         sqlx::query(
             "UPDATE stripe_event_reconciliation_state SET \
              history_gap_start = LEAST(COALESCE(history_gap_start, $3), $3), \
-             history_gap_end = GREATEST(COALESCE(history_gap_end, $4), $4), \
-             oldest_unresolved_created = LEAST(COALESCE(oldest_unresolved_created, $3), $3) \
+             history_gap_end = GREATEST(COALESCE(history_gap_end, $4), $4) \
              WHERE provider_account_id = $1 AND provider_environment = $2",
         )
         .bind(account_id)
