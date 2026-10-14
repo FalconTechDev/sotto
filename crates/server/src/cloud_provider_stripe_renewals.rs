@@ -78,6 +78,14 @@ impl StripeRenewalFailureEvidence {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_event(mut self, event_id: &str, event_created_at: i64) -> Self {
+        self.event_id = event_id.into();
+        self.event_created_at = event_created_at;
+        self.evidence_reference = format!("stripe-renewal-test-evidence:{event_id}");
+        self
+    }
+
     /// The versioned semantic reference for this complete historical observation.
     ///
     /// This is separate from the generic provider event fingerprint: it includes the linked

@@ -310,22 +310,48 @@ fn active_failure_for_term<'a>(
                 && failure.predecessor_invoice_id() == term.invoice_id()
         })
         .collect::<Vec<_>>();
-    if linked.len() > 1 {
+    let Some(renewal_id) = linked.first().map(|failure| failure.renewal_id()) else {
+        return Ok(None);
+    };
+    if linked
+        .iter()
+        .any(|failure| failure.renewal_id() != renewal_id)
+    {
         return Err(ProviderCollectionError::InvalidEvidence(
-            "multiple accepted renewal failures target one paid term".into(),
+            "multiple renewal invoices target one paid term".into(),
         ));
     }
-    Ok(linked.first().copied().filter(|failure| {
-        history.recovery_currently_eligible()
-            && history.entries().iter().any(|entry| {
-                matches!(
-                    entry,
-                    StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
-                        if invoice.invoice_id() == failure.invoice_id()
-                            && invoice.status() == "open"
-                )
-            })
-    }))
+    let first_claim = linked[0];
+    if linked.iter().skip(1).any(|failure| {
+        failure.invoice_line_id() != first_claim.invoice_line_id()
+            || failure.predecessor_evidence_reference()
+                != first_claim.predecessor_evidence_reference()
+            || failure.predecessor_period_start() != first_claim.predecessor_period_start()
+            || failure.predecessor_period_end() != first_claim.predecessor_period_end()
+            || failure.renewal_period_start() != first_claim.renewal_period_start()
+            || failure.renewal_period_end() != first_claim.renewal_period_end()
+            || failure.interval() != first_claim.interval()
+    }) {
+        return Err(ProviderCollectionError::InvalidEvidence(
+            "failure events disagree about their renewal evidence".into(),
+        ));
+    }
+    let Some(failure) = linked
+        .into_iter()
+        .min_by_key(|failure| (failure.event_created_at(), failure.event_id()))
+    else {
+        return Ok(None);
+    };
+    Ok((history.recovery_currently_eligible()
+        && history.entries().iter().any(|entry| {
+            matches!(
+                entry,
+                StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
+                    if invoice.invoice_id() == failure.invoice_id()
+                        && invoice.status() == "open"
+            )
+        }))
+    .then_some(failure))
 }
 
 #[cfg(test)]
@@ -439,6 +465,15 @@ mod tests {
             .map(|failure| failure.renewal_id()),
             Some("renewal_one")
         );
+        let retry_event = failure
+            .clone()
+            .with_test_event("evt_retry_2", 1_702_592_010);
+        let retries = [failure.clone(), retry_event];
+        let selected = active_failure_for_term(&open, &retries, &source.allocation, &term)
+            .expect("retries for one renewal are one failure")
+            .expect("open renewal stays eligible");
+        assert_eq!(selected.renewal_id(), "renewal_one");
+        assert_eq!(selected.event_id(), failure.event_id());
 
         for (status, recovery_allowed) in [("void", true), ("uncollectible", true), ("open", false)]
         {
