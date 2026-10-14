@@ -474,6 +474,24 @@ mod tests {
             .expect("open renewal stays eligible");
         assert_eq!(selected.renewal_id(), "renewal_one");
         assert_eq!(selected.event_id(), failure.event_id());
+        let different_renewal = StripeRenewalFailureEvidence::for_test(
+            "allocation:one",
+            "cus_one",
+            "sub_one",
+            "si_one",
+            "pi_failed_two",
+            "pi_predecessor",
+            "renewal_two",
+        );
+        assert!(matches!(
+            active_failure_for_term(
+                &open,
+                &[failure.clone(), different_renewal],
+                &source.allocation,
+                &term
+            ),
+            Err(ProviderCollectionError::InvalidEvidence(_))
+        ));
 
         for (status, recovery_allowed) in [("void", true), ("uncollectible", true), ("open", false)]
         {
