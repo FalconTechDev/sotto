@@ -251,6 +251,32 @@ pub async fn claim_window(
     }))
 }
 
+/// Extend the active lease before handing a retrieved event to a potentially slow repair path.
+pub async fn renew_window_lease(
+    pool: &PgPool,
+    window: &StripeEventRepairWindow,
+) -> Result<(), StripeEventRepairError> {
+    let updated = sqlx::query(
+        "UPDATE stripe_event_reconciliation_state SET \
+         lease_expires_at = now() + ($5 * interval '1 second'), updated_at = now() \
+         WHERE provider_account_id = $1 AND provider_environment = $2 \
+           AND window_start = $3 AND window_end = $4 AND lease_owner = $6 \
+           AND lease_expires_at > now()",
+    )
+    .bind(&window.account_id)
+    .bind(window.environment.as_str())
+    .bind(window.start)
+    .bind(window.end)
+    .bind(LEASE_SECONDS)
+    .bind(&window.lease_owner)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(StripeEventRepairError::LeaseLost);
+    }
+    Ok(())
+}
+
 /// Persist a candidate's immutable API-read provenance and move the cursor after its disposition.
 pub async fn record_event_disposition(
     pool: &PgPool,
@@ -621,6 +647,16 @@ where
         let disposition = if event_type != summary.event_type || created != summary.created {
             StripeEventRepairDisposition::Unresolved("event_list_detail_mismatch")
         } else {
+            if let Err(error) = renew_window_lease(pool, &window).await {
+                let _ = fail_window(
+                    pool,
+                    &window,
+                    "event_application_lease_renewal",
+                    "retryable_failure",
+                )
+                .await;
+                return Err(error.into());
+            }
             match apply(event, retrieved_at).await {
                 Ok(disposition) => disposition,
                 Err(error) => {

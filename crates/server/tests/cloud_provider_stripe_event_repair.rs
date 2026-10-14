@@ -10,9 +10,9 @@ use sotto_server::billing::STRIPE_API_VERSION;
 use sotto_server::cloud_provider::ProviderEnvironment;
 use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
 use sotto_server::cloud_provider_stripe_event_repair::{
-    claim_window, fail_window, finish_page, record_event_disposition, run_once, status_snapshot,
-    StripeEventRepairDisposition, StripeEventRepairError, StripeEventRepairPayloadProvenance,
-    StripeEventRepairReceipt, StripeEventRepairRunOutcome,
+    claim_window, fail_window, finish_page, record_event_disposition, renew_window_lease, run_once,
+    status_snapshot, StripeEventRepairDisposition, StripeEventRepairError,
+    StripeEventRepairPayloadProvenance, StripeEventRepairReceipt, StripeEventRepairRunOutcome,
 };
 use sotto_server::cloud_provider_stripe_http::{StripeReadClient, StripeReadLimits};
 use sotto_server::db;
@@ -628,6 +628,45 @@ async fn concurrent_event_repair_claims_have_one_lease_owner() {
         usize::from(left.is_some()) + usize::from(right.is_some()),
         1
     );
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn renewing_active_event_repair_lease_extends_its_deadline() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    let window = claim_window(&pool, &account, ProviderEnvironment::Test, NOW)
+        .await
+        .expect("claim window")
+        .expect("window is available");
+    sqlx::query(
+        "UPDATE stripe_event_reconciliation_state SET \
+         lease_expires_at = now() + interval '30 seconds' \
+         WHERE provider_account_id = $1 AND provider_environment = 'test'",
+    )
+    .bind(&account)
+    .execute(&pool)
+    .await
+    .expect("shorten lease for deterministic check");
+
+    renew_window_lease(&pool, &window)
+        .await
+        .expect("current owner can extend its active lease");
+    let extended: bool = sqlx::query_scalar(
+        "SELECT lease_expires_at > now() + interval '200 seconds' \
+         FROM stripe_event_reconciliation_state \
+         WHERE provider_account_id = $1 AND provider_environment = 'test'",
+    )
+    .bind(&account)
+    .fetch_one(&pool)
+    .await
+    .expect("read renewed lease");
+    assert!(extended);
     drop(pool);
     database.cleanup().await;
 }
