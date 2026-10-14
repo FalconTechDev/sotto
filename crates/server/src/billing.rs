@@ -53,7 +53,7 @@ use crate::cloud_provider_stripe_sponsored_store::{
 };
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
-use crate::founding_allocator::{self, FoundingOffer};
+use crate::founding_allocator::{self, FoundingDate, FoundingOffer};
 use crate::personal_billing;
 use crate::sponsored_billing::{self, SponsoredSeatAction, SponsoredSeatRequest};
 use crate::state::AppState;
@@ -3532,6 +3532,13 @@ pub(crate) async fn repair_authenticated_stripe_event(
     } else {
         None
     };
+    let prepared_period_end = match personal_coverage.as_ref() {
+        Some(PreparedPersonalInvoiceCoverage { period_end, .. }) => Some(*period_end),
+        _ => None,
+    };
+    if let Some(reason) = paid_invoice_repair_shape_error(&event.data.object, prepared_period_end) {
+        return Ok(StripeEventRepairDisposition::Unresolved(reason));
+    }
 
     let mut tx = pool.begin().await?;
     prune_webhook_events(&mut tx).await?;
@@ -5711,6 +5718,26 @@ fn invoice_period_end(object: &serde_json::Value) -> Option<i64> {
     subscription_line_end.or_else(|| object["period_end"].as_i64().filter(|end| *end > 0))
 }
 
+fn paid_invoice_repair_shape_error(
+    object: &serde_json::Value,
+    prepared_period_end: Option<i64>,
+) -> Option<&'static str> {
+    let period_end = prepared_period_end.or_else(|| invoice_period_end(object));
+    if period_end
+        .and_then(|period_end| FoundingDate::from_unix_seconds(period_end).ok())
+        .is_none()
+    {
+        return Some("paid_invoice_settlement_shape");
+    }
+    if prepared_period_end.is_none()
+        && object["payment_intent"].as_str().is_none()
+        && object["id"].as_str().is_none()
+    {
+        return Some("paid_invoice_settlement_shape");
+    }
+    None
+}
+
 fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
     object["parent"]["subscription_details"]["subscription"].as_str()
 }
@@ -6243,14 +6270,43 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[test]
+    fn malformed_paid_invoice_shape_becomes_an_unresolved_repair() {
+        assert_eq!(
+            paid_invoice_repair_shape_error(&serde_json::json!({"id": "in_1"}), None),
+            Some("paid_invoice_settlement_shape")
+        );
+        assert_eq!(
+            paid_invoice_repair_shape_error(
+                &serde_json::json!({"id": "in_1", "period_end": -1}),
+                None
+            ),
+            Some("paid_invoice_settlement_shape")
+        );
+        assert_eq!(
+            paid_invoice_repair_shape_error(
+                &serde_json::json!({"id": "in_1"}),
+                Some(1_950_000_000)
+            ),
+            None
+        );
+        assert_eq!(
+            paid_invoice_repair_shape_error(
+                &serde_json::json!({"id": "in_1", "period_end": 1_950_000_000}),
+                None
+            ),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn completed_invoice_repairs_skip_reads_without_skipping_unhandled_failures() {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
             return;
         }
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
-        let options = sqlx::postgres::PgConnectOptions::from_str(&database_url)
-            .expect("parse DATABASE_URL");
+        let options =
+            sqlx::postgres::PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
         assert!(
             matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
             "refusing to write test fixtures to non-local database: {}",
