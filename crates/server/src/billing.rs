@@ -39,8 +39,11 @@ use crate::cloud_provider::{
     VerifiedAllocation,
 };
 use crate::cloud_provider_stripe::StripeCoverageConfig;
-use crate::cloud_provider_stripe::{decode_paid_invoice, StripeAllocationBinding};
-use crate::cloud_provider_stripe_http::StripeReadClient;
+use crate::cloud_provider_stripe::{
+    decode_paid_invoice, decode_paid_invoice_from_authenticated_read, StripeAllocationBinding,
+};
+use crate::cloud_provider_stripe_event_repair::StripeEventRepairDisposition;
+use crate::cloud_provider_stripe_http::{AuthenticatedStripeEvent, StripeReadClient};
 use crate::cloud_provider_stripe_sponsored::{
     compose_sponsored_coverage, SponsoredAllocationInterval, SponsoredAllocationManifest,
     SponsoredCoverageResult, SponsoredStripeCoverageConfig,
@@ -3220,7 +3223,13 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         && billing.personal_coverage_ingest_enabled()
         && !processed_duplicate
     {
-        match prepare_personal_invoice_coverage(&state.pool, billing, &body, signature, now).await?
+        match prepare_personal_invoice_coverage(
+            &state.pool,
+            billing,
+            &body,
+            PersonalInvoiceEventSource::Signed { signature, now },
+        )
+        .await?
         {
             PersonalInvoiceCoveragePreparation::NotApplicable => (None, None),
             PersonalInvoiceCoveragePreparation::Prepared(coverage) => (Some(*coverage), None),
@@ -3395,6 +3404,357 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     Ok(())
 }
 
+/// Apply an Event retrieved from Stripe's authenticated Events API using the same settlement
+/// stores as signed webhooks. The sealed transport value remains distinct from webhook signature
+/// provenance; this function accepts only the invoice event types enumerated by the scanner.
+pub(crate) async fn repair_authenticated_stripe_event(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    authenticated: &AuthenticatedStripeEvent,
+    now_epoch: i64,
+) -> Result<StripeEventRepairDisposition> {
+    let event: Event = serde_json::from_value(authenticated.payload().clone())
+        .map_err(|_| Error::BadRequest("malformed authenticated Stripe event".into()))?;
+    if event.id != authenticated.event_id() || event.created < 0 {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "event_identity_mismatch",
+        ));
+    }
+    if !webhook_version_accepted(event.api_version.as_deref()) {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "unsupported_api_version",
+        ));
+    }
+    if !matches!(
+        event.kind.as_str(),
+        "invoice.paid" | "invoice.payment_failed"
+    ) {
+        return Ok(StripeEventRepairDisposition::Unrelated);
+    }
+    if event.kind == "invoice.payment_failed" {
+        return repair_authenticated_personal_renewal_failure(
+            pool,
+            billing,
+            authenticated,
+            now_epoch,
+        )
+        .await;
+    }
+    if invoice_subscription_id_claim(&event.data.object).is_none() {
+        return Ok(StripeEventRepairDisposition::Unrelated);
+    }
+
+    let raw_event = serde_json::to_string(authenticated.payload())
+        .map_err(|_| Error::BadRequest("malformed authenticated Stripe event".into()))?;
+    let (personal_coverage, personal_rejection) = if billing.personal_coverage().is_some() {
+        match prepare_personal_invoice_coverage(
+            pool,
+            billing,
+            &raw_event,
+            PersonalInvoiceEventSource::AuthenticatedRead(authenticated),
+        )
+        .await?
+        {
+            PersonalInvoiceCoveragePreparation::NotApplicable => (None, None),
+            PersonalInvoiceCoveragePreparation::Prepared(coverage) => (Some(*coverage), None),
+            PersonalInvoiceCoveragePreparation::Rejected(reason) => (None, Some(reason)),
+        }
+    } else {
+        (None, None)
+    };
+    let sponsored_coverage = if sponsored_billing_enabled() && billing.personal_coverage().is_some()
+    {
+        Some(prepare_sponsored_invoice_coverage(pool, billing, &raw_event, &event).await?)
+    } else {
+        None
+    };
+
+    let mut tx = pool.begin().await?;
+    prune_webhook_events(&mut tx).await?;
+    let disposition = record_webhook_event(&mut tx, &event).await?;
+    if disposition == EventDisposition::Ignore {
+        if let Some(coverage) = &personal_coverage {
+            accept_personal_invoice_coverage(
+                &mut tx,
+                &coverage.context,
+                &coverage.event,
+                &coverage.allocation,
+                true,
+            )
+            .await?;
+        }
+        if let Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) =
+            sponsored_coverage.as_ref()
+        {
+            accept_sponsored_invoice_coverage(&mut tx, prepared).await?;
+        }
+        if let Some(SponsoredInvoiceCoveragePreparation::Rejected {
+            context,
+            event,
+            reason,
+        }) = sponsored_coverage.as_ref()
+        {
+            reject_sponsored_invoice_coverage(&mut tx, context, event, reason).await?;
+        }
+        tx.commit().await?;
+        if let Some(reason) = personal_rejection {
+            return Ok(StripeEventRepairDisposition::Rejected(reason));
+        }
+        if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
+            sponsored_coverage.as_ref()
+        {
+            return Ok(StripeEventRepairDisposition::Rejected(reason));
+        }
+        if personal_coverage.is_some()
+            || matches!(
+                sponsored_coverage.as_ref(),
+                Some(SponsoredInvoiceCoveragePreparation::Prepared(_))
+            )
+        {
+            return Ok(StripeEventRepairDisposition::Applied);
+        }
+        return Ok(StripeEventRepairDisposition::AlreadyApplied);
+    }
+    if disposition != EventDisposition::Apply {
+        return Err(Error::Internal(
+            "authenticated invoice event has an invalid disposition".into(),
+        ));
+    }
+    invoice_paid(
+        &mut tx,
+        &event.data.object,
+        event.created,
+        billing.price_catalogue(),
+        personal_coverage.as_ref(),
+        sponsored_coverage.as_ref(),
+    )
+    .await?;
+    if let Some(coverage) = &personal_coverage {
+        accept_personal_invoice_coverage(
+            &mut tx,
+            &coverage.context,
+            &coverage.event,
+            &coverage.allocation,
+            true,
+        )
+        .await?;
+    }
+    mark_webhook_event_processed(&mut tx, &event.id).await?;
+    tx.commit().await?;
+
+    if let Some(reason) = personal_rejection {
+        eprintln!(
+            "error: repaired Stripe invoice settled without personal Cloud coverage: {reason}"
+        );
+        return Ok(StripeEventRepairDisposition::Rejected(reason));
+    }
+    if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
+        sponsored_coverage.as_ref()
+    {
+        eprintln!(
+            "error: repaired Stripe invoice settled without sponsored Cloud coverage: {reason}"
+        );
+        return Ok(StripeEventRepairDisposition::Rejected(reason));
+    }
+    Ok(StripeEventRepairDisposition::Applied)
+}
+
+async fn repair_authenticated_personal_renewal_failure(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    authenticated: &AuthenticatedStripeEvent,
+    now_epoch: i64,
+) -> Result<StripeEventRepairDisposition> {
+    let Some((coverage_config, stripe)) = billing.personal_coverage() else {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "personal_coverage_not_configured",
+        ));
+    };
+    let payload = authenticated.payload();
+    let invoice = payload
+        .get("data")
+        .and_then(|data| data.get("object"))
+        .ok_or_else(|| Error::BadRequest("malformed authenticated Stripe event".into()))?;
+    let Some(allocation_reference) = invoice_allocation_reference_claim(invoice) else {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "allocation_reference_missing",
+        ));
+    };
+    let row = sqlx::query(
+        "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
+                allocation.provider_subscription_id, allocation.provider_item_id, \
+                allocation.external_allocation_reference, allocation.coverage_source_id, \
+                allocation.effective_from, allocation.effective_until, allocation.state, \
+                allocation.ownership_evidence_reference, allocation.provider_account_id, \
+                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.provider_namespace = 'stripe' \
+           AND allocation.provider_account_id = $1 AND allocation.provider_environment = $2 \
+           AND allocation.external_allocation_reference = $3",
+    )
+    .bind(&coverage_config.account_id)
+    .bind(coverage_config.environment.as_str())
+    .bind(&allocation_reference)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(StripeEventRepairDisposition::Unrelated);
+    };
+    if row.try_get::<String, _>("payer_kind")? != "personal" {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "sponsored_failure_unsupported",
+        ));
+    }
+    let customer_id: String = row.try_get("provider_customer_id")?;
+    let subscription_id: String = row.try_get("provider_subscription_id")?;
+    let item_id: String = row.try_get("provider_item_id")?;
+    let binding = StripeAllocationBinding::new(
+        allocation_reference,
+        customer_id.clone(),
+        subscription_id.clone(),
+        item_id,
+        ProviderPayerKind::Personal,
+    )
+    .map_err(|_| Error::Internal("stored Stripe allocation binding is invalid".into()))?;
+    let allocation = VerifiedAllocation::new(
+        row.try_get::<String, _>("allocation_id")?,
+        row.try_get::<String, _>("payer_id")?,
+        customer_id,
+        ProviderPayerKind::Personal,
+        row.try_get::<String, _>("beneficiary_id")?,
+        subscription_id,
+        binding.provider_item_id().to_owned(),
+        row.try_get::<String, _>("external_allocation_reference")?,
+        row.try_get::<String, _>("coverage_source_id")?,
+        row.try_get::<i64, _>("effective_from")?,
+        row.try_get::<Option<i64>, _>("effective_until")?,
+        parse_allocation_state(&row.try_get::<String, _>("state")?)?,
+        row.try_get::<String, _>("ownership_evidence_reference")?,
+    )
+    .map_err(|_| Error::Internal("stored Stripe allocation is invalid".into()))?;
+    if row.try_get::<String, _>("provider_account_id")? != coverage_config.account_id
+        || row.try_get::<String, _>("provider_environment")? != coverage_config.environment.as_str()
+    {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "allocation_context_mismatch",
+        ));
+    }
+
+    let mut session = stripe.session();
+    let history_result = stripe
+        .personal_invoice_history(&mut session, &binding)
+        .await
+        .map_err(|_| Error::Internal("Stripe renewal history read failed".into()))?;
+    let history = match history_result {
+        crate::cloud_provider_stripe_http::StripePersonalInvoiceHistoryResult::Observed(
+            history,
+        ) => history,
+        crate::cloud_provider_stripe_http::StripePersonalInvoiceHistoryResult::NeedsEvidence(_) => {
+            return Ok(StripeEventRepairDisposition::Unresolved(
+                "invoice_history_incomplete",
+            ));
+        }
+    };
+    let candidate = match crate::cloud_provider_stripe_repair::decode_authenticated_repair_event(
+        payload,
+        now_epoch,
+        coverage_config,
+        &binding,
+    ) {
+        Ok(candidate) => candidate,
+        Err(crate::cloud_provider_stripe_repair::StripeRepairError::Unsupported(
+            "personal allocation required",
+        )) => {
+            return Ok(StripeEventRepairDisposition::Unresolved(
+                "sponsored_failure_unsupported",
+            ));
+        }
+        Err(crate::cloud_provider_stripe_repair::StripeRepairError::Unsupported(_)) => {
+            return Ok(StripeEventRepairDisposition::Rejected(
+                "renewal_event_unsupported",
+            ));
+        }
+        Err(crate::cloud_provider_stripe_repair::StripeRepairError::OwnershipMismatch) => {
+            return Ok(StripeEventRepairDisposition::Rejected(
+                "renewal_event_binding_mismatch",
+            ));
+        }
+        Err(crate::cloud_provider_stripe_repair::StripeRepairError::UnsupportedApiVersion(_)) => {
+            return Ok(StripeEventRepairDisposition::Unresolved(
+                "unsupported_api_version",
+            ));
+        }
+        Err(crate::cloud_provider_stripe_repair::StripeRepairError::Read(error)) => {
+            return Err(Error::Internal(format!(
+                "Stripe renewal repair read failed: {error}"
+            )));
+        }
+        Err(_) => {
+            return Ok(StripeEventRepairDisposition::Rejected(
+                "renewal_event_malformed",
+            ));
+        }
+    };
+    let linked = crate::cloud_provider_stripe_renewals::link_repaired_candidate(
+        &candidate,
+        coverage_config,
+        &binding,
+        &history,
+    )
+    .map_err(|_| Error::Internal("Stripe renewal history could not be linked".into()))?;
+    let evidence = match linked {
+        crate::cloud_provider_stripe_renewals::StripeRenewalFailureResult::Linked(evidence) => {
+            *evidence
+        }
+        crate::cloud_provider_stripe_renewals::StripeRenewalFailureResult::NeedsEvidence(
+            reason,
+        ) => {
+            return Ok(StripeEventRepairDisposition::Unresolved(match reason {
+                crate::cloud_provider_stripe_renewals::StripeRenewalFailureNeedsEvidence::TruncatedInvoiceLines => "renewal_history_truncated",
+                crate::cloud_provider_stripe_renewals::StripeRenewalFailureNeedsEvidence::MissingProrationProof => "renewal_proration_unproven",
+                crate::cloud_provider_stripe_renewals::StripeRenewalFailureNeedsEvidence::NoMatchingPaidPredecessor => "renewal_predecessor_missing",
+                crate::cloud_provider_stripe_renewals::StripeRenewalFailureNeedsEvidence::AmbiguousPaidPredecessor => "renewal_predecessor_ambiguous",
+            }));
+        }
+    };
+    let context = coverage_config
+        .provider_context()
+        .map_err(|_| Error::Internal("Stripe provider context is invalid".into()))?;
+    let mut tx = pool.begin().await?;
+    let subscription_id = Some(evidence.subscription_id());
+    lock_subscription(&mut tx, evidence.subscription_id()).await?;
+    record_webhook_receipt(
+        &mut tx,
+        &Event {
+            id: evidence.event_id().to_owned(),
+            created: evidence.event_created_at(),
+            api_version: payload
+                .get("api_version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: payload["data"]["object"].clone(),
+            },
+        },
+        subscription_id,
+    )
+    .await?;
+    crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure(
+        &mut tx,
+        &context,
+        &allocation,
+        &evidence,
+        true,
+    )
+    .await
+    .map_err(|_| Error::Internal("personal renewal failure could not be recorded".into()))?;
+    mark_webhook_event_processed(&mut tx, evidence.event_id()).await?;
+    tx.commit().await?;
+    Ok(StripeEventRepairDisposition::Applied)
+}
+
 struct PreparedPersonalInvoiceCoverage {
     context: ProviderContext,
     event: crate::cloud_provider::VerifiedProviderEvent,
@@ -3407,6 +3767,11 @@ enum PersonalInvoiceCoveragePreparation {
     NotApplicable,
     Prepared(Box<PreparedPersonalInvoiceCoverage>),
     Rejected(&'static str),
+}
+
+enum PersonalInvoiceEventSource<'a> {
+    Signed { signature: &'a str, now: i64 },
+    AuthenticatedRead(&'a AuthenticatedStripeEvent),
 }
 
 struct PreparedSponsoredInvoiceSeat {
@@ -3796,8 +4161,7 @@ async fn prepare_personal_invoice_coverage(
     pool: &sqlx::PgPool,
     billing: &BillingState,
     raw_event: &str,
-    signature: &str,
-    now_epoch: i64,
+    source: PersonalInvoiceEventSource<'_>,
 ) -> Result<PersonalInvoiceCoveragePreparation> {
     let (coverage_config, stripe) = billing
         .personal_coverage()
@@ -4002,15 +4366,26 @@ async fn prepare_personal_invoice_coverage(
             ));
         }
     };
-    let evidence = match decode_paid_invoice(
-        raw_event.as_bytes(),
-        signature,
-        &billing.webhook_secret,
-        now_epoch,
-        coverage_config,
-        &binding,
-        &settlement,
-    ) {
+    let decoded = match source {
+        PersonalInvoiceEventSource::Signed { signature, now } => decode_paid_invoice(
+            raw_event.as_bytes(),
+            signature,
+            &billing.webhook_secret,
+            now,
+            coverage_config,
+            &binding,
+            &settlement,
+        ),
+        PersonalInvoiceEventSource::AuthenticatedRead(event) => {
+            decode_paid_invoice_from_authenticated_read(
+                event,
+                coverage_config,
+                &binding,
+                &settlement,
+            )
+        }
+    };
+    let evidence = match decoded {
         Ok(evidence) => evidence,
         Err(_) => {
             return Ok(PersonalInvoiceCoveragePreparation::Rejected(
