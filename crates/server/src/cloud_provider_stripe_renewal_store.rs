@@ -534,11 +534,12 @@ async fn compare_existing(
                 accepted_generation \
          FROM cloud_provider_stripe_renewal_failures \
          WHERE provider_namespace = 'stripe' AND provider_account_id = $1 \
-           AND provider_environment = $2 AND event_id = $3",
+           AND provider_environment = $2 AND event_id = $3 AND beneficiary_id = $4",
     )
     .bind(&context.account_id)
     .bind(context.environment.as_str())
     .bind(evidence.event_id())
+    .bind(&allocation.beneficiary_id)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(StripeRenewalFailureStoreError::EvidenceMissing)?;
