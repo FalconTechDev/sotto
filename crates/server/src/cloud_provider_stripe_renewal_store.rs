@@ -132,6 +132,7 @@ pub async fn load_personal_renewal_failures(
           AND association.provider_account_id = failure.provider_account_id \
           AND association.provider_environment = failure.provider_environment \
           AND association.event_id = failure.event_id \
+          AND association.beneficiary_id = failure.beneficiary_id \
          JOIN cloud_provider_allocations AS allocation \
            ON allocation.allocation_id = association.allocation_id \
          JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
@@ -232,6 +233,7 @@ pub async fn load_personal_renewal_failures(
           AND association.provider_account_id = failure.provider_account_id \
           AND association.provider_environment = failure.provider_environment \
           AND association.event_id = failure.event_id \
+          AND association.beneficiary_id = failure.beneficiary_id \
          JOIN cloud_provider_allocations AS allocation \
            ON allocation.allocation_id = association.allocation_id \
          JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
@@ -441,7 +443,7 @@ pub async fn accept_personal_renewal_failure(
           renewal_period_start, renewal_period_end, event_created_at, interval, accepted_generation) \
          VALUES ('stripe', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                  $16, $17, $18, $19, $20, $21, $22, $23, $24) \
-         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id) \
+         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
          DO NOTHING",
     )
     .bind(evidence.provider_account_id())
