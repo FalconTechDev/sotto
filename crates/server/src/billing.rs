@@ -3219,6 +3219,22 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         } else {
             false
         };
+    let accepted_failure_duplicate =
+        if event.kind == "invoice.payment_failed" && billing.personal_coverage_ingest_enabled() {
+            if let Some((coverage, _)) = billing.personal_coverage() {
+                repair_event_already_completed(
+                    &state.pool,
+                    &coverage.account_id,
+                    coverage.environment,
+                    &event,
+                )
+                .await?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
     let (personal_coverage, coverage_rejection) = if event.kind == "invoice.paid"
         && billing.personal_coverage_ingest_enabled()
         && !processed_duplicate
@@ -3237,6 +3253,14 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         }
     } else {
         (None, None)
+    };
+    let personal_renewal_failure = if event.kind == "invoice.payment_failed"
+        && billing.personal_coverage_ingest_enabled()
+        && !accepted_failure_duplicate
+    {
+        prepare_signed_personal_renewal_failure(&state.pool, billing, &body, signature, now).await?
+    } else {
+        None
     };
     let sponsored_coverage = if event.kind == "invoice.paid"
         && billing.personal_coverage_ingest_enabled()
@@ -3313,6 +3337,15 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             tx.commit().await?;
             return Ok(());
         }
+        if let Some(failure) = personal_renewal_failure.as_ref() {
+            accept_prepared_personal_renewal_failure(&mut tx, failure).await?;
+            if let Some(subscription_id) = subscription_id {
+                update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+            }
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
         let subscription_id = subscription_id.ok_or_else(|| {
             Error::Config("stripe reconciliation event has no subscription id".into())
         })?;
@@ -3374,6 +3407,11 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                         true,
                     )
                     .await?;
+                }
+            }
+            "invoice.payment_failed" => {
+                if let Some(failure) = personal_renewal_failure.as_ref() {
+                    accept_prepared_personal_renewal_failure(&mut tx, failure).await?;
                 }
             }
             _ => {}
@@ -3850,6 +3888,147 @@ enum PersonalInvoiceCoveragePreparation {
 enum PersonalInvoiceEventSource<'a> {
     Signed { signature: &'a str, now: i64 },
     AuthenticatedRead(&'a AuthenticatedStripeEvent),
+}
+
+struct PreparedPersonalRenewalFailure {
+    context: ProviderContext,
+    allocation: VerifiedAllocation,
+    evidence: crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence,
+}
+
+async fn prepare_signed_personal_renewal_failure(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    raw_event: &str,
+    signature: &str,
+    now_epoch: i64,
+) -> Result<Option<PreparedPersonalRenewalFailure>> {
+    let Some((coverage_config, stripe)) = billing.personal_coverage() else {
+        return Ok(None);
+    };
+    let payload: serde_json::Value = serde_json::from_str(raw_event)
+        .map_err(|_| Error::BadRequest("malformed signed Stripe event".into()))?;
+    let invoice = &payload["data"]["object"];
+    let Some(allocation_reference) = invoice_allocation_reference_claim(invoice) else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
+                allocation.provider_subscription_id, allocation.provider_item_id, \
+                allocation.external_allocation_reference, allocation.coverage_source_id, \
+                allocation.effective_from, allocation.effective_until, allocation.state, \
+                allocation.ownership_evidence_reference, allocation.provider_account_id, \
+                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.provider_namespace = 'stripe' \
+           AND allocation.provider_account_id = $1 AND allocation.provider_environment = $2 \
+           AND allocation.external_allocation_reference = $3",
+    )
+    .bind(&coverage_config.account_id)
+    .bind(coverage_config.environment.as_str())
+    .bind(&allocation_reference)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row.try_get::<String, _>("payer_kind")? != "personal" {
+        return Ok(None);
+    }
+    let customer_id: String = row.try_get("provider_customer_id")?;
+    let subscription_id: String = row.try_get("provider_subscription_id")?;
+    let provider_item_id: String = row.try_get("provider_item_id")?;
+    let binding = StripeAllocationBinding::new(
+        allocation_reference,
+        customer_id.clone(),
+        subscription_id.clone(),
+        provider_item_id.clone(),
+        ProviderPayerKind::Personal,
+    )
+    .map_err(|_| Error::Internal("stored Stripe allocation binding is invalid".into()))?;
+    let allocation = VerifiedAllocation::new(
+        row.try_get::<String, _>("allocation_id")?,
+        row.try_get::<String, _>("payer_id")?,
+        customer_id,
+        ProviderPayerKind::Personal,
+        row.try_get::<String, _>("beneficiary_id")?,
+        subscription_id.clone(),
+        provider_item_id,
+        row.try_get::<String, _>("external_allocation_reference")?,
+        row.try_get::<String, _>("coverage_source_id")?,
+        row.try_get::<i64, _>("effective_from")?,
+        row.try_get::<Option<i64>, _>("effective_until")?,
+        parse_allocation_state(&row.try_get::<String, _>("state")?)?,
+        row.try_get::<String, _>("ownership_evidence_reference")?,
+    )
+    .map_err(|_| Error::Internal("stored Stripe allocation is invalid".into()))?;
+    if row.try_get::<String, _>("provider_account_id")? != coverage_config.account_id
+        || row.try_get::<String, _>("provider_environment")? != coverage_config.environment.as_str()
+    {
+        return Ok(None);
+    }
+
+    let mut session = stripe.session();
+    let history = match stripe
+        .personal_invoice_history(&mut session, &binding)
+        .await
+        .map_err(|_| Error::Internal("Stripe renewal history read failed".into()))?
+    {
+        crate::cloud_provider_stripe_http::StripePersonalInvoiceHistoryResult::Observed(
+            history,
+        ) => history,
+        crate::cloud_provider_stripe_http::StripePersonalInvoiceHistoryResult::NeedsEvidence(_) => {
+            return Ok(None);
+        }
+    };
+    let result = crate::cloud_provider_stripe_renewals::decode_personal_renewal_failure(
+        raw_event.as_bytes(),
+        signature,
+        &billing.webhook_secret,
+        now_epoch,
+        coverage_config,
+        &binding,
+        &history,
+    );
+    let evidence = match result {
+        Ok(crate::cloud_provider_stripe_renewals::StripeRenewalFailureResult::Linked(evidence)) => {
+            *evidence
+        }
+        Ok(crate::cloud_provider_stripe_renewals::StripeRenewalFailureResult::NeedsEvidence(_)) => {
+            return Ok(None);
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: signed Stripe renewal failure did not produce coverage evidence: {error}"
+            );
+            return Ok(None);
+        }
+    };
+    let context = coverage_config
+        .provider_context()
+        .map_err(|_| Error::Internal("Stripe provider context is invalid".into()))?;
+    Ok(Some(PreparedPersonalRenewalFailure {
+        context,
+        allocation,
+        evidence,
+    }))
+}
+
+async fn accept_prepared_personal_renewal_failure(
+    tx: &mut Transaction<'_, Postgres>,
+    failure: &PreparedPersonalRenewalFailure,
+) -> Result<()> {
+    crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure(
+        tx,
+        &failure.context,
+        &failure.allocation,
+        &failure.evidence,
+        true,
+    )
+    .await
+    .map_err(|_| Error::Internal("personal renewal failure could not be recorded".into()))?;
+    Ok(())
 }
 
 struct PreparedSponsoredInvoiceSeat {
