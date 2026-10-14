@@ -3556,11 +3556,13 @@ async fn prepare_sponsored_invoice_coverage(
     let seats = sqlx::query(
         "SELECT seat.seat_id, seat.beneficiary_id, seat.offer, seat.effective_from, \
                 seat.effective_until, seat.state, seat.operation_id, seat.provider_item_id, \
-                seat.allocation_id, operation.state AS operation_state, operation.offer AS operation_offer \
+                seat.allocation_id, operation.state AS operation_state, operation.offer AS operation_offer, \
+                operation.provider_item_id AS operation_provider_item_id \
          FROM billing_sponsored_seats AS seat \
          JOIN billing_sponsored_operations AS operation ON operation.operation_id = seat.operation_id \
          WHERE seat.organization_id = $1 \
            AND operation.state IN ('active','provider_pending') \
+           AND operation.provider_subscription_id = $4 \
            AND seat.state IN ('pending','active','scheduled_removal','replaced','canceled') \
            AND seat.effective_from < $2 \
            AND (seat.effective_until IS NULL OR seat.effective_until > $3) \
@@ -3569,6 +3571,7 @@ async fn prepare_sponsored_invoice_coverage(
     .bind(&organization_id)
     .bind(settlement.period_end())
     .bind(settlement.period_start())
+    .bind(&subscription_id)
     .fetch_all(pool)
     .await?;
     if seats.len() > 128 {
@@ -3607,11 +3610,21 @@ async fn prepare_sponsored_invoice_coverage(
             {
                 continue;
             }
-            let stored_item: Option<String> = seat.try_get("provider_item_id")?;
-            if stored_item
+            let seat_item: Option<String> = seat.try_get("provider_item_id")?;
+            let operation_item: Option<String> = seat.try_get("operation_provider_item_id")?;
+            if seat_item
                 .as_deref()
-                .is_some_and(|item_id| item_id != line.provider_item_id())
+                .zip(operation_item.as_deref())
+                .is_some_and(|(seat_item, operation_item)| seat_item != operation_item)
             {
+                let event = event.clone();
+                return Ok(SponsoredInvoiceCoveragePreparation::Rejected {
+                    context,
+                    event: Box::new(event),
+                    reason: "sponsored_invoice_item_binding_mismatch",
+                });
+            }
+            if seat_item.as_deref().or(operation_item.as_deref()) != Some(line.provider_item_id()) {
                 continue;
             }
             let seat_id: String = seat.try_get("seat_id")?;
@@ -3725,7 +3738,14 @@ async fn prepare_sponsored_invoice_coverage(
     };
     match compose_sponsored_coverage(&sponsored, &manifest, &settlement) {
         Ok(SponsoredCoverageResult::Candidate(_)) => {}
-        Ok(SponsoredCoverageResult::NeedsEvidence(_)) | Err(_) => {
+        Ok(SponsoredCoverageResult::NeedsEvidence(_)) => {
+            return Ok(SponsoredInvoiceCoveragePreparation::Rejected {
+                context,
+                event: Box::new(event),
+                reason: "sponsored_invoice_manifest_mismatch",
+            });
+        }
+        Err(_) => {
             return Ok(SponsoredInvoiceCoveragePreparation::Rejected {
                 context,
                 event: Box::new(event),

@@ -306,15 +306,21 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     let owner_id = format!("sponsored-coverage-owner-{fixture}");
     let monthly_user = format!("sponsored-coverage-monthly-{fixture}");
     let founding_user = format!("sponsored-coverage-founding-{fixture}");
+    let unbound_item_user = format!("sponsored-coverage-unbound-item-{fixture}");
+    let other_subscription_user = format!("sponsored-coverage-other-subscription-{fixture}");
     sqlx::query(
         "INSERT INTO users (id, oauth_provider, oauth_subject) \
          VALUES ($1, 'sponsored-coverage-test', $1), \
                 ($2, 'sponsored-coverage-test', $2), \
-                ($3, 'sponsored-coverage-test', $3)",
+                ($3, 'sponsored-coverage-test', $3), \
+                ($4, 'sponsored-coverage-test', $4), \
+                ($5, 'sponsored-coverage-test', $5)",
     )
     .bind(&owner_id)
     .bind(&monthly_user)
     .bind(&founding_user)
+    .bind(&unbound_item_user)
+    .bind(&other_subscription_user)
     .execute(&pool)
     .await
     .unwrap();
@@ -357,6 +363,53 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             item_id: &monthly_item,
             customer_id: &customer_id,
             subscription_id: &subscription_id,
+            start: period_start,
+            end: period_end,
+            now,
+        },
+    )
+    .await;
+    let unbound_operation = seed_sponsored_operation(
+        &pool,
+        SponsoredOperationFixture {
+            organization_id: &organization_id,
+            owner_id: &owner_id,
+            beneficiary_id: &unbound_item_user,
+            offer: BillingOffer::StandardMonthly,
+            item_id: &monthly_item,
+            customer_id: &customer_id,
+            subscription_id: &subscription_id,
+            start: period_start,
+            end: period_end,
+            now,
+        },
+    )
+    .await;
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET provider_item_id = NULL WHERE operation_id = $1",
+    )
+    .bind(&unbound_operation)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET provider_item_id = NULL WHERE operation_id = $1",
+    )
+    .bind(&unbound_operation)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let old_subscription_id = format!("sub_old_{fixture}");
+    seed_sponsored_operation(
+        &pool,
+        SponsoredOperationFixture {
+            organization_id: &organization_id,
+            owner_id: &owner_id,
+            beneficiary_id: &other_subscription_user,
+            offer: BillingOffer::StandardMonthly,
+            item_id: &monthly_item,
+            customer_id: &customer_id,
+            subscription_id: &old_subscription_id,
             start: period_start,
             end: period_end,
             now,
@@ -701,14 +754,16 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     .await
     .unwrap();
     assert_eq!(provider_state, (1, 2, 2, 2));
-    let scope_states: Vec<String> = sqlx::query_scalar(
-        "SELECT status FROM cloud_provider_event_scopes WHERE event_id = $1 ORDER BY beneficiary_id",
+    let scoped_beneficiaries: Vec<String> = sqlx::query_scalar(
+        "SELECT beneficiary_id FROM cloud_provider_event_scopes WHERE event_id = $1 ORDER BY beneficiary_id",
     )
     .bind(&event_id)
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(scope_states, ["pending", "pending"]);
+    let mut expected_beneficiaries = vec![monthly_user.clone(), founding_user.clone()];
+    expected_beneficiaries.sort();
+    assert_eq!(scoped_beneficiaries, expected_beneficiaries);
 
     let mut executor =
         sotto_server::cloud_provider_stripe_refresh_executor::StripeRefreshExecutor::new(
@@ -809,7 +864,12 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
 
     stripe_task.abort();
 
-    let beneficiary_ids = vec![monthly_user.clone(), founding_user.clone()];
+    let beneficiary_ids = vec![
+        monthly_user.clone(),
+        founding_user.clone(),
+        unbound_item_user,
+        other_subscription_user,
+    ];
     let event_ids = vec![event_id.clone(), rejected_event_id];
     let subscription_ids = vec![
         subscription_id.clone(),
