@@ -3539,6 +3539,9 @@ pub(crate) async fn repair_authenticated_stripe_event(
         )
         .await?;
     }
+    if let Some(subscription_id) = event_subscription_id(&event) {
+        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+    }
     mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
 
