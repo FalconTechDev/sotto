@@ -20,10 +20,12 @@ use crate::cloud_provider::{
 use crate::cloud_provider_stripe::STRIPE_NAMESPACE;
 use crate::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use crate::cloud_provider_stripe_authority::StripeAuthoritySource;
+use crate::cloud_provider_stripe_corrections::StripeRetainedPaidTerm;
 use crate::cloud_provider_stripe_http::{
-    StripePersonalInvoiceHistoryEntry, StripePersonalInvoiceHistoryResult, StripeReadClient,
-    StripeReadSession,
+    StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
+    StripePersonalInvoiceHistoryResult, StripeReadClient, StripeReadSession,
 };
+use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
 use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,6 +199,7 @@ pub(crate) struct StripeHistoryClient {
     client: StripeReadClient,
     session: StripeReadSession,
     prepared: StripePreparedCollection,
+    renewal_failures: Vec<StripeRenewalFailureEvidence>,
 }
 
 impl StripeHistoryClient {
@@ -206,7 +209,16 @@ impl StripeHistoryClient {
             client,
             session,
             prepared,
+            renewal_failures: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_renewal_failures(
+        mut self,
+        renewal_failures: Vec<StripeRenewalFailureEvidence>,
+    ) -> Self {
+        self.renewal_failures = renewal_failures;
+        self
     }
 }
 
@@ -250,14 +262,24 @@ impl ProviderHistoryClient for StripeHistoryClient {
         let mut evidence = Vec::new();
         for entry in history.entries() {
             if let StripePersonalInvoiceHistoryEntry::Paid(term) = entry {
+                let active_failure = active_failure_for_term(
+                    &history,
+                    &self.renewal_failures,
+                    &source.allocation,
+                    term,
+                )?;
                 paid_intervals.push(ConfirmedPaidInterval {
                     coverage_id: term.invoice_id().to_owned(),
                     source_id: binding.source_id.clone(),
                     starts_at: term.period_start(),
                     paid_until: term.period_end(),
-                    failed_renewal_id: None,
+                    failed_renewal_id: active_failure
+                        .map(|failure| failure.renewal_id().to_owned()),
                 });
                 evidence.push(term.evidence_reference().to_owned());
+                if let Some(failure) = active_failure {
+                    evidence.push(failure.evidence_reference().to_owned());
+                }
             }
         }
         evidence.sort();
@@ -272,11 +294,49 @@ impl ProviderHistoryClient for StripeHistoryClient {
     }
 }
 
+fn active_failure_for_term<'a>(
+    history: &StripePersonalInvoiceHistory,
+    failures: &'a [StripeRenewalFailureEvidence],
+    allocation: &StripeAllocationBinding,
+    term: &StripeRetainedPaidTerm,
+) -> Result<Option<&'a StripeRenewalFailureEvidence>, ProviderCollectionError> {
+    let linked = failures
+        .iter()
+        .filter(|failure| {
+            failure.allocation_reference() == allocation.allocation_reference()
+                && failure.customer_id() == allocation.customer_id()
+                && failure.subscription_id() == allocation.subscription_id()
+                && failure.provider_item_id() == allocation.provider_item_id()
+                && failure.predecessor_invoice_id() == term.invoice_id()
+        })
+        .collect::<Vec<_>>();
+    if linked.len() > 1 {
+        return Err(ProviderCollectionError::InvalidEvidence(
+            "multiple accepted renewal failures target one paid term".into(),
+        ));
+    }
+    Ok(linked.first().copied().filter(|failure| {
+        history.recovery_currently_eligible()
+            && history.entries().iter().any(|entry| {
+                matches!(
+                    entry,
+                    StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
+                        if invoice.invoice_id() == failure.invoice_id()
+                            && invoice.status() == "open"
+                )
+            })
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cloud_coverage_reconciliation::CollectionStatus;
     use crate::cloud_provider::PayerKind;
+    use crate::cloud_provider_stripe::{StripeInterval, StripePersonalInvoiceObservation};
+    use crate::cloud_provider_stripe_corrections::StripeRetainedPaidTerm;
+    use crate::cloud_provider_stripe_http::StripeNonPaidInvoice;
+    use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
 
     fn config() -> StripeCoverageConfig {
         StripeCoverageConfig::new(
@@ -322,6 +382,89 @@ mod tests {
             1,
             "source:evidence",
         )
+    }
+
+    fn paid_term() -> StripeRetainedPaidTerm {
+        StripeRetainedPaidTerm::for_test(StripePersonalInvoiceObservation::for_test(
+            "pi_predecessor",
+            "cus_one",
+            "sub_one",
+            "si_one",
+            "allocation:one",
+            StripeInterval::Month,
+            1_700_000_000,
+            1_702_592_000,
+            "paid-evidence",
+        ))
+    }
+
+    fn renewal_failure() -> StripeRenewalFailureEvidence {
+        StripeRenewalFailureEvidence::for_test(
+            "allocation:one",
+            "cus_one",
+            "sub_one",
+            "si_one",
+            "pi_failed",
+            "pi_predecessor",
+            "renewal_one",
+        )
+    }
+
+    #[test]
+    fn renewal_recovery_requires_a_current_open_invoice_and_live_subscription() {
+        let source = source();
+        let term = paid_term();
+        let failure = renewal_failure();
+        let open = StripePersonalInvoiceHistory::for_test(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "sub_one",
+            "cus_one",
+            vec![
+                StripePersonalInvoiceHistoryEntry::Paid(term.clone()),
+                StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::for_test(
+                    "pi_failed",
+                    "open",
+                )),
+            ],
+        );
+        assert_eq!(
+            active_failure_for_term(
+                &open,
+                std::slice::from_ref(&failure),
+                &source.allocation,
+                &term
+            )
+            .unwrap()
+            .map(|failure| failure.renewal_id()),
+            Some("renewal_one")
+        );
+
+        for (status, recovery_allowed) in [("void", true), ("uncollectible", true), ("open", false)]
+        {
+            let history = StripePersonalInvoiceHistory::for_test_with_recovery(
+                "acct_test",
+                ProviderEnvironment::Test,
+                "sub_one",
+                "cus_one",
+                recovery_allowed,
+                vec![
+                    StripePersonalInvoiceHistoryEntry::Paid(term.clone()),
+                    StripePersonalInvoiceHistoryEntry::NonPaid(StripeNonPaidInvoice::for_test(
+                        "pi_failed",
+                        status,
+                    )),
+                ],
+            );
+            assert!(active_failure_for_term(
+                &history,
+                std::slice::from_ref(&failure),
+                &source.allocation,
+                &term
+            )
+            .unwrap()
+            .is_none());
+        }
     }
 
     #[test]
