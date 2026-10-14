@@ -194,15 +194,17 @@ async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
             ..
         }
     ));
-    assert_eq!(seen.lock().unwrap().as_slice(), &[event_id.clone()]);
-    let calls = server.calls.lock().unwrap();
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        std::slice::from_ref(&event_id)
+    );
+    let calls = server.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[0], "/v1/account");
     assert!(calls[1].starts_with("/v1/events?"));
     assert!(calls[1].contains("types%5B%5D=invoice.paid"));
     assert!(calls[1].contains("created%5Bgte%5D="));
     assert_eq!(calls[2], format!("/v1/events/{event_id}"));
-    drop(calls);
     let receipt = sqlx::query(
         "SELECT disposition, event_type, provider_created_at, api_version, payload_hash \
          FROM stripe_event_repair_receipts WHERE provider_account_id = $1 AND event_id = $2",
