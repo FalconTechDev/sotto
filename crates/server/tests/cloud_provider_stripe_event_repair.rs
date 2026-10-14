@@ -354,6 +354,85 @@ async fn malformed_event_detail_becomes_a_durable_unresolved_receipt() {
 }
 
 #[tokio::test]
+async fn missing_event_detail_becomes_a_durable_unresolved_receipt() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    let pool = database.pool.clone();
+    migrate(&pool).await;
+    let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
+    let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
+    let created = NOW - 30 * 24 * 60 * 60 + 200;
+    let server = event_api_server(&account, &event_id, created, false, true).await;
+    let config = stripe_config(&account);
+    let stripe = StripeReadClient::for_test(
+        "sk_test_event_repair",
+        &config,
+        server.origin.clone(),
+        StripeReadLimits::default(),
+    )
+    .expect("construct bounded test Stripe client");
+    let outcome = run_once(
+        &pool,
+        &stripe,
+        &account,
+        ProviderEnvironment::Test,
+        NOW,
+        |_event, _retrieved_at| async {
+            panic!("missing detail must not enter the event application callback")
+        },
+    )
+    .await
+    .expect("persist missing event detail as unresolved and continue");
+    assert!(matches!(
+        outcome,
+        StripeEventRepairRunOutcome::PageCompleted {
+            events: 1,
+            unresolved: 1,
+            window_completed: true,
+            ..
+        }
+    ));
+    let receipt = sqlx::query(
+        "SELECT retrieval_status, api_version, payload_hash, disposition, reason_code \
+         FROM stripe_event_repair_receipts WHERE provider_account_id = $1 AND event_id = $2",
+    )
+    .bind(&account)
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("unresolved receipt is durable");
+    assert_eq!(
+        receipt.try_get::<String, _>("retrieval_status").unwrap(),
+        "detail_unavailable"
+    );
+    assert!(receipt
+        .try_get::<Option<String>, _>("api_version")
+        .unwrap()
+        .is_none());
+    assert!(receipt
+        .try_get::<Option<String>, _>("payload_hash")
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        receipt.try_get::<String, _>("disposition").unwrap(),
+        "unresolved"
+    );
+    assert_eq!(
+        receipt.try_get::<String, _>("reason_code").unwrap(),
+        "event_detail_missing"
+    );
+    let status = status_snapshot(&pool, &account, ProviderEnvironment::Test)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.unresolved_count, 1);
+    assert_eq!(status.completed_through, Some(created - 200 + 24 * 60 * 60));
+    drop(pool);
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn event_repair_resumes_a_page_and_only_completes_after_its_final_receipt() {
     let Some(database) = DisposableDatabase::create().await else {
         return;
