@@ -37,6 +37,7 @@ struct EventApiState {
     created: i64,
     detail_available: bool,
     detail_missing: bool,
+    detail_missing_object: bool,
     calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -86,7 +87,17 @@ async fn event_api_handler(
                     .body(Body::empty())
                     .unwrap();
             }
-            if state.detail_available {
+            if state.detail_missing_object {
+                json!({
+                    "object": "event",
+                    "id": state.event_id,
+                    "type": "invoice.paid",
+                    "created": state.created,
+                    "api_version": STRIPE_API_VERSION,
+                    "livemode": false,
+                    "data": {}
+                })
+            } else if state.detail_available {
                 json!({
                     "object": "event",
                     "id": state.event_id,
@@ -126,6 +137,7 @@ async fn event_api_server(
     created: i64,
     detail_available: bool,
     detail_missing: bool,
+    detail_missing_object: bool,
 ) -> EventApiServer {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let state = EventApiState {
@@ -134,6 +146,7 @@ async fn event_api_server(
         created,
         detail_available,
         detail_missing,
+        detail_missing_object,
         calls: Arc::clone(&calls),
     };
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -177,7 +190,7 @@ async fn scanner_retrieves_each_listed_event_and_checkpoints_its_disposition() {
     let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let created = NOW - 30 * 24 * 60 * 60 + 100;
-    let server = event_api_server(&account, &event_id, created, true, false).await;
+    let server = event_api_server(&account, &event_id, created, true, false, false).await;
     let config = stripe_config(&account);
     let stripe = StripeReadClient::for_test(
         "sk_test_event_repair",
@@ -285,7 +298,7 @@ async fn malformed_event_detail_becomes_a_durable_unresolved_receipt() {
     let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let created = NOW - 30 * 24 * 60 * 60 + 200;
-    let server = event_api_server(&account, &event_id, created, false, false).await;
+    let server = event_api_server(&account, &event_id, created, false, false, true).await;
     let config = stripe_config(&account);
     let stripe = StripeReadClient::for_test(
         "sk_test_event_repair",
@@ -363,7 +376,7 @@ async fn missing_event_detail_becomes_a_durable_unresolved_receipt() {
     let account = format!("acct_{}", uuid::Uuid::new_v4().simple());
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let created = NOW - 30 * 24 * 60 * 60 + 200;
-    let server = event_api_server(&account, &event_id, created, false, true).await;
+    let server = event_api_server(&account, &event_id, created, false, true, false).await;
     let config = stripe_config(&account);
     let stripe = StripeReadClient::for_test(
         "sk_test_event_repair",

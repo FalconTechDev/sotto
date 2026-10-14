@@ -470,6 +470,12 @@ impl StripeReadClient {
                 value.get("type").and_then(Value::as_str),
                 Some("invoice.paid" | "invoice.payment_failed")
             )
+            || value
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("object"))
+                .and_then(Value::as_object)
+                .is_none()
         {
             return Err(StripeReadError::MalformedResponse(
                 "event context or identity",
