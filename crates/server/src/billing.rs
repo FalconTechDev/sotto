@@ -36,7 +36,7 @@ use crate::billing_refunds::{self, CorrectionReason, PayerKind};
 use crate::cloud_provider::{
     accept_provider_invalidation, record_verified_event, register_verified_allocation,
     reject_verified_event, AllocationState, PayerKind as ProviderPayerKind, ProviderContext,
-    VerifiedAllocation,
+    ProviderEnvironment, VerifiedAllocation,
 };
 use crate::cloud_provider_stripe::StripeCoverageConfig;
 use crate::cloud_provider_stripe::{
@@ -3407,6 +3407,60 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 /// Apply an Event retrieved from Stripe's authenticated Events API using the same settlement
 /// stores as signed webhooks. The sealed transport value remains distinct from webhook signature
 /// provenance; this function accepts only the invoice event types enumerated by the scanner.
+async fn repair_event_already_completed(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    environment: ProviderEnvironment,
+    event: &Event,
+) -> Result<bool> {
+    let processed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events \
+         WHERE event_id = $1 AND processed_at IS NOT NULL)",
+    )
+    .bind(&event.id)
+    .fetch_one(pool)
+    .await?;
+    if !processed {
+        return Ok(false);
+    }
+    match event.kind.as_str() {
+        "invoice.paid" => Ok(sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM cloud_provider_event_receipts receipt \
+                 WHERE receipt.provider_namespace = 'stripe' \
+                   AND receipt.provider_account_id = $1 \
+                   AND receipt.provider_environment = $2 \
+                   AND receipt.event_id = $3 \
+                   AND receipt.status IN ('applied', 'rejected') \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM cloud_provider_event_scopes scope \
+                       WHERE scope.provider_namespace = receipt.provider_namespace \
+                         AND scope.provider_account_id = receipt.provider_account_id \
+                         AND scope.provider_environment = receipt.provider_environment \
+                         AND scope.event_id = receipt.event_id \
+                         AND scope.status = 'pending' \
+                   ) \
+             )",
+        )
+        .bind(account_id)
+        .bind(environment.as_str())
+        .bind(&event.id)
+        .fetch_one(pool)
+        .await?),
+        "invoice.payment_failed" => Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM cloud_provider_stripe_renewal_failures \
+             WHERE provider_namespace = 'stripe' AND provider_account_id = $1 \
+               AND provider_environment = $2 AND event_id = $3)",
+        )
+        .bind(account_id)
+        .bind(environment.as_str())
+        .bind(&event.id)
+        .fetch_one(pool)
+        .await?),
+        _ => Ok(false),
+    }
+}
+
 pub(crate) async fn repair_authenticated_stripe_event(
     pool: &sqlx::PgPool,
     billing: &BillingState,
@@ -3430,6 +3484,16 @@ pub(crate) async fn repair_authenticated_stripe_event(
         "invoice.paid" | "invoice.payment_failed"
     ) {
         return Ok(StripeEventRepairDisposition::Unrelated);
+    }
+    if repair_event_already_completed(
+        pool,
+        authenticated.account_id(),
+        authenticated.environment(),
+        &event,
+    )
+    .await?
+    {
+        return Ok(StripeEventRepairDisposition::AlreadyApplied);
     }
     if event.kind == "invoice.payment_failed" {
         return repair_authenticated_personal_renewal_failure(
@@ -6177,6 +6241,114 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn completed_invoice_repairs_skip_reads_without_skipping_unhandled_failures() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+        let options = sqlx::postgres::PgConnectOptions::from_str(&database_url)
+            .expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing to write test fixtures to non-local database: {}",
+            options.get_host()
+        );
+        let pool = crate::db::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+
+        let fixture = Uuid::new_v4().simple().to_string();
+        let paid_event_id = format!("evt_paid_repair_{fixture}");
+        let failed_event_id = format!("evt_failed_repair_{fixture}");
+        let account_id = format!("acct_repair_{fixture}");
+        for event_id in [&paid_event_id, &failed_event_id] {
+            sqlx::query(
+                "INSERT INTO stripe_webhook_events \
+                 (event_id, event_type, api_version, stripe_created, subscription_id, processed_at) \
+                 VALUES ($1, $2, $3, 1, $4, now())",
+            )
+            .bind(event_id)
+            .bind(if event_id == &paid_event_id {
+                "invoice.paid"
+            } else {
+                "invoice.payment_failed"
+            })
+            .bind(STRIPE_API_VERSION)
+            .bind("sub_repair_fixture")
+            .execute(&pool)
+            .await
+            .expect("insert processed webhook event");
+        }
+        sqlx::query(
+            "INSERT INTO cloud_provider_event_receipts \
+             (provider_namespace, provider_account_id, provider_environment, event_id, event_type, \
+              provider_created_at, allocation_reference, normalized_payload_hash, status, \
+              allocation_id, coverage_source_id, projection_revision, processed_at) \
+             VALUES ('stripe', $1, 'test', $2, 'invoice.paid', 1, 'allocation_fixture', $3, \
+                     'applied', 'allocation_fixture', 'source_fixture', 1, now())",
+        )
+        .bind(&account_id)
+        .bind(&paid_event_id)
+        .bind("a".repeat(64))
+        .execute(&pool)
+        .await
+        .expect("insert completed coverage receipt");
+
+        let paid = Event {
+            id: paid_event_id.clone(),
+            created: 1,
+            api_version: Some(STRIPE_API_VERSION.into()),
+            kind: "invoice.paid".into(),
+            data: EventData {
+                object: serde_json::json!({}),
+            },
+        };
+        let failed = Event {
+            id: failed_event_id.clone(),
+            created: 1,
+            api_version: Some(STRIPE_API_VERSION.into()),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: serde_json::json!({}),
+            },
+        };
+        assert!(repair_event_already_completed(
+            &pool,
+            &account_id,
+            ProviderEnvironment::Test,
+            &paid
+        )
+        .await
+        .expect("check completed paid event"));
+        assert!(!repair_event_already_completed(
+            &pool,
+            &account_id,
+            ProviderEnvironment::Test,
+            &failed
+        )
+        .await
+        .expect("check webhook-acknowledged failure event"));
+
+        sqlx::query(
+            "DELETE FROM cloud_provider_event_receipts \
+             WHERE event_id = ANY($1)",
+        )
+        .bind(vec![paid_event_id.clone()])
+        .execute(&pool)
+        .await
+        .expect("remove coverage fixture");
+        sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
+            .bind(vec![paid_event_id, failed_event_id])
+            .execute(&pool)
+            .await
+            .expect("remove webhook fixtures");
+    }
 
     #[test]
     fn sales_gate_blocks_new_purchase_actions_without_blocking_billing_config() {
