@@ -3438,11 +3438,32 @@ fn stripe_schedule_contains_phases(
     current_start: i64,
     current_end: i64,
     current_items: &[SponsoredSubscriptionItem],
-    expected: &[SponsoredSubscriptionPhase],
+    expected_phases: &[SponsoredSubscriptionPhase],
 ) -> bool {
     let Some(actual) = schedule["phases"].as_array() else {
         return false;
     };
+    if actual.iter().any(|phase| {
+        let Some(start) = phase["start_date"].as_i64() else {
+            return true;
+        };
+        let Some(end) = phase["end_date"].as_i64() else {
+            return true;
+        };
+        end <= start
+    }) {
+        return false;
+    }
+    // Stripe may return completed schedule phases, though it can omit them. Compare the active
+    // phase and future plan, excluding only history whose end is at or before this period starts.
+    let current_phases: Vec<_> = actual
+        .iter()
+        .filter(|phase| {
+            phase["end_date"]
+                .as_i64()
+                .is_some_and(|end| end > current_start)
+        })
+        .collect();
     let active = SponsoredSubscriptionPhase {
         start_at_epoch: current_start,
         end_at_epoch: Some(current_end),
@@ -3454,24 +3475,30 @@ fn stripe_schedule_contains_phases(
             })
             .collect(),
     };
-    actual.len() == expected.len() + 1
-        && stripe_schedule_phase_matches(&actual[0], &active)
-        && actual[1..]
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| stripe_schedule_phase_matches(actual, expected))
+    current_phases.len() == expected_phases.len() + 1
+        && stripe_schedule_phase_matches(current_phases[0], &active, None)
+        && expected_phases.iter().enumerate().all(|(index, expected)| {
+            let next_start = expected_phases
+                .get(index + 1)
+                .map(|phase| phase.start_at_epoch);
+            stripe_schedule_phase_matches(current_phases[index + 1], expected, next_start)
+        })
 }
 
 fn stripe_schedule_phase_matches(
     actual: &serde_json::Value,
     expected: &SponsoredSubscriptionPhase,
+    next_phase_start: Option<i64>,
 ) -> bool {
     actual["start_date"].as_i64() == Some(expected.start_at_epoch)
         && match expected.end_at_epoch {
             Some(end) => actual["end_date"].as_i64() == Some(end),
-            None => actual
-                .get("end_date")
-                .is_none_or(serde_json::Value::is_null),
+            None => actual["end_date"]
+                .as_i64()
+                .is_some_and(|end| match next_phase_start {
+                    Some(next_start) => end == next_start,
+                    None => end > expected.start_at_epoch,
+                }),
         }
         && stripe_schedule_items_match(&actual["items"], &expected.items)
 }
@@ -7556,12 +7583,18 @@ mod tests {
         let accepted = serde_json::json!({
             "phases": [
                 {
+                    "start_date": 1_600_000_000,
+                    "end_date": 1_700_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                },
+                {
                     "start_date": 1_700_000_000,
                     "end_date": 1_800_000_000,
                     "items": [{"price": {"id": "price_founding_monthly"}, "quantity": 1}]
                 },
                 {
                     "start_date": 1_800_000_000,
+                    "end_date": 2_100_000_000,
                     "items": [{"price": {"id": "price_standard_monthly"}, "quantity": 1}]
                 }
             ]
@@ -7583,6 +7616,7 @@ mod tests {
                 },
                 {
                     "start_date": 1_800_000_000,
+                    "end_date": 2_100_000_000,
                     "items": [{"price": "price_founding_monthly", "quantity": 1}]
                 }
             ]
@@ -7609,12 +7643,80 @@ mod tests {
                 },
                 {
                     "start_date": 1_900_000_000,
+                    "end_date": 2_100_000_000,
                     "items": [{"price": "price_founding_monthly", "quantity": 1}]
                 }
             ]
         });
         assert!(!stripe_schedule_contains_phases(
             &unexpected_future,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
+
+        let expected_with_contiguous_open_phase = vec![
+            SponsoredSubscriptionPhase {
+                start_at_epoch: 1_800_000_000,
+                end_at_epoch: None,
+                items: vec![SponsoredSubscriptionItemRequest {
+                    provider_price_id: "price_founding_monthly".into(),
+                    quantity: 1,
+                }],
+            },
+            SponsoredSubscriptionPhase {
+                start_at_epoch: 1_900_000_000,
+                end_at_epoch: None,
+                items: vec![SponsoredSubscriptionItemRequest {
+                    provider_price_id: "price_standard_monthly".into(),
+                    quantity: 1,
+                }],
+            },
+        ];
+        let gapped_open_phase = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 1_850_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_900_000_000,
+                    "end_date": 2_100_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                }
+            ]
+        });
+        assert!(!stripe_schedule_contains_phases(
+            &gapped_open_phase,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected_with_contiguous_open_phase
+        ));
+
+        let invalid_final_boundary = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                }
+            ]
+        });
+        assert!(!stripe_schedule_contains_phases(
+            &invalid_final_boundary,
             1_700_000_000,
             1_800_000_000,
             &current_items,
