@@ -148,9 +148,21 @@ async fn process_job(
             if subscription.as_deref() != Some(job.subscription_id.as_str()) {
                 return Err(local_error("local_binding_missing"));
             }
-            let phases = sponsored_provider_phases(pool, &job.payer_id, catalogue, epoch_now())
-                .await
-                .map_err(|_| local_error("local_evidence_invalid"))?;
+            let current = provider
+                .get_sponsored_subscription(&job.subscription_id)
+                .await?;
+            if current.subscription_id != job.subscription_id {
+                return Err(local_error("local_binding_missing"));
+            }
+            let current_period_end = current
+                .current_period_end
+                .ok_or_else(|| local_error("local_evidence_invalid"))?;
+            // A retry may run after the wall clock has crossed the old billing boundary. Stripe
+            // still needs the first proposed phase to cover its current provider boundary.
+            let phases =
+                sponsored_provider_phases(pool, &job.payer_id, catalogue, current_period_end)
+                    .await
+                    .map_err(|_| local_error("local_evidence_invalid"))?;
             let updated = provider
                 .update_sponsored_subscription(
                     &job.payer_id,
@@ -229,13 +241,6 @@ fn local_error(code: &'static str) -> ProviderError {
         code: Some(code.into()),
         kind: crate::billing::ProviderErrorKind::Unknown,
     }
-}
-
-fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 async fn run(pool: PgPool, provider: Arc<dyn SubscriptionProvider>, catalogue: BillingPriceIds) {
