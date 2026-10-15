@@ -111,6 +111,15 @@ async fn process_job(
             let current_end = current
                 .current_period_end
                 .ok_or_else(|| local_error("local_evidence_invalid"))?;
+            if !personal_current_price_matches(
+                &current,
+                award_offer,
+                current_end,
+                end_epoch,
+                catalogue,
+            ) {
+                return Err(local_error("local_evidence_invalid"));
+            }
             let phases = personal_transition_phases(award_offer, current_end, end_epoch, catalogue);
             let updated = provider
                 .update_personal_subscription(&job.subscription_id, &phases, &job.idempotency_key)
@@ -198,6 +207,22 @@ fn personal_transition_phases(
     phases
 }
 
+fn personal_current_price_matches(
+    current: &crate::billing::SponsoredSubscriptionSnapshot,
+    founding_offer: FoundingOffer,
+    current_period_end: i64,
+    founding_end: i64,
+    catalogue: &BillingPriceIds,
+) -> bool {
+    let expected_offer = if founding_end <= current_period_end {
+        founding_offer.standard_billing_offer()
+    } else {
+        founding_offer.billing_offer()
+    };
+    current.items.len() == 1
+        && current.items[0].provider_price_id == catalogue.id_for(expected_offer)
+}
+
 fn local_error(code: &'static str) -> ProviderError {
     ProviderError {
         status: None,
@@ -268,5 +293,45 @@ mod tests {
             phases[0].items[0].provider_price_id,
             "price_standard_annual"
         );
+    }
+
+    #[test]
+    fn personal_worker_requires_the_provider_price_for_the_current_founding_phase() {
+        let catalogue = catalogue();
+        let snapshot = |price: &str| crate::billing::SponsoredSubscriptionSnapshot {
+            customer_id: Some("cus".into()),
+            subscription_id: "sub".into(),
+            status: crate::billing::SubscriptionStatus::Active,
+            current_period_start: Some(0),
+            current_period_end: Some(100),
+            schedule_id: None,
+            items: vec![crate::billing::SponsoredSubscriptionItem {
+                provider_item_id: "si".into(),
+                provider_price_id: price.into(),
+                quantity: 1,
+            }],
+        };
+
+        assert!(personal_current_price_matches(
+            &snapshot("price_founding_monthly"),
+            FoundingOffer::Monthly,
+            100,
+            200,
+            &catalogue,
+        ));
+        assert!(personal_current_price_matches(
+            &snapshot("price_standard_monthly"),
+            FoundingOffer::Monthly,
+            100,
+            100,
+            &catalogue,
+        ));
+        assert!(!personal_current_price_matches(
+            &snapshot("price_standard_monthly"),
+            FoundingOffer::Monthly,
+            100,
+            200,
+            &catalogue,
+        ));
     }
 }
