@@ -1259,12 +1259,7 @@ impl SubscriptionProvider for StripeBilling {
         if object["id"].as_str() != Some(subscription_id) {
             return Err(ProviderError::malformed_response());
         }
-        Ok(subscription_period_start(&object)
-            .zip(subscription_period_end(&object))
-            .map(|(start_epoch, end_epoch)| PersonalSubscriptionPeriod {
-                start_epoch,
-                end_epoch,
-            }))
+        personal_subscription_period_from_object(&object)
     }
 
     async fn cancel_subscription(
@@ -6411,6 +6406,24 @@ fn subscription_period_end(object: &serde_json::Value) -> Option<i64> {
         .max()
 }
 
+fn personal_subscription_period_from_object(
+    object: &serde_json::Value,
+) -> ProviderResult<Option<PersonalSubscriptionPeriod>> {
+    let Some(start_epoch) = subscription_period_start(object) else {
+        return Ok(None);
+    };
+    let Some(end_epoch) = subscription_period_end(object) else {
+        return Ok(None);
+    };
+    if end_epoch <= start_epoch {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(Some(PersonalSubscriptionPeriod {
+        start_epoch,
+        end_epoch,
+    }))
+}
+
 fn invoice_period_start(object: &serde_json::Value) -> Option<i64> {
     let lines = object["lines"]["data"].as_array()?;
     lines
@@ -8188,6 +8201,32 @@ mod tests {
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
         assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
+    }
+
+    #[test]
+    fn personal_subscription_period_rejects_non_increasing_boundaries() {
+        let valid = serde_json::json!({
+            "items": {"data": [{"current_period_start": 100, "current_period_end": 200}]}
+        });
+        assert_eq!(
+            personal_subscription_period_from_object(&valid).unwrap(),
+            Some(PersonalSubscriptionPeriod {
+                start_epoch: 100,
+                end_epoch: 200,
+            })
+        );
+
+        for end in [100, 99] {
+            let malformed = serde_json::json!({
+                "items": {"data": [{"current_period_start": 100, "current_period_end": end}]}
+            });
+            assert_eq!(
+                personal_subscription_period_from_object(&malformed)
+                    .unwrap_err()
+                    .kind,
+                ProviderErrorKind::Unknown
+            );
+        }
     }
 
     #[test]
