@@ -2148,6 +2148,7 @@ async fn sponsored_provider_items(
 type SponsoredScheduleSeatRow = (
     String,
     String,
+    String,
     i64,
     Option<i64>,
     Option<i64>,
@@ -2162,7 +2163,7 @@ pub(crate) async fn sponsored_provider_phases(
     now_epoch: i64,
 ) -> Result<Vec<SponsoredSubscriptionPhase>> {
     let rows: Vec<SponsoredScheduleSeatRow> = sqlx::query_as(
-        "SELECT seat.beneficiary_id, seat.offer, seat.effective_from, seat.effective_until, \
+        "SELECT seat.beneficiary_id, seat.offer, seat.state, seat.effective_from, seat.effective_until, \
                 award.original_end_epoch, award.offer \
          FROM billing_sponsored_seats AS seat \
          LEFT JOIN billing_founding_awards AS award ON award.beneficiary_id = seat.beneficiary_id \
@@ -2193,12 +2194,19 @@ fn compile_sponsored_provider_phases(
 ) -> Result<Vec<SponsoredSubscriptionPhase>> {
     if rows
         .iter()
-        .any(|(_, offer, _, _, founding_end, award_offer)| {
-            (award_offer.is_some()
-                || billing_offer(offer)
+        .any(|(_, offer, state, _, _, founding_end, award_offer)| {
+            let unawarded_pending_founding = state == "pending"
+                && award_offer.is_none()
+                && billing_offer(offer)
                     .ok()
                     .and_then(FoundingOffer::from_billing_offer)
-                    .is_some())
+                    .is_some();
+            !unawarded_pending_founding
+                && (award_offer.is_some()
+                    || billing_offer(offer)
+                        .ok()
+                        .and_then(FoundingOffer::from_billing_offer)
+                        .is_some())
                 && founding_end.is_none()
         })
     {
@@ -2213,13 +2221,13 @@ fn compile_sponsored_provider_phases(
     for (beneficiary_id, _, effective_until) in pending_changes {
         for row in &mut rows {
             if row.0 == *beneficiary_id {
-                row.3 = *effective_until;
+                row.4 = *effective_until;
             }
         }
     }
 
     let mut boundaries = std::collections::BTreeSet::from([now_epoch]);
-    for (_, _, effective_from, effective_until, founding_end, award_offer) in &rows {
+    for (_, _, _, effective_from, effective_until, founding_end, award_offer) in &rows {
         if *effective_from > now_epoch {
             boundaries.insert(*effective_from);
         }
@@ -2240,26 +2248,33 @@ fn compile_sponsored_provider_phases(
     for (index, start_at_epoch) in boundaries.iter().copied().enumerate() {
         let end_at_epoch = boundaries.get(index + 1).copied();
         let mut quantities = std::collections::BTreeMap::<String, i64>::new();
-        for (_, offer, effective_from, effective_until, founding_end, award_offer) in &rows {
+        for (_, offer, state, effective_from, effective_until, founding_end, award_offer) in &rows {
             if *effective_from <= start_at_epoch
                 && effective_until
                     .map(|effective_until| start_at_epoch < effective_until)
                     .unwrap_or(true)
             {
-                let mut offer = billing_offer(offer)?;
+                let stored_offer = billing_offer(offer)?;
                 let founding_offer = award_offer
                     .as_deref()
                     .map(parse_founding_offer)
                     .transpose()?;
-                offer = expected_founding_invoice_offer(
-                    offer,
-                    founding_offer,
-                    founding_end.map(founding_price_boundary).transpose()?,
-                    start_at_epoch,
-                )
-                .ok_or_else(|| {
-                    Error::Internal("founding sponsored seat has no transition boundary".into())
-                })?;
+                let offer = if *state == "pending"
+                    && founding_offer.is_none()
+                    && FoundingOffer::from_billing_offer(stored_offer).is_some()
+                {
+                    stored_offer
+                } else {
+                    expected_founding_invoice_offer(
+                        stored_offer,
+                        founding_offer,
+                        founding_end.map(founding_price_boundary).transpose()?,
+                        start_at_epoch,
+                    )
+                    .ok_or_else(|| {
+                        Error::Internal("founding sponsored seat has no transition boundary".into())
+                    })?
+                };
                 let quantity = quantities.entry(offer.as_str().to_string()).or_default();
                 *quantity = quantity
                     .checked_add(1)
@@ -7331,6 +7346,7 @@ mod tests {
             (
                 "monthly-founder".into(),
                 "founding_monthly".into(),
+                "active".into(),
                 900,
                 None,
                 Some(2_000),
@@ -7339,6 +7355,7 @@ mod tests {
             (
                 "annual-founder".into(),
                 "founding_annual".into(),
+                "active".into(),
                 900,
                 None,
                 Some(3_000),
@@ -7347,6 +7364,7 @@ mod tests {
             (
                 "standard-seat".into(),
                 "standard_monthly".into(),
+                "active".into(),
                 900,
                 None,
                 None,
@@ -7355,6 +7373,7 @@ mod tests {
             (
                 "removing-seat".into(),
                 "standard_monthly".into(),
+                "active".into(),
                 900,
                 None,
                 None,
@@ -7396,6 +7415,35 @@ mod tests {
             provider_price_id: "price_standard_annual".into(),
             quantity: 1,
         }));
+    }
+
+    #[test]
+    fn pending_founding_sponsored_seat_keeps_its_requested_price_before_award() {
+        let catalogue = BillingPriceIds {
+            standard_monthly: "price_standard_monthly".into(),
+            standard_annual: "price_standard_annual".into(),
+            founding_monthly: "price_founding_monthly".into(),
+            founding_annual: "price_founding_annual".into(),
+        };
+        let rows = vec![(
+            "pending-founder".into(),
+            "founding_monthly".into(),
+            "pending".into(),
+            900,
+            None,
+            None,
+            None,
+        )];
+        let phases = compile_sponsored_provider_phases(rows, &[], &catalogue, 1_000)
+            .expect("unpaid pending seat can be scheduled before its award exists");
+        assert_eq!(phases.len(), 1);
+        assert_eq!(
+            phases[0].items,
+            vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_founding_monthly".into(),
+                quantity: 1,
+            }]
+        );
     }
 
     #[test]
