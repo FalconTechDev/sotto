@@ -111,10 +111,14 @@ async fn process_job(
             let current_end = current
                 .current_period_end
                 .ok_or_else(|| local_error("local_evidence_invalid"))?;
+            let current_start = current
+                .current_period_start
+                .filter(|start| *start < current_end)
+                .ok_or_else(|| local_error("local_evidence_invalid"))?;
             if !personal_current_price_matches(
                 &current,
                 award_offer,
-                current_end,
+                current_start,
                 end_epoch,
                 catalogue,
             ) {
@@ -222,11 +226,13 @@ fn personal_transition_phases(
 fn personal_current_price_matches(
     current: &crate::billing::SponsoredSubscriptionSnapshot,
     founding_offer: FoundingOffer,
-    current_period_end: i64,
+    current_period_start: i64,
     founding_end: i64,
     catalogue: &BillingPriceIds,
 ) -> bool {
-    let expected_offer = if founding_end <= current_period_end {
+    // The current item covers through its period end, so the founding price remains valid when
+    // that end equals the boundary. The standard price is current only once a period starts at it.
+    let expected_offer = if founding_end <= current_period_start {
         founding_offer.standard_billing_offer()
     } else {
         founding_offer.billing_offer()
@@ -303,39 +309,63 @@ mod tests {
     #[test]
     fn personal_worker_requires_the_provider_price_for_the_current_founding_phase() {
         let catalogue = catalogue();
-        let snapshot = |price: &str| crate::billing::SponsoredSubscriptionSnapshot {
-            customer_id: Some("cus".into()),
-            subscription_id: "sub".into(),
-            status: crate::billing::SubscriptionStatus::Active,
-            current_period_start: Some(0),
-            current_period_end: Some(100),
-            schedule_id: None,
-            items: vec![crate::billing::SponsoredSubscriptionItem {
-                provider_item_id: "si".into(),
-                provider_price_id: price.into(),
-                quantity: 1,
-            }],
-        };
+        let snapshot =
+            |price: &str, start: i64, end: i64| crate::billing::SponsoredSubscriptionSnapshot {
+                customer_id: Some("cus".into()),
+                subscription_id: "sub".into(),
+                status: crate::billing::SubscriptionStatus::Active,
+                current_period_start: Some(start),
+                current_period_end: Some(end),
+                schedule_id: None,
+                items: vec![crate::billing::SponsoredSubscriptionItem {
+                    provider_item_id: "si".into(),
+                    provider_price_id: price.into(),
+                    quantity: 1,
+                }],
+            };
 
         assert!(personal_current_price_matches(
-            &snapshot("price_founding_monthly"),
+            &snapshot("price_founding_monthly", 0, 99),
             FoundingOffer::Monthly,
-            100,
+            0,
             200,
             &catalogue,
         ));
         assert!(personal_current_price_matches(
-            &snapshot("price_standard_monthly"),
+            &snapshot("price_founding_monthly", 0, 100),
+            FoundingOffer::Monthly,
+            0,
+            100,
+            &catalogue,
+        ));
+        assert!(personal_current_price_matches(
+            &snapshot("price_standard_monthly", 100, 200),
             FoundingOffer::Monthly,
             100,
+            100,
+            &catalogue,
+        ));
+        assert!(personal_current_price_matches(
+            &snapshot("price_founding_monthly", 99, 100),
+            FoundingOffer::Monthly,
+            99,
             100,
             &catalogue,
         ));
         assert!(!personal_current_price_matches(
-            &snapshot("price_standard_monthly"),
+            &snapshot("price_standard_monthly", 99, 100),
             FoundingOffer::Monthly,
+            99,
             100,
-            200,
+            &catalogue,
+        ));
+
+        let annual_at_its_first_boundary = snapshot("price_founding_annual", 1_000, 2_000);
+        assert!(personal_current_price_matches(
+            &annual_at_its_first_boundary,
+            FoundingOffer::Annual,
+            1_000,
+            2_000,
             &catalogue,
         ));
     }
