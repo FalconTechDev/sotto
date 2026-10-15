@@ -6094,7 +6094,7 @@ async fn personal_checkout_completed(
             ));
         }
         let reservation_id = format!("founding:{operation_id}");
-        let award = match founding_allocator::confirm_payment_with_period_start(
+        match founding_allocator::confirm_payment_with_period_start(
             tx,
             &reservation_id,
             payment_reference,
@@ -6105,8 +6105,17 @@ async fn personal_checkout_completed(
         .await
         .map_err(|error| Error::Internal(error.to_string()))?
         {
-            founding_allocator::ConfirmationOutcome::Awarded(award)
-            | founding_allocator::ConfirmationOutcome::AlreadyAwarded(award) => award,
+            founding_allocator::ConfirmationOutcome::Awarded(award) => {
+                crate::founding_schedule::enqueue(tx, &award, subscription)
+                    .await
+                    .map_err(|_| {
+                        Error::Internal("founding transition could not be queued".into())
+                    })?;
+            }
+            // A replay can carry an obsolete subscription after a payer transfer. The durable
+            // job was retargeted with the transfer itself; never retarget it from duplicate
+            // provider evidence.
+            founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
             founding_allocator::ConfirmationOutcome::RefundRequired => {
                 let refund = personal_billing::record_refund_required(
                     tx,
@@ -6130,10 +6139,7 @@ async fn personal_checkout_completed(
                 }
                 return Ok(());
             }
-        };
-        crate::founding_schedule::enqueue(tx, &award, subscription)
-            .await
-            .map_err(|_| Error::Internal("founding transition could not be queued".into()))?;
+        }
     }
     let settlement = personal_billing::record_paid_settlement(
         tx,
@@ -6998,7 +7004,7 @@ async fn record_sponsored_founding_award(
     // globally unique payment claim specific to this operation while retaining the unmodified
     // provider reference in the sponsored operation for refund handling.
     let allocation_payment_reference = format!("{}:{operation_id}", evidence.payment_reference);
-    let award = match founding_allocator::confirm_payment_with_period_start(
+    match founding_allocator::confirm_payment_with_period_start(
         tx,
         &format!("founding:{operation_id}"),
         &allocation_payment_reference,
@@ -7009,18 +7015,19 @@ async fn record_sponsored_founding_award(
     .await
     .map_err(|error| Error::Internal(error.to_string()))?
     {
-        founding_allocator::ConfirmationOutcome::Awarded(award)
-        | founding_allocator::ConfirmationOutcome::AlreadyAwarded(award) => award,
+        founding_allocator::ConfirmationOutcome::Awarded(award) => {
+            crate::founding_schedule::enqueue(tx, &award, &evidence.subscription_id)
+                .await
+                .map_err(|_| Error::Internal("founding transition could not be queued".into()))?;
+        }
+        founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
         founding_allocator::ConfirmationOutcome::RefundRequired => {
             sponsored_billing::record_founding_refund_required(tx, operation_id, evidence)
                 .await
                 .map_err(Error::from)?;
             return Ok(true);
         }
-    };
-    crate::founding_schedule::enqueue(tx, &award, &evidence.subscription_id)
-        .await
-        .map_err(|_| Error::Internal("founding transition could not be queued".into()))?;
+    }
     Ok(false)
 }
 
