@@ -987,7 +987,13 @@ impl SubscriptionProvider for StripeBilling {
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
-        if !stripe_schedule_contains_phases(&schedule, &normalized) {
+        if !stripe_schedule_contains_phases(
+            &schedule,
+            current_start,
+            current_end,
+            &current.items,
+            &normalized,
+        ) {
             return Err(ProviderError::malformed_response());
         }
         self.get_sponsored_subscription(subscription_id).await
@@ -1127,7 +1133,13 @@ impl SubscriptionProvider for StripeBilling {
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
-        if !stripe_schedule_contains_phases(&schedule, &normalized) {
+        if !stripe_schedule_contains_phases(
+            &schedule,
+            current_start,
+            current_end,
+            &current.items,
+            &normalized,
+        ) {
             return Err(ProviderError::malformed_response());
         }
         self.get_sponsored_subscription(subscription_id).await
@@ -3399,23 +3411,45 @@ async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Val
 
 fn stripe_schedule_contains_phases(
     schedule: &serde_json::Value,
+    current_start: i64,
+    current_end: i64,
+    current_items: &[SponsoredSubscriptionItem],
     expected: &[SponsoredSubscriptionPhase],
 ) -> bool {
     let Some(actual) = schedule["phases"].as_array() else {
         return false;
     };
-    expected.iter().all(|phase| {
-        actual.iter().any(|candidate| {
-            candidate["start_date"].as_i64() == Some(phase.start_at_epoch)
-                && match phase.end_at_epoch {
-                    Some(end) => candidate["end_date"].as_i64() == Some(end),
-                    None => candidate
-                        .get("end_date")
-                        .is_none_or(serde_json::Value::is_null),
-                }
-                && stripe_schedule_items_match(&candidate["items"], &phase.items)
-        })
-    })
+    let active = SponsoredSubscriptionPhase {
+        start_at_epoch: current_start,
+        end_at_epoch: Some(current_end),
+        items: current_items
+            .iter()
+            .map(|item| SponsoredSubscriptionItemRequest {
+                provider_price_id: item.provider_price_id.clone(),
+                quantity: item.quantity,
+            })
+            .collect(),
+    };
+    actual.len() == expected.len() + 1
+        && stripe_schedule_phase_matches(&actual[0], &active)
+        && actual[1..]
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| stripe_schedule_phase_matches(actual, expected))
+}
+
+fn stripe_schedule_phase_matches(
+    actual: &serde_json::Value,
+    expected: &SponsoredSubscriptionPhase,
+) -> bool {
+    actual["start_date"].as_i64() == Some(expected.start_at_epoch)
+        && match expected.end_at_epoch {
+            Some(end) => actual["end_date"].as_i64() == Some(end),
+            None => actual
+                .get("end_date")
+                .is_none_or(serde_json::Value::is_null),
+        }
+        && stripe_schedule_items_match(&actual["items"], &expected.items)
 }
 
 fn stripe_schedule_items_match(
@@ -7448,6 +7482,11 @@ mod tests {
 
     #[test]
     fn stripe_schedule_readback_must_match_price_boundary_and_quantity() {
+        let current_items = vec![SponsoredSubscriptionItem {
+            provider_item_id: "si_1".into(),
+            provider_price_id: "price_founding_monthly".into(),
+            quantity: 1,
+        }];
         let expected = vec![SponsoredSubscriptionPhase {
             start_at_epoch: 1_800_000_000,
             end_at_epoch: None,
@@ -7457,20 +7496,72 @@ mod tests {
             }],
         }];
         let accepted = serde_json::json!({
-            "phases": [{
-                "start_date": 1_800_000_000,
-                "items": [{"price": {"id": "price_standard_monthly"}, "quantity": 1}]
-            }]
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": {"id": "price_founding_monthly"}, "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "items": [{"price": {"id": "price_standard_monthly"}, "quantity": 1}]
+                }
+            ]
         });
-        assert!(stripe_schedule_contains_phases(&accepted, &expected));
+        assert!(stripe_schedule_contains_phases(
+            &accepted,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
 
         let drifted = serde_json::json!({
-            "phases": [{
-                "start_date": 1_800_000_000,
-                "items": [{"price": "price_founding_monthly", "quantity": 1}]
-            }]
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                }
+            ]
         });
-        assert!(!stripe_schedule_contains_phases(&drifted, &expected));
+        assert!(!stripe_schedule_contains_phases(
+            &drifted,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
+
+        let unexpected_future = serde_json::json!({
+            "phases": [
+                {
+                    "start_date": 1_700_000_000,
+                    "end_date": 1_800_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_800_000_000,
+                    "end_date": 1_900_000_000,
+                    "items": [{"price": "price_standard_monthly", "quantity": 1}]
+                },
+                {
+                    "start_date": 1_900_000_000,
+                    "items": [{"price": "price_founding_monthly", "quantity": 1}]
+                }
+            ]
+        });
+        assert!(!stripe_schedule_contains_phases(
+            &unexpected_future,
+            1_700_000_000,
+            1_800_000_000,
+            &current_items,
+            &expected
+        ));
     }
 
     #[test]
