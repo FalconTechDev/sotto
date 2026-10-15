@@ -2352,6 +2352,30 @@ fn expected_founding_invoice_offer(
     }
 }
 
+fn expected_sponsored_invoice_offer(
+    stored_offer: BillingOffer,
+    founding_offer: Option<FoundingOffer>,
+    founding_end_epoch: Option<i64>,
+    seat_state: &str,
+    period_start_epoch: i64,
+) -> Option<BillingOffer> {
+    if seat_state == "pending"
+        && founding_offer.is_none()
+        && FoundingOffer::from_billing_offer(stored_offer).is_some()
+    {
+        // The first paid invoice is what creates the award boundary. Until it does, a pending
+        // founding seat must be matched against the founding price it requested.
+        Some(stored_offer)
+    } else {
+        expected_founding_invoice_offer(
+            stored_offer,
+            founding_offer,
+            founding_end_epoch,
+            period_start_epoch,
+        )
+    }
+}
+
 async fn select_founding_aware_offer(
     tx: &mut Transaction<'_, Postgres>,
     beneficiary_id: &str,
@@ -4739,10 +4763,12 @@ async fn prepare_sponsored_invoice_coverage(
                 .map(parse_founding_offer)
                 .transpose()?;
             let founding_end_epoch: Option<i64> = seat.try_get("original_end_epoch")?;
-            let Some(expected_offer) = expected_founding_invoice_offer(
+            let seat_state: String = seat.try_get("state")?;
+            let Some(expected_offer) = expected_sponsored_invoice_offer(
                 stored_offer,
                 founding_offer,
                 founding_end_epoch,
+                &seat_state,
                 line.period_start(),
             ) else {
                 let event = event.clone();
@@ -7372,6 +7398,31 @@ mod tests {
                 boundary,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn first_sponsored_founding_invoice_uses_the_pending_seats_requested_price() {
+        assert_eq!(
+            expected_sponsored_invoice_offer(
+                BillingOffer::FoundingMonthly,
+                None,
+                None,
+                "pending",
+                1_800_000_000,
+            ),
+            Some(BillingOffer::FoundingMonthly)
+        );
+        assert_eq!(
+            expected_sponsored_invoice_offer(
+                BillingOffer::FoundingMonthly,
+                None,
+                None,
+                "active",
+                1_800_000_000,
+            ),
+            None,
+            "an active founding seat without an award remains corrupt evidence"
         );
     }
 
