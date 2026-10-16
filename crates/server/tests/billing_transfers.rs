@@ -645,6 +645,14 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
     .await
     .expect("insert active source seat");
 
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET effective_until = 1802591999 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation)
+    .execute(&pool)
+    .await
+    .expect("seed a seat that ends before the paid-through boundary");
     let request = TransferRequest {
         actor_user_id: admin.clone(),
         counterparty_user_id: beneficiary.clone(),
@@ -660,6 +668,23 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         effective_until: None,
         idempotency_key: "leave-sponsor".into(),
     };
+    let mut tx = pool.begin().await.expect("begin transfer from short seat");
+    assert!(matches!(
+        begin_transfer(&mut tx, &request, 1_800_000_000).await,
+        Err(TransferError::SourceInactive)
+    ));
+    tx.rollback()
+        .await
+        .expect("rollback transfer from short seat");
+    sqlx::query(
+        "UPDATE billing_sponsored_seats SET effective_until = 1802592000 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation)
+    .execute(&pool)
+    .await
+    .expect("extend source seat to the paid-through boundary");
+
     let mut tx = pool.begin().await.expect("begin sponsored transfer");
     let outcome = begin_transfer(&mut tx, &request, 1_800_000_000)
         .await

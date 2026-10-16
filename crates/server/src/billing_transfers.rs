@@ -911,10 +911,15 @@ async fn ensure_source_active(
                  WHERE seat.organization_id = $1 AND seat.beneficiary_id = $2 \
                    AND seat.state = 'active' AND subscription.status = 'active' \
                    AND subscription.provider_subscription_id IS NOT NULL \
+                   AND subscription.current_period_end IS NOT NULL \
+                   AND seat.effective_from <= $3 \
+                   AND (seat.effective_until IS NULL OR \
+                        seat.effective_until >= subscription.current_period_end) \
                  FOR UPDATE OF seat, subscription",
             )
             .bind(organization_id)
             .bind(&request.beneficiary_id)
+            .bind(now_epoch)
             .fetch_optional(&mut **tx)
             .await?
         }
