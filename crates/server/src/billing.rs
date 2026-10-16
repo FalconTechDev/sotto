@@ -3289,16 +3289,16 @@ async fn create_checkout(
     Path(org_id): Path<String>,
 ) -> Result<Json<RedirectView>> {
     let billing = cloud_sales_config(&state)?;
-    billing
-        .validate_cloud_portal_configuration()
-        .await
-        .map_err(ProviderError::into_error)?;
     let mut tx = state.pool.begin().await?;
     // Keep the organisation lock through provider session creation so deletion cannot transition
     // between the lifecycle check and this billing side effect. The bounded provider timeout
     // briefly pins a pool connection and serialises this organisation's writes; that is the
     // deliberate trade-off for closing the race.
     require_billing_admin(&mut tx, &org_id, &user.user_id).await?;
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
 
     // Reuse the org's Stripe customer if one exists, so a cancel/resubscribe doesn't fork billing
     // history; otherwise Checkout creates one and the webhook records it.
