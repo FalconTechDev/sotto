@@ -58,6 +58,7 @@ async fn process_job(
         FoundingPayerKind::Personal => {
             let row = sqlx::query(
                 "SELECT account.stripe_subscription_id, account.state, account.cancel_at_period_end, \
+                        account.cancellation_requested_at IS NOT NULL AS cancellation_requested, \
                         award.offer, award.original_end_epoch \
                  FROM billing_personal_accounts AS account \
                  JOIN billing_founding_awards AS award ON award.beneficiary_id = account.user_id \
@@ -79,14 +80,34 @@ async fn process_job(
             let cancel_at_period_end: bool = row
                 .try_get("cancel_at_period_end")
                 .map_err(|_| local_error("local_evidence_invalid"))?;
-            if state == "canceled" || cancel_at_period_end {
+            let cancellation_requested: bool = row
+                .try_get("cancellation_requested")
+                .map_err(|_| local_error("local_evidence_invalid"))?;
+            if state == "canceled" {
+                return Ok(None);
+            }
+            if subscription_id.as_deref() != Some(job.subscription_id.as_str()) {
+                return Err(local_error("local_binding_missing"));
+            }
+            if cancel_at_period_end || cancellation_requested {
+                provider
+                    .cancel_personal_subscription(
+                        &job.subscription_id,
+                        &personal_cancellation_idempotency_key(&job.subscription_id),
+                        &job.beneficiary_id,
+                    )
+                    .await?;
+                founding_schedule::record_personal_cancellation(
+                    pool,
+                    &job.beneficiary_id,
+                    &job.subscription_id,
+                )
+                .await
+                .map_err(|_| local_error("local_evidence_invalid"))?;
                 return Ok(None);
             }
             if !matches!(state.as_str(), "active" | "past_due") {
                 return Err(local_error("local_evidence_invalid"));
-            }
-            if subscription_id.as_deref() != Some(job.subscription_id.as_str()) {
-                return Err(local_error("local_binding_missing"));
             }
             let offer_text: String = row
                 .try_get("offer")
@@ -128,6 +149,34 @@ async fn process_job(
             let updated = provider
                 .update_personal_subscription(&job.subscription_id, &phases, &job.idempotency_key)
                 .await?;
+            let cancellation_requested: bool = sqlx::query_scalar(
+                "SELECT cancellation_requested_at IS NOT NULL OR cancel_at_period_end \
+                 FROM billing_personal_accounts WHERE user_id = $1 \
+                   AND stripe_subscription_id = $2",
+            )
+            .bind(&job.beneficiary_id)
+            .bind(&job.subscription_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| local_error("local_evidence_invalid"))?
+            .ok_or_else(|| local_error("local_binding_missing"))?;
+            if cancellation_requested {
+                provider
+                    .cancel_personal_subscription(
+                        &job.subscription_id,
+                        &personal_cancellation_idempotency_key(&job.subscription_id),
+                        &job.beneficiary_id,
+                    )
+                    .await?;
+                founding_schedule::record_personal_cancellation(
+                    pool,
+                    &job.beneficiary_id,
+                    &job.subscription_id,
+                )
+                .await
+                .map_err(|_| local_error("local_evidence_invalid"))?;
+                return Ok(None);
+            }
             updated
                 .schedule_id
                 .ok_or_else(|| local_error("local_evidence_invalid"))
@@ -181,6 +230,10 @@ async fn process_job(
                 .map(Some)
         }
     }
+}
+
+fn personal_cancellation_idempotency_key(subscription_id: &str) -> String {
+    format!("sotto-personal-cancel:{subscription_id}")
 }
 
 fn parse_founding_offer(value: &str) -> Result<FoundingOffer, ProviderError> {

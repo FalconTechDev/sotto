@@ -3246,20 +3246,17 @@ async fn personal_cancel(
     let subscription_id = account.stripe_subscription_id.clone().ok_or_else(|| {
         Error::Conflict("personal billing has not received a paid subscription yet".into())
     })?;
-    tx.rollback().await?;
+    founding_schedule::request_personal_cancellation(&mut tx, &user.user_id, &subscription_id)
+        .await?;
+    tx.commit().await?;
     billing
         .provider
         .cancel_personal_subscription(&subscription_id, &request.idempotency_key, &user.user_id)
         .await
         .map_err(ProviderError::into_error)?;
+    founding_schedule::record_personal_cancellation(&state.pool, &user.user_id, &subscription_id)
+        .await?;
     let mut update_tx = state.pool.begin().await?;
-    sqlx::query(
-        "UPDATE billing_personal_accounts SET cancel_at_period_end = TRUE, \
-         cancellation_requested_at = now(), updated_at = now() WHERE user_id = $1",
-    )
-    .bind(&user.user_id)
-    .execute(&mut *update_tx)
-    .await?;
     let founding = personal_founding_transition(&mut update_tx, &user.user_id).await?;
     update_tx.commit().await?;
     Ok(Json(PersonalLifecycleView {

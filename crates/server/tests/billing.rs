@@ -358,6 +358,28 @@ async fn post_authed(app: &Router, uri: &str, token: &str) -> StatusCode {
     response.status()
 }
 
+async fn post_authed_json(
+    app: &Router,
+    uri: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> StatusCode {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("request");
+    response.status()
+}
+
 async fn org_billing_state(
     pool: &PgPool,
     org_id: &str,
@@ -431,6 +453,71 @@ async fn billing_endpoints_are_503_when_unconfigured() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let status = post_webhook(&app, "{}", Some("t=1,v1=00")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn personal_cancellation_persists_intent_before_acknowledging_provider_acceptance() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-cancel-{fixture}");
+    let token = seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("personal-cancel-{fixture}")).await;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'active', stripe_customer_id = $2, \
+           stripe_subscription_id = $3 WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(format!("cus_cancel_{fixture}"))
+    .bind(format!("sub_cancel_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("activate personal subscription fixture");
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+
+    assert_eq!(
+        post_authed_json(
+            &app,
+            "/billing/personal/cancel",
+            &token,
+            serde_json::json!({"idempotency_key": format!("cancel-{fixture}")}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let cancellation: (bool, bool) = sqlx::query_as(
+        "SELECT cancel_at_period_end, cancellation_requested_at IS NOT NULL \
+         FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read accepted cancellation");
+    assert_eq!(cancellation, (true, true));
+
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean user");
 }
 
 #[tokio::test]

@@ -206,6 +206,77 @@ pub async fn mark_not_required(
     Ok(changed == 1)
 }
 
+/// Persist a cancellation request before contacting Stripe and make any founding transition
+/// work retryable. The worker checks this marker before and after updating a schedule, closing the
+/// race where a schedule update started just before the customer requested cancellation.
+pub async fn request_personal_cancellation(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+    subscription_id: &str,
+) -> Result<(), sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE billing_personal_accounts SET cancellation_requested_at = \
+           COALESCE(cancellation_requested_at, now()), updated_at = now() \
+         WHERE user_id = $1 AND stripe_subscription_id = $2",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    sqlx::query(
+        "UPDATE billing_founding_schedule_jobs SET state = 'pending', \
+           provider_schedule_id = NULL, last_error_code = NULL, lease_token = NULL, \
+           lease_until = NULL, next_attempt_at = now(), updated_at = now() \
+         WHERE beneficiary_id = $1 AND payer_kind = 'personal' \
+           AND provider_subscription_id = $2 AND state <> 'not_required'",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Record that Stripe has accepted the end-of-period cancellation. A retrying worker may call
+/// this after the HTTP request has already completed, so both updates are idempotent.
+pub async fn record_personal_cancellation(
+    pool: &PgPool,
+    beneficiary_id: &str,
+    subscription_id: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE billing_personal_accounts SET cancel_at_period_end = TRUE, \
+           cancellation_requested_at = COALESCE(cancellation_requested_at, now()), \
+           updated_at = now() WHERE user_id = $1 AND stripe_subscription_id = $2",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    sqlx::query(
+        "UPDATE billing_founding_schedule_jobs SET state = 'not_required', \
+           last_error_code = 'subscription_terminates_before_transition', lease_token = NULL, \
+           lease_until = NULL, updated_at = now(), next_attempt_at = now() \
+         WHERE beneficiary_id = $1 AND payer_kind = 'personal' \
+           AND provider_subscription_id = $2 AND state <> 'not_required'",
+    )
+    .bind(beneficiary_id)
+    .bind(subscription_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
 fn provider_error_code(error: &ProviderError) -> &'static str {
     match error.code.as_deref() {
         Some("local_binding_missing") => return "local_binding_missing",
