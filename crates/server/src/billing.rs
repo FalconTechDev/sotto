@@ -1362,6 +1362,61 @@ impl SubscriptionProvider for StripeBilling {
         idempotency_key: &str,
         _user_id: &str,
     ) -> ProviderResult<SubscriptionObservation> {
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        if let Some(schedule_id) = current.schedule_id.as_deref() {
+            let current_start = current
+                .current_period_start
+                .filter(|start| *start >= 0)
+                .ok_or_else(ProviderError::malformed_response)?;
+            let current_end = current
+                .current_period_end
+                .filter(|end| *end > current_start)
+                .ok_or_else(ProviderError::malformed_response)?;
+            if current.items.len() != 1
+                || current.items[0].quantity != 1
+                || current.items[0].provider_price_id.is_empty()
+            {
+                return Err(ProviderError::malformed_response());
+            }
+            let form =
+                personal_schedule_cancellation_form(current_start, current_end, &current.items);
+            // Every retry and the founding worker use the same final-state request. The current
+            // paid-period boundary scopes the key so a retry after a later renewal can make a new
+            // provider request rather than reusing Stripe's cached response with changed dates.
+            let provider_key =
+                personal_schedule_cancellation_idempotency_key(subscription_id, current_end);
+            stripe_post_with_idempotency(
+                &self.api_key,
+                &format!("subscription_schedules/{schedule_id}"),
+                &form,
+                &provider_key,
+            )
+            .await?;
+            let schedule = stripe_get(
+                &self.api_key,
+                &format!("subscription_schedules/{schedule_id}"),
+            )
+            .await?;
+            if schedule["id"].as_str() != Some(schedule_id)
+                || stripe_schedule_subscription_id(&schedule) != Some(subscription_id)
+                || schedule["end_behavior"].as_str() != Some("cancel")
+                || !stripe_schedule_contains_phases(
+                    &schedule,
+                    current_start,
+                    current_end,
+                    &current.items,
+                    &[],
+                )
+            {
+                return Err(ProviderError::malformed_response());
+            }
+            let response =
+                stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+            return Ok(SubscriptionObservation::Current(subscription_snapshot(
+                &response,
+                subscription_id,
+            )?));
+        }
         let form = vec![("cancel_at_period_end".to_string(), "true".to_string())];
         let response = stripe_post_with_idempotency(
             &self.api_key,
@@ -3569,6 +3624,43 @@ fn stripe_schedule_contains_phases(
                 .map(|phase| phase.start_at_epoch);
             stripe_schedule_phase_matches(current_phases[index + 1], expected, next_start)
         })
+}
+
+fn personal_schedule_cancellation_form(
+    current_start: i64,
+    current_end: i64,
+    current_items: &[SponsoredSubscriptionItem],
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("end_behavior".into(), "cancel".into()),
+        ("proration_behavior".into(), "none".into()),
+        ("phases[0][start_date]".into(), current_start.to_string()),
+        ("phases[0][end_date]".into(), current_end.to_string()),
+    ];
+    for (index, item) in current_items.iter().enumerate() {
+        form.push((
+            format!("phases[0][items][{index}][price]"),
+            item.provider_price_id.clone(),
+        ));
+        form.push((
+            format!("phases[0][items][{index}][quantity]"),
+            item.quantity.to_string(),
+        ));
+    }
+    form
+}
+
+fn stripe_schedule_subscription_id(schedule: &serde_json::Value) -> Option<&str> {
+    schedule["subscription"]
+        .as_str()
+        .or_else(|| schedule["subscription"]["id"].as_str())
+}
+
+fn personal_schedule_cancellation_idempotency_key(
+    subscription_id: &str,
+    current_end: i64,
+) -> String {
+    format!("sotto-personal-cancel:{subscription_id}:{current_end}")
 }
 
 fn stripe_schedule_phase_matches(
@@ -7842,6 +7934,53 @@ mod tests {
             1_800_000_000,
             &current_items,
             &expected
+        ));
+    }
+
+    #[test]
+    fn personal_schedule_cancellation_keeps_only_the_paid_phase() {
+        let current_items = vec![SponsoredSubscriptionItem {
+            provider_item_id: "si_personal".into(),
+            provider_price_id: "price_founding_monthly".into(),
+            quantity: 1,
+        }];
+        let form =
+            personal_schedule_cancellation_form(1_700_000_000, 1_702_592_000, &current_items);
+        assert!(form.contains(&("end_behavior".into(), "cancel".into())));
+        assert!(form.contains(&("proration_behavior".into(), "none".into())));
+        assert!(form.contains(&("phases[0][start_date]".into(), "1700000000".into())));
+        assert!(form.contains(&("phases[0][end_date]".into(), "1702592000".into())));
+        assert!(form.contains(&(
+            "phases[0][items][0][price]".into(),
+            "price_founding_monthly".into()
+        )));
+        assert!(!form.iter().any(|(key, _)| key.starts_with("phases[1]")));
+        assert_eq!(
+            personal_schedule_cancellation_idempotency_key("sub_personal_1", 1_702_592_000),
+            "sotto-personal-cancel:sub_personal_1:1702592000"
+        );
+
+        let readback = serde_json::json!({
+            "id": "sub_sched_1",
+            "subscription": {"id": "sub_personal_1"},
+            "end_behavior": "cancel",
+            "phases": [{
+                "start_date": 1_700_000_000,
+                "end_date": 1_702_592_000,
+                "items": [{"price": {"id": "price_founding_monthly"}, "quantity": 1}]
+            }]
+        });
+        assert_eq!(
+            stripe_schedule_subscription_id(&readback),
+            Some("sub_personal_1")
+        );
+        assert_eq!(readback["end_behavior"].as_str(), Some("cancel"));
+        assert!(stripe_schedule_contains_phases(
+            &readback,
+            1_700_000_000,
+            1_702_592_000,
+            &current_items,
+            &[],
         ));
     }
 
