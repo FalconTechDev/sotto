@@ -55,6 +55,50 @@ Windows). Prefere conferir antes? Baixe um arquivo compactado na
 [página de releases](https://github.com/getsotto/sotto/releases) e verifique manualmente conforme
 [SECURITY.md](SECURITY.md), ou compile do código-fonte (consulte [Desenvolvimento](#desenvolvimento)).
 
+### Homebrew (prévia)
+
+O [tap do Sotto](https://github.com/getsotto/homebrew-tap) oferece outra forma
+de instalação no macOS. A fórmula distribui versões revisadas da CLI e exige
+macOS 15 ou posterior. Apple Silicon é a plataforma principal; Intel tem suporte
+de melhor esforço e está no Tier 3 do Homebrew. O Homebrew planeja encerrar o
+suporte a Intel em setembro de 2027 ou depois. O tap continua em prévia: a
+criação de PR pelo workflow está desativada, e a proposta de atualização e o
+teste isolado de identidade ainda não foram executados. Consulte as
+[orientações de instalação e suporte do tap](https://github.com/getsotto/homebrew-tap#readme)
+e o [registro de prontidão para lançamento](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md)
+antes de usar. Evite esta prévia para segredos críticos de produção.
+
+Instale e atualize a fórmula com:
+
+```sh
+brew install getsotto/tap/sotto
+```
+
+```sh
+brew update
+brew upgrade getsotto/tap/sotto
+```
+
+Se houver outra instalação do `sotto` no seu `PATH`, confira os executáveis
+encontrados e o binário gerenciado pelo Homebrew antes de escolher qual usar:
+
+```sh
+which -a sotto
+brew list --versions sotto
+"$(brew --prefix)/bin/sotto" --version
+```
+
+Para remover apenas a fórmula do Homebrew, execute:
+
+```sh
+brew uninstall getsotto/tap/sotto
+```
+
+Desinstalar a fórmula preserva os arquivos do projeto, os dados locais do
+Sotto, os itens do app Acesso às Chaves e outras instalações do `sotto`. Confirme o
+binário selecionado e guarde seu Kit de Emergência antes de remover ou trocar
+uma instalação existente.
+
 ### Autocompletar do shell
 
 `sotto completions <shell>` imprime um script de autocompletar na saída padrão. Por exemplo:

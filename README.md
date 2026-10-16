@@ -53,6 +53,50 @@ Windows). Prefer to look first? Grab an archive from the
 [releases page](https://github.com/getsotto/sotto/releases) and verify it manually per
 [SECURITY.md](SECURITY.md), or build from source (see [Developing](#developing)).
 
+### Homebrew (preview)
+
+The [Sotto tap](https://github.com/getsotto/homebrew-tap) provides another
+installation route for macOS. The formula packages reviewed CLI releases and
+requires macOS 15 or later. Apple Silicon is the primary platform; Intel is
+best-effort and Homebrew Tier 3, with Homebrew planning to end Intel support
+in or after September 2027. The tap remains a preview: workflow PR creation is
+disabled, and the live updater proposal and isolated identity smoke have not
+been exercised. Check the tap's
+[support and installation guidance](https://github.com/getsotto/homebrew-tap#readme)
+and [release-readiness record](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md)
+before using it. Avoid this preview for critical production secrets.
+
+Install and upgrade the formula with:
+
+```sh
+brew install getsotto/tap/sotto
+```
+
+```sh
+brew update
+brew upgrade getsotto/tap/sotto
+```
+
+If another `sotto` installation is on your `PATH`, inspect the resolved
+executables and the Homebrew-managed binary before choosing which one to use:
+
+```sh
+which -a sotto
+brew list --versions sotto
+"$(brew --prefix)/bin/sotto" --version
+```
+
+To remove only the Homebrew formula, run:
+
+```sh
+brew uninstall getsotto/tap/sotto
+```
+
+Uninstalling the formula leaves project files, local Sotto data, Keychain
+entries, and other `sotto` installations in place. Confirm the selected binary
+and preserve your Emergency Kit before removing or switching an existing
+installation.
+
 ### Shell completions
 
 `sotto completions <shell>` prints a completion script to stdout. For example:

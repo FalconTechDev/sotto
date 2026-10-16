@@ -55,6 +55,52 @@ Windows). Vous préférez vérifier d'abord ? Récupérez une archive sur la
 [page des versions](https://github.com/getsotto/sotto/releases) et vérifiez-la manuellement selon
 [SECURITY.md](SECURITY.md), ou compilez depuis les sources (voir [Développement](#développement)).
 
+### Homebrew (aperçu)
+
+Le [tap Sotto](https://github.com/getsotto/homebrew-tap) propose une autre
+méthode d'installation pour macOS. La formule distribue des versions de la CLI
+qui ont été examinées et requiert macOS 15 ou ultérieur. Apple Silicon est la
+plateforme principale ; Intel est pris en charge au mieux et relève du niveau
+Tier 3 de Homebrew. Homebrew prévoit de mettre fin à la prise en charge d'Intel
+en septembre 2027 ou après. Le tap reste un aperçu : la création de PR par le
+workflow est désactivée, et ni la proposition de mise à jour ni le test
+d'identité isolé n'ont été exécutés. Consultez le [guide d'installation et de
+prise en charge du tap](https://github.com/getsotto/homebrew-tap#readme) et le
+[registre de préparation au lancement](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md)
+avant de l'utiliser. Évitez cet aperçu pour les secrets de production critiques.
+
+Installez et mettez à jour la formule avec :
+
+```sh
+brew install getsotto/tap/sotto
+```
+
+```sh
+brew update
+brew upgrade getsotto/tap/sotto
+```
+
+Si une autre installation de `sotto` figure dans votre `PATH`, vérifiez les
+exécutables trouvés et le binaire géré par Homebrew avant de choisir celui à
+utiliser :
+
+```sh
+which -a sotto
+brew list --versions sotto
+"$(brew --prefix)/bin/sotto" --version
+```
+
+Pour supprimer uniquement la formule Homebrew, exécutez :
+
+```sh
+brew uninstall getsotto/tap/sotto
+```
+
+La désinstallation de la formule conserve les fichiers du projet, les données
+locales Sotto, les entrées du trousseau et les autres installations de `sotto`.
+Vérifiez le binaire sélectionné et conservez votre kit de secours avant de
+supprimer ou de remplacer une installation existante.
+
 ### Complétions du shell
 
 `sotto completions <shell>` affiche un script de complétion sur la sortie standard. Par exemple :

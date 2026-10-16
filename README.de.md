@@ -55,6 +55,51 @@ Windows). Lieber erst ansehen? Lade ein Archiv von der
 [Release-Seite](https://github.com/getsotto/sotto/releases) herunter und verifiziere es manuell gemäß
 [SECURITY.md](SECURITY.md), oder baue aus den Quellen (siehe [Entwicklung](#entwicklung)).
 
+### Homebrew (Vorschau)
+
+Der [Sotto-Tap](https://github.com/getsotto/homebrew-tap) bietet einen weiteren
+Installationsweg für macOS. Die Formula stellt geprüfte CLI-Versionen bereit
+und setzt macOS 15 oder neuer voraus. Apple Silicon ist die primäre Plattform;
+Intel wird bestmöglich unterstützt und ist bei Homebrew Tier 3. Homebrew plant,
+den Intel-Support im September 2027 oder später einzustellen. Der Tap bleibt
+eine Vorschau: Die Erstellung von PRs durch den Workflow ist deaktiviert, und
+weder ein Update-Vorschlag noch der isolierte Identitätstest wurden ausgeführt.
+Lies vor der Nutzung die [Installations- und Supporthinweise des Taps](https://github.com/getsotto/homebrew-tap#readme)
+und den [Bericht zur Launch-Bereitschaft](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md).
+Verwende diese Vorschau nicht für kritische Produktionsgeheimnisse.
+
+Installiere und aktualisiere die Formula mit:
+
+```sh
+brew install getsotto/tap/sotto
+```
+
+```sh
+brew update
+brew upgrade getsotto/tap/sotto
+```
+
+Wenn eine weitere `sotto`-Installation in deinem `PATH` liegt, prüfe vor der
+Auswahl die gefundenen ausführbaren Dateien und das von Homebrew verwaltete
+Binary:
+
+```sh
+which -a sotto
+brew list --versions sotto
+"$(brew --prefix)/bin/sotto" --version
+```
+
+Um nur die Homebrew-Formula zu entfernen, führe Folgendes aus:
+
+```sh
+brew uninstall getsotto/tap/sotto
+```
+
+Beim Entfernen der Formula bleiben Projektdateien, lokale Sotto-Daten,
+Schlüsselbund-Einträge und andere `sotto`-Installationen erhalten. Prüfe das
+ausgewählte Binary und sichere dein Notfall-Kit, bevor du eine vorhandene
+Installation entfernst oder wechselst.
+
 ### Shell-Vervollständigungen
 
 `sotto completions <shell>` gibt ein Vervollständigungsskript auf der Standardausgabe aus. Zum Beispiel:

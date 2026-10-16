@@ -55,6 +55,51 @@ Windows). ¿Prefieres revisar antes? Descarga un archivo comprimido desde la
 [página de versiones](https://github.com/getsotto/sotto/releases) y verifícalo manualmente según
 [SECURITY.md](SECURITY.md), o compila desde el código fuente (consulta [Desarrollo](#desarrollo)).
 
+### Homebrew (versión preliminar)
+
+El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de
+instalación para macOS. La fórmula empaqueta versiones de la CLI revisadas y
+requiere macOS 15 o posterior. Apple Silicon es la plataforma principal; Intel
+se ofrece como mejor esfuerzo y Homebrew Tier 3. Homebrew prevé finalizar el
+soporte para Intel en septiembre de 2027 o después. El tap sigue en versión
+preliminar: la creación de PR del workflow está desactivada y aún no se han
+probado la propuesta del actualizador ni la prueba aislada de identidad. Consulta la
+[guía de soporte e instalación del tap](https://github.com/getsotto/homebrew-tap#readme)
+y el [registro de preparación para el lanzamiento](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md)
+antes de usarlo. Evita esta versión preliminar para secretos críticos de
+producción.
+
+Instala y actualiza la fórmula con:
+
+```sh
+brew install getsotto/tap/sotto
+```
+
+```sh
+brew update
+brew upgrade getsotto/tap/sotto
+```
+
+Si hay otra instalación de `sotto` en tu `PATH`, inspecciona los ejecutables
+resueltos y el binario de Homebrew antes de elegir cuál usar:
+
+```sh
+which -a sotto
+brew list --versions sotto
+"$(brew --prefix)/bin/sotto" --version
+```
+
+Para eliminar solo la fórmula de Homebrew, ejecuta:
+
+```sh
+brew uninstall getsotto/tap/sotto
+```
+
+Al desinstalar la fórmula se conservan los archivos del proyecto, los datos
+locales de Sotto, las entradas del Llavero y otras instalaciones de `sotto`.
+Confirma qué binario está seleccionado y guarda tu Kit de emergencia
+antes de eliminar o cambiar una instalación existente.
+
 ### Completado del shell
 
 `sotto completions <shell>` muestra un script de completado en la salida estándar. Por ejemplo:
