@@ -3300,6 +3300,10 @@ async fn create_checkout(
     Path(org_id): Path<String>,
 ) -> Result<Json<RedirectView>> {
     let billing = cloud_sales_config(&state)?;
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
     let mut tx = state.pool.begin().await?;
     // Keep the organisation lock through provider session creation so deletion cannot transition
     // between the lifecycle check and this billing side effect. The bounded provider timeout
