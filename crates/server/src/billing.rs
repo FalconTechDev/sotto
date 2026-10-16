@@ -612,6 +612,7 @@ impl BillingState {
         let provider = StripeBilling {
             api_key: config.api_key.clone(),
             price_id: config.price_id,
+            api_origin: "https://api.stripe.com".into(),
         };
         Self {
             provider: Arc::new(provider),
@@ -701,6 +702,7 @@ impl BillingState {
 struct StripeBilling {
     api_key: String,
     price_id: String,
+    api_origin: String,
 }
 
 #[async_trait]
@@ -1033,7 +1035,12 @@ impl SubscriptionProvider for StripeBilling {
         &self,
         subscription_id: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
-        let value = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscriptions/{subscription_id}"),
+        )
+        .await?;
         sponsored_subscription_snapshot(&value, subscription_id)
     }
 
@@ -1385,15 +1392,17 @@ impl SubscriptionProvider for StripeBilling {
             // provider request rather than reusing Stripe's cached response with changed dates.
             let provider_key =
                 personal_schedule_cancellation_idempotency_key(subscription_id, current_end);
-            stripe_post_with_idempotency(
+            stripe_post_with_idempotency_at(
                 &self.api_key,
+                &self.api_origin,
                 &format!("subscription_schedules/{schedule_id}"),
                 &form,
                 &provider_key,
             )
             .await?;
-            let schedule = stripe_get(
+            let schedule = stripe_get_at(
                 &self.api_key,
+                &self.api_origin,
                 &format!("subscription_schedules/{schedule_id}"),
             )
             .await?;
@@ -1410,16 +1419,21 @@ impl SubscriptionProvider for StripeBilling {
             {
                 return Err(ProviderError::malformed_response());
             }
-            let response =
-                stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+            let response = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscriptions/{subscription_id}"),
+            )
+            .await?;
             return Ok(SubscriptionObservation::Current(subscription_snapshot(
                 &response,
                 subscription_id,
             )?));
         }
         let form = vec![("cancel_at_period_end".to_string(), "true".to_string())];
-        let response = stripe_post_with_idempotency(
+        let response = stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscriptions/{subscription_id}"),
             &form,
             idempotency_key,
@@ -3284,6 +3298,49 @@ async fn personal_cancel(
         .map_err(personal_billing_error)?
         .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
     if account.cancel_at_period_end {
+        // A webhook or an earlier cancellation attempt may have set the account flag before the
+        // founding transition schedule was reconciled. Repeat the provider operation on retries:
+        // it is idempotent and changes an attached schedule to end at the paid boundary.
+        if account.state != personal_billing::PersonalBillingState::Canceled {
+            if let Some(subscription_id) = account.stripe_subscription_id.as_deref() {
+                founding_schedule::request_personal_cancellation(
+                    &mut tx,
+                    &user.user_id,
+                    subscription_id,
+                )
+                .await?;
+                tx.commit().await?;
+                billing
+                    .provider
+                    .cancel_personal_subscription(
+                        subscription_id,
+                        &request.idempotency_key,
+                        &user.user_id,
+                    )
+                    .await
+                    .map_err(ProviderError::into_error)?;
+                founding_schedule::record_personal_cancellation(
+                    &state.pool,
+                    &user.user_id,
+                    subscription_id,
+                )
+                .await?;
+                let mut update_tx = state.pool.begin().await?;
+                let founding = personal_founding_transition(&mut update_tx, &user.user_id).await?;
+                update_tx.commit().await?;
+                return Ok(Json(PersonalLifecycleView {
+                    state: account.state.as_str().into(),
+                    stripe_subscription_id: Some(subscription_id.to_owned()),
+                    paid_through_date: account.paid_through_date,
+                    cancel_at_period_end: true,
+                    portal_url: None,
+                    founding_price_end_epoch: founding.end_epoch,
+                    standard_renewal_amount_pence: founding.standard_amount_pence,
+                    founding_transition_status: founding.status,
+                    founding_transition_reason: founding.reason,
+                }));
+            }
+        }
         let founding = personal_founding_transition(&mut tx, &user.user_id).await?;
         tx.rollback().await?;
         return Ok(Json(PersonalLifecycleView {
@@ -3551,8 +3608,25 @@ async fn stripe_post_with_idempotency(
     form: &[(String, String)],
     idempotency_key: &str,
 ) -> ProviderResult<serde_json::Value> {
+    stripe_post_with_idempotency_at(
+        api_key,
+        "https://api.stripe.com",
+        path,
+        form,
+        idempotency_key,
+    )
+    .await
+}
+
+async fn stripe_post_with_idempotency_at(
+    api_key: &str,
+    api_origin: &str,
+    path: &str,
+    form: &[(String, String)],
+    idempotency_key: &str,
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
-        .post(format!("https://api.stripe.com/v1/{path}"))
+        .post(format!("{}/v1/{path}", api_origin.trim_end_matches('/')))
         .bearer_auth(api_key)
         .headers(stripe_headers(Some(idempotency_key))?)
         .form(form)
@@ -3564,8 +3638,16 @@ async fn stripe_post_with_idempotency(
 
 /// Fetch one Stripe resource with the pinned API version and structured error classification.
 async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Value> {
+    stripe_get_at(api_key, "https://api.stripe.com", path).await
+}
+
+async fn stripe_get_at(
+    api_key: &str,
+    api_origin: &str,
+    path: &str,
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
-        .get(format!("https://api.stripe.com/v1/{path}"))
+        .get(format!("{}/v1/{path}", api_origin.trim_end_matches('/')))
         .bearer_auth(api_key)
         .headers(stripe_headers(None)?)
         .send()
@@ -7593,6 +7675,82 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::sync::Mutex;
+    use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct CancellationHttpState(Arc<Mutex<Vec<(String, String, String)>>>);
+
+    async fn cancellation_http_mock(
+        State(state): State<CancellationHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let method = request.method().to_string();
+        let path = request.uri().path().to_owned();
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small Stripe mock body");
+        let body = String::from_utf8(body.to_vec()).expect("form body is UTF-8");
+        state.0.lock().expect("request log lock").push((
+            method.clone(),
+            path.clone(),
+            body.clone(),
+        ));
+        let value = match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/subscriptions/sub_scheduled") => serde_json::json!({
+                "id":"sub_scheduled", "customer":"cus_test", "status":"active",
+                "schedule":"sched_test", "items":{"data":[{
+                    "id":"si_test", "price":{"id":"price_founding_monthly"}, "quantity":1,
+                    "current_period_start":1700000000, "current_period_end":1702592000
+                }]}
+            }),
+            ("GET", "/v1/subscription_schedules/sched_test")
+            | ("POST", "/v1/subscription_schedules/sched_test") => serde_json::json!({
+                "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+                "phases":[{"start_date":1700000000,"end_date":1702592000,"items":[{
+                    "price":{"id":"price_founding_monthly"},"quantity":1
+                }]}]
+            }),
+            ("GET", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
+                "id":"sub_unscheduled", "customer":"cus_test", "status":"active",
+                "items":{"data":[{
+                    "id":"si_test", "price":{"id":"price_standard_monthly"}, "quantity":1,
+                    "current_period_start":1700000000, "current_period_end":1702592000
+                }]}
+            }),
+            ("POST", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
+                "id":"sub_unscheduled", "status":"active"
+            }),
+            _ => {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("{}"))
+                    .expect("mock response")
+            }
+        };
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(value.to_string()))
+            .expect("mock response")
+    }
+
+    async fn cancellation_http_server() -> (
+        String,
+        Arc<Mutex<Vec<(String, String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind Stripe HTTP mock");
+        let address = listener.local_addr().expect("mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .fallback(axum::routing::any(cancellation_http_mock))
+            .with_state(CancellationHttpState(requests.clone()));
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{address}"), requests, task)
+    }
 
     #[test]
     fn founding_price_moves_to_standard_at_the_award_boundary() {
@@ -7982,6 +8140,69 @@ mod tests {
             &current_items,
             &[],
         ));
+    }
+
+    #[tokio::test]
+    async fn stripe_personal_cancellation_updates_schedules_and_direct_subscriptions() {
+        let (origin, requests, server) = cancellation_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            api_origin: origin,
+        };
+
+        let scheduled = provider
+            .cancel_personal_subscription("sub_scheduled", "cancel-request", "user")
+            .await
+            .expect("scheduled cancellation succeeds after read-back");
+        assert!(matches!(scheduled, SubscriptionObservation::Current(_)));
+        let unscheduled = provider
+            .cancel_personal_subscription("sub_unscheduled", "cancel-unscheduled", "user")
+            .await
+            .expect("unscheduled cancellation succeeds");
+        assert!(matches!(unscheduled, SubscriptionObservation::Current(_)));
+
+        let requests = requests.lock().expect("request log lock").clone();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path, _)| {
+                    method == "GET" && path == "/v1/subscription_schedules/sched_test"
+                })
+                .count(),
+            1,
+            "scheduled cancellation verifies the updated schedule"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path, _)| {
+                    method == "GET" && path == "/v1/subscriptions/sub_scheduled"
+                })
+                .count(),
+            2,
+            "scheduled cancellation reads the subscription before and after the update"
+        );
+        let schedule_update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_test"
+            })
+            .expect("schedule update request");
+        assert!(schedule_update.2.contains("end_behavior=cancel"));
+        assert!(schedule_update
+            .2
+            .contains("phases%5B0%5D%5Bend_date%5D=1702592000"));
+        assert!(!schedule_update.2.contains("phases%5B1%5D"));
+        let direct_update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscriptions/sub_unscheduled"
+            })
+            .expect("direct subscription update request");
+        assert!(direct_update.2.contains("cancel_at_period_end=true"));
+        server.abort();
     }
 
     #[test]

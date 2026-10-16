@@ -15,6 +15,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tower::ServiceExt;
@@ -244,6 +245,47 @@ impl SubscriptionProvider for TestProvider {
         _organisation_id: &str,
     ) -> ProviderResult<SubscriptionObservation> {
         Ok(self.observation.clone())
+    }
+}
+
+struct CancellationCountingProvider(Arc<AtomicUsize>);
+
+#[async_trait]
+impl SubscriptionProvider for CancellationCountingProvider {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<String> {
+        Ok("https://stripe.test/checkout".into())
+    }
+
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
+        Ok("https://stripe.test/portal".into())
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Ok(SubscriptionObservation::Missing)
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(SubscriptionObservation::Missing)
     }
 }
 
@@ -502,6 +544,69 @@ async fn personal_cancellation_persists_intent_before_acknowledging_provider_acc
     .await
     .expect("read accepted cancellation");
     assert_eq!(cancellation, (true, true));
+
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean user");
+}
+
+#[tokio::test]
+async fn already_flagged_personal_cancellation_still_reconciles_provider_state() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-cancel-retry-{fixture}");
+    let token = seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("personal-cancel-retry-{fixture}")).await;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'active', cancel_at_period_end = TRUE, \
+           stripe_customer_id = $2, stripe_subscription_id = $3 WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .bind(format!("cus_cancel_retry_{fixture}"))
+    .bind(format!("sub_cancel_retry_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("seed cancellation already accepted by webhook");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(CancellationCountingProvider(calls.clone())),
+    );
+
+    assert_eq!(
+        post_authed_json(
+            &app,
+            "/billing/personal/cancel",
+            &token,
+            serde_json::json!({"idempotency_key": format!("cancel-retry-{fixture}")}),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let intent_recorded: bool = sqlx::query_scalar(
+        "SELECT cancellation_requested_at IS NOT NULL FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read cancellation intent");
+    assert!(intent_recorded);
 
     sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
         .bind(&user_id)
