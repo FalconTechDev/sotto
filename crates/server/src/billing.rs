@@ -1087,12 +1087,25 @@ impl SubscriptionProvider for StripeBilling {
                     .to_string()
             }
         };
-        let current_start = current
+        let current_period_start = current
             .current_period_start
             .ok_or_else(ProviderError::malformed_response)?;
         let current_end = current
             .current_period_end
             .ok_or_else(ProviderError::malformed_response)?;
+        let existing_schedule = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscription_schedules/{schedule_id}"),
+        )
+        .await?;
+        let current_start = stripe_current_schedule_phase_start(
+            &existing_schedule,
+            &schedule_id,
+            subscription_id,
+            current_period_start,
+            current_end,
+        )?;
         let phase_at_end = phases
             .iter()
             .find(|phase| {
@@ -1158,15 +1171,17 @@ impl SubscriptionProvider for StripeBilling {
                 ));
             }
         }
-        stripe_post_with_idempotency(
+        stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
             &form,
             &schedule_update_idempotency_key(idempotency_key, &normalized),
         )
         .await?;
-        let schedule = stripe_get(
+        let schedule = stripe_get_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
@@ -1371,13 +1386,13 @@ impl SubscriptionProvider for StripeBilling {
     ) -> ProviderResult<SubscriptionObservation> {
         let current = self.get_sponsored_subscription(subscription_id).await?;
         if let Some(schedule_id) = current.schedule_id.as_deref() {
-            let current_start = current
+            let current_period_start = current
                 .current_period_start
                 .filter(|start| *start >= 0)
                 .ok_or_else(ProviderError::malformed_response)?;
             let current_end = current
                 .current_period_end
-                .filter(|end| *end > current_start)
+                .filter(|end| *end > current_period_start)
                 .ok_or_else(ProviderError::malformed_response)?;
             if current.items.len() != 1
                 || current.items[0].quantity != 1
@@ -1385,13 +1400,28 @@ impl SubscriptionProvider for StripeBilling {
             {
                 return Err(ProviderError::malformed_response());
             }
+            let existing_schedule = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscription_schedules/{schedule_id}"),
+            )
+            .await?;
+            let current_start = stripe_current_schedule_phase_start(
+                &existing_schedule,
+                schedule_id,
+                subscription_id,
+                current_period_start,
+                current_end,
+            )?;
             let form =
                 personal_schedule_cancellation_form(current_start, current_end, &current.items);
-            // Every retry and the founding worker use the same final-state request. The current
-            // paid-period boundary scopes the key so a retry after a later renewal can make a new
-            // provider request rather than reusing Stripe's cached response with changed dates.
-            let provider_key =
-                personal_schedule_cancellation_idempotency_key(subscription_id, current_end);
+            // Each route request or worker lease gets its own key. Reusing a key across the route
+            // and worker could replay a response from before the worker's schedule update.
+            let provider_key = personal_schedule_cancellation_idempotency_key(
+                subscription_id,
+                current_end,
+                idempotency_key,
+            );
             stripe_post_with_idempotency_at(
                 &self.api_key,
                 &self.api_origin,
@@ -3741,8 +3771,40 @@ fn stripe_schedule_subscription_id(schedule: &serde_json::Value) -> Option<&str>
 fn personal_schedule_cancellation_idempotency_key(
     subscription_id: &str,
     current_end: i64,
+    request_key: &str,
 ) -> String {
-    format!("sotto-personal-cancel:{subscription_id}:{current_end}")
+    let digest = Sha256::digest(request_key.as_bytes());
+    let request_fingerprint = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sotto-personal-cancel:{subscription_id}:{current_end}:{request_fingerprint}")
+}
+
+fn stripe_current_schedule_phase_start(
+    schedule: &serde_json::Value,
+    schedule_id: &str,
+    subscription_id: &str,
+    period_start: i64,
+    period_end: i64,
+) -> ProviderResult<i64> {
+    if schedule["id"].as_str() != Some(schedule_id)
+        || stripe_schedule_subscription_id(schedule) != Some(subscription_id)
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let start = schedule["current_phase"]["start_date"]
+        .as_i64()
+        .filter(|start| *start >= 0)
+        .ok_or_else(ProviderError::malformed_response)?;
+    let end = schedule["current_phase"]["end_date"]
+        .as_i64()
+        .filter(|end| *end > start)
+        .ok_or_else(ProviderError::malformed_response)?;
+    if start > period_start || end < period_end {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(start)
 }
 
 fn stripe_schedule_phase_matches(
@@ -6721,6 +6783,21 @@ async fn subscription_updated(
         let cancel_at_period_end = object["cancel_at_period_end"].as_bool().ok_or_else(|| {
             Error::Config("personal subscription event has no cancellation state".into())
         })?;
+        let cancel_at_epoch = object["cancel_at"]
+            .as_i64()
+            .filter(|timestamp| *timestamp >= 0);
+        let will_cancel = cancel_at_period_end || cancel_at_epoch.is_some();
+        let was_cancel_at_period_end: bool = sqlx::query_scalar(
+            "SELECT cancel_at_period_end FROM billing_personal_accounts \
+             WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(&user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        // A schedule-managed cancellation can be represented by `cancel_at` even when Stripe
+        // leaves `cancel_at_period_end` false. Only an unscheduled transition from a recorded
+        // cancellation back to no cancellation is treated as customer reactivation.
+        let reactivated = was_cancel_at_period_end && !will_cancel && object["schedule"].is_null();
         let state = match SubscriptionStatus::parse(status) {
             SubscriptionStatus::Active | SubscriptionStatus::Trialing => "active",
             SubscriptionStatus::PastDue | SubscriptionStatus::Paused => "past_due",
@@ -6733,14 +6810,19 @@ async fn subscription_updated(
             "UPDATE billing_personal_accounts SET state = CASE \
                  WHEN state = 'pending' AND $2 <> 'canceled' THEN state ELSE $2 END, \
                  cancel_at_period_end = $3, stripe_subscription_id = COALESCE(stripe_subscription_id, $4), \
+                 cancellation_requested_at = CASE WHEN $5 THEN NULL ELSE cancellation_requested_at END, \
                  updated_at = now() WHERE user_id = $1",
         )
         .bind(&user_id)
         .bind(state)
-        .bind(cancel_at_period_end)
+        .bind(will_cancel)
         .bind(subscription_id)
+        .bind(reactivated)
         .execute(&mut **tx)
         .await?;
+        if reactivated {
+            founding_schedule::resume_personal_transition(tx, &user_id, subscription_id).await?;
+        }
         return Ok(());
     }
     if sponsored_subscription_updated(tx, object).await? {
@@ -7674,12 +7756,16 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::str::FromStr;
     use std::sync::Mutex;
     use tokio::net::TcpListener;
 
     #[derive(Clone)]
-    struct CancellationHttpState(Arc<Mutex<Vec<(String, String, String)>>>);
+    struct CancellationHttpState {
+        requests: Arc<Mutex<Vec<(String, String, String)>>>,
+        updated_schedules: Arc<Mutex<HashSet<String>>>,
+    }
 
     async fn cancellation_http_mock(
         State(state): State<CancellationHttpState>,
@@ -7691,25 +7777,98 @@ mod tests {
             .await
             .expect("small Stripe mock body");
         let body = String::from_utf8(body.to_vec()).expect("form body is UTF-8");
-        state.0.lock().expect("request log lock").push((
+        state.requests.lock().expect("request log lock").push((
             method.clone(),
             path.clone(),
             body.clone(),
         ));
+        if method == "POST" && path.starts_with("/v1/subscription_schedules/") {
+            let schedule_id = path.trim_start_matches("/v1/subscription_schedules/");
+            state
+                .updated_schedules
+                .lock()
+                .expect("updated schedule lock")
+                .insert(schedule_id.to_owned());
+        }
+        let schedule_updated = state
+            .updated_schedules
+            .lock()
+            .expect("updated schedule lock")
+            .clone();
         let value = match (method.as_str(), path.as_str()) {
             ("GET", "/v1/subscriptions/sub_scheduled") => serde_json::json!({
                 "id":"sub_scheduled", "customer":"cus_test", "status":"active",
                 "schedule":"sched_test", "items":{"data":[{
                     "id":"si_test", "price":{"id":"price_founding_monthly"}, "quantity":1,
-                    "current_period_start":1700000000, "current_period_end":1702592000
+                    "current_period_start":1705184000, "current_period_end":1707776000
                 }]}
             }),
             ("GET", "/v1/subscription_schedules/sched_test")
-            | ("POST", "/v1/subscription_schedules/sched_test") => serde_json::json!({
+                if schedule_updated.contains("sched_test") =>
+            {
+                serde_json::json!({
+                    "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+                    "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                    "phases":[{"start_date":1702592000,"end_date":1707776000,"items":[{
+                        "price":{"id":"price_founding_monthly"},"quantity":1
+                    }]}]
+                })
+            }
+            ("GET", "/v1/subscription_schedules/sched_test") => serde_json::json!({
                 "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
-                "phases":[{"start_date":1700000000,"end_date":1702592000,"items":[{
+                "current_phase":{"start_date":1702592000,"end_date":1710368000},
+                "phases":[{"start_date":1702592000,"end_date":1710368000,"items":[{
                     "price":{"id":"price_founding_monthly"},"quantity":1
                 }]}]
+            }),
+            ("POST", "/v1/subscription_schedules/sched_test") => serde_json::json!({
+                "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+                "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                "phases":[{"start_date":1702592000,"end_date":1707776000,"items":[{
+                    "price":{"id":"price_founding_monthly"},"quantity":1
+                }]}]
+            }),
+            ("GET", "/v1/subscriptions/sub_transition") => serde_json::json!({
+                "id":"sub_transition", "customer":"cus_test", "status":"active",
+                "schedule":"sched_transition", "items":{"data":[{
+                    "id":"si_transition", "price":{"id":"price_founding_monthly"}, "quantity":1,
+                    "current_period_start":1705184000, "current_period_end":1707776000
+                }]}
+            }),
+            ("GET", "/v1/subscription_schedules/sched_transition")
+                if schedule_updated.contains("sched_transition") =>
+            {
+                serde_json::json!({
+                    "id":"sched_transition", "subscription":"sub_transition", "end_behavior":"release",
+                    "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                    "phases":[
+                        {"start_date":1702592000,"end_date":1707776000,"items":[{
+                            "price":{"id":"price_founding_monthly"},"quantity":1
+                        }]},
+                        {"start_date":1707776000,"end_date":1710368000,"items":[{
+                            "price":{"id":"price_standard_monthly"},"quantity":1
+                        }]}
+                    ]
+                })
+            }
+            ("GET", "/v1/subscription_schedules/sched_transition") => serde_json::json!({
+                "id":"sched_transition", "subscription":"sub_transition", "end_behavior":"release",
+                "current_phase":{"start_date":1702592000,"end_date":1710368000},
+                "phases":[{"start_date":1702592000,"end_date":1710368000,"items":[{
+                    "price":{"id":"price_founding_monthly"},"quantity":1
+                }]}]
+            }),
+            ("POST", "/v1/subscription_schedules/sched_transition") => serde_json::json!({
+                "id":"sched_transition", "subscription":"sub_transition", "end_behavior":"release",
+                "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                "phases":[
+                    {"start_date":1702592000,"end_date":1707776000,"items":[{
+                        "price":{"id":"price_founding_monthly"},"quantity":1
+                    }]},
+                    {"start_date":1707776000,"end_date":1710368000,"items":[{
+                        "price":{"id":"price_standard_monthly"},"quantity":1
+                    }]}
+                ]
             }),
             ("GET", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
                 "id":"sub_unscheduled", "customer":"cus_test", "status":"active",
@@ -7747,7 +7906,10 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let router = Router::new()
             .fallback(axum::routing::any(cancellation_http_mock))
-            .with_state(CancellationHttpState(requests.clone()));
+            .with_state(CancellationHttpState {
+                requests: requests.clone(),
+                updated_schedules: Arc::new(Mutex::new(HashSet::new())),
+            });
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (format!("http://{address}"), requests, task)
     }
@@ -8114,8 +8276,12 @@ mod tests {
         )));
         assert!(!form.iter().any(|(key, _)| key.starts_with("phases[1]")));
         assert_eq!(
-            personal_schedule_cancellation_idempotency_key("sub_personal_1", 1_702_592_000),
-            "sotto-personal-cancel:sub_personal_1:1702592000"
+            personal_schedule_cancellation_idempotency_key(
+                "sub_personal_1",
+                1_702_592_000,
+                "request-1"
+            ),
+            "sotto-personal-cancel:sub_personal_1:1702592000:19f1064b619d49d35392eac7261cd726"
         );
 
         let readback = serde_json::json!({
@@ -8145,6 +8311,23 @@ mod tests {
     #[tokio::test]
     async fn stripe_personal_cancellation_updates_schedules_and_direct_subscriptions() {
         let (origin, requests, server) = cancellation_http_server().await;
+        let schedule_readback = serde_json::json!({
+            "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+            "phases":[{"start_date":1702592000,"end_date":1707776000,"items":[{
+                "price":{"id":"price_founding_monthly"},"quantity":1
+            }]}]
+        });
+        assert!(stripe_schedule_contains_phases(
+            &schedule_readback,
+            1702592000,
+            1707776000,
+            &[SponsoredSubscriptionItem {
+                provider_item_id: "si_test".into(),
+                provider_price_id: "price_founding_monthly".into(),
+                quantity: 1,
+            }],
+            &[]
+        ));
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
@@ -8153,17 +8336,47 @@ mod tests {
 
         let scheduled = provider
             .cancel_personal_subscription("sub_scheduled", "cancel-request", "user")
-            .await
-            .expect("scheduled cancellation succeeds after read-back");
-        assert!(matches!(scheduled, SubscriptionObservation::Current(_)));
+            .await;
+        assert!(
+            scheduled.is_ok(),
+            "scheduled cancellation succeeds after read-back: {:?}; requests: {:?}",
+            scheduled,
+            requests.lock().expect("request log lock")
+        );
+        assert!(matches!(scheduled, Ok(SubscriptionObservation::Current(_))));
         let unscheduled = provider
             .cancel_personal_subscription("sub_unscheduled", "cancel-unscheduled", "user")
             .await
             .expect("unscheduled cancellation succeeds");
         assert!(matches!(unscheduled, SubscriptionObservation::Current(_)));
+        let transitioned = provider
+            .update_personal_subscription(
+                "sub_transition",
+                &[SponsoredSubscriptionPhase {
+                    start_at_epoch: 1707776000,
+                    end_at_epoch: None,
+                    items: vec![SponsoredSubscriptionItemRequest {
+                        provider_price_id: "price_standard_monthly".into(),
+                        quantity: 1,
+                    }],
+                }],
+                "transition-request",
+            )
+            .await;
+        assert!(
+            transitioned.is_ok(),
+            "transition update retains the active schedule phase start: {:?}; requests: {:?}",
+            transitioned,
+            requests.lock().expect("request log lock")
+        );
+        let transitioned = transitioned.expect("transition update returned snapshot");
+        assert_eq!(
+            transitioned.schedule_id.as_deref(),
+            Some("sched_transition")
+        );
 
         let requests = requests.lock().expect("request log lock").clone();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 12);
         assert_eq!(
             requests
                 .iter()
@@ -8171,7 +8384,7 @@ mod tests {
                     method == "GET" && path == "/v1/subscription_schedules/sched_test"
                 })
                 .count(),
-            1,
+            2,
             "scheduled cancellation verifies the updated schedule"
         );
         assert_eq!(
@@ -8193,7 +8406,11 @@ mod tests {
         assert!(schedule_update.2.contains("end_behavior=cancel"));
         assert!(schedule_update
             .2
-            .contains("phases%5B0%5D%5Bend_date%5D=1702592000"));
+            .contains("phases%5B0%5D%5Bstart_date%5D=1702592000"));
+        assert!(schedule_update
+            .2
+            .contains("phases%5B0%5D%5Bend_date%5D=1707776000"));
+        assert!(schedule_update.2.contains("proration_behavior=none"));
         assert!(!schedule_update.2.contains("phases%5B1%5D"));
         let direct_update = requests
             .iter()
@@ -8202,6 +8419,18 @@ mod tests {
             })
             .expect("direct subscription update request");
         assert!(direct_update.2.contains("cancel_at_period_end=true"));
+        let transition_update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_transition"
+            })
+            .expect("transition schedule update request");
+        assert!(transition_update
+            .2
+            .contains("phases%5B0%5D%5Bstart_date%5D=1702592000"));
+        assert!(transition_update
+            .2
+            .contains("phases%5B0%5D%5Bend_date%5D=1707776000"));
         server.abort();
     }
 

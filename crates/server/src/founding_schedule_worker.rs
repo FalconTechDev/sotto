@@ -32,7 +32,24 @@ pub async fn run_once(
     let result = process_job(pool, provider, catalogue, &job).await;
     match result {
         Ok(Some(schedule_id)) => {
-            founding_schedule::mark_scheduled(pool, &job, &schedule_id).await?;
+            let marked = founding_schedule::mark_scheduled(pool, &job, &schedule_id).await?;
+            if !marked && job.payer_kind == FoundingPayerKind::Personal {
+                let cancellation_requested = personal_cancellation_requested(pool, &job).await?;
+                if cancellation_requested {
+                    match apply_personal_cancellation(pool, provider, &job).await {
+                        Ok(()) => {
+                            founding_schedule::mark_not_required(pool, &job).await?;
+                        }
+                        Err(error) => {
+                            let _ = founding_schedule::mark_unresolved(pool, &job, &error).await?;
+                            eprintln!(
+                                "founding schedule worker: cancellation remains unresolved attempt={}",
+                                job.attempt_count,
+                            );
+                        }
+                    }
+                }
+            }
         }
         Ok(None) => {
             founding_schedule::mark_not_required(pool, &job).await?;
@@ -93,7 +110,10 @@ async fn process_job(
                 provider
                     .cancel_personal_subscription(
                         &job.subscription_id,
-                        &personal_cancellation_idempotency_key(&job.subscription_id),
+                        &personal_cancellation_idempotency_key(
+                            &job.subscription_id,
+                            &job.lease_token,
+                        ),
                         &job.beneficiary_id,
                     )
                     .await?;
@@ -164,7 +184,10 @@ async fn process_job(
                 provider
                     .cancel_personal_subscription(
                         &job.subscription_id,
-                        &personal_cancellation_idempotency_key(&job.subscription_id),
+                        &personal_cancellation_idempotency_key(
+                            &job.subscription_id,
+                            &job.lease_token,
+                        ),
                         &job.beneficiary_id,
                     )
                     .await?;
@@ -232,8 +255,45 @@ async fn process_job(
     }
 }
 
-fn personal_cancellation_idempotency_key(subscription_id: &str) -> String {
-    format!("sotto-personal-cancel:{subscription_id}")
+async fn personal_cancellation_requested(
+    pool: &PgPool,
+    job: &FoundingScheduleJob,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT cancel_at_period_end OR cancellation_requested_at IS NOT NULL \
+         FROM billing_personal_accounts WHERE user_id = $1 AND stripe_subscription_id = $2",
+    )
+    .bind(&job.beneficiary_id)
+    .bind(&job.subscription_id)
+    .fetch_optional(pool)
+    .await
+    .map(|value| value.unwrap_or(false))
+}
+
+async fn apply_personal_cancellation(
+    pool: &PgPool,
+    provider: &dyn SubscriptionProvider,
+    job: &FoundingScheduleJob,
+) -> Result<(), ProviderError> {
+    provider
+        .cancel_personal_subscription(
+            &job.subscription_id,
+            &personal_cancellation_idempotency_key(&job.subscription_id, &job.lease_token),
+            &job.beneficiary_id,
+        )
+        .await?;
+    founding_schedule::record_personal_cancellation(
+        pool,
+        &job.beneficiary_id,
+        &job.subscription_id,
+    )
+    .await
+    .map_err(|_| local_error("local_evidence_invalid"))?;
+    Ok(())
+}
+
+fn personal_cancellation_idempotency_key(subscription_id: &str, lease_token: &str) -> String {
+    format!("sotto-personal-cancel:{subscription_id}:worker:{lease_token}")
 }
 
 fn parse_founding_offer(value: &str) -> Result<FoundingOffer, ProviderError> {
