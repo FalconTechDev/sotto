@@ -241,6 +241,8 @@ pub enum TransferError {
     AlreadyInProgress,
     #[error("transfer is not authorised")]
     Unauthorised,
+    #[error("transfer beneficiary does not exist")]
+    BeneficiaryMissing,
     #[error("transfer state is corrupt")]
     CorruptState,
     #[error("transfer evidence conflicts with the stored result")]
@@ -273,6 +275,9 @@ impl From<TransferError> for Error {
                 Self::Conflict("a transfer is already in progress for this beneficiary".into())
             }
             TransferError::Unauthorised => Self::Forbidden("transfer is not authorised".into()),
+            TransferError::BeneficiaryMissing => {
+                Self::NotFound("billing beneficiary not found".into())
+            }
             TransferError::CorruptState => Self::Internal("transfer state is corrupt".into()),
             TransferError::ResultConflict
             | TransferError::FoundingPayerConflict
@@ -326,6 +331,7 @@ pub async fn begin_transfer(
         return Err(TransferError::AlreadyInProgress);
     }
     let source_offer = ensure_source_active(tx, request, now_epoch).await?;
+    ensure_no_pending_billing_mutation(tx, &request.beneficiary_id).await?;
     ensure_destination_free(tx, request).await?;
     let founding_award_id: Option<String> = sqlx::query_scalar(
         "SELECT award_id FROM billing_founding_awards WHERE beneficiary_id = $1",
@@ -431,6 +437,7 @@ pub async fn accept_transfer(
     let request = request_from_intent(&current);
     request.validate_timing(now_epoch)?;
     let source_offer = ensure_source_active(tx, &request, now_epoch).await?;
+    ensure_no_pending_billing_mutation(tx, &request.beneficiary_id).await?;
     ensure_destination_free(tx, &request).await?;
     let award = if let Some(award_id) = current.founding_award_id.as_deref() {
         let award = founding_allocator::load_award(tx, award_id)
@@ -473,32 +480,56 @@ pub async fn lock_and_check_no_live_transfer(
         .copied()
         .filter(|id| !id.trim().is_empty())
         .collect::<std::collections::BTreeSet<_>>();
-    for user_id in &user_ids {
-        let exists: Option<String> =
-            sqlx::query_scalar("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        if exists.is_none() {
-            return Err(TransferError::Unauthorised);
-        }
+    let user_ids = user_ids.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    if user_ids.is_empty() {
+        return Ok(());
+    }
+    let locked_user_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM users WHERE id = ANY($1) ORDER BY id FOR UPDATE")
+            .bind(&user_ids)
+            .fetch_all(&mut **tx)
+            .await?;
+    if locked_user_ids.len() != user_ids.len() {
+        return Err(TransferError::BeneficiaryMissing);
     }
 
-    for user_id in user_ids {
-        let active: Option<String> = sqlx::query_scalar(
-            "SELECT transfer_id FROM billing_transfer_intents \
-             WHERE beneficiary_id = $1 AND (state IN \
-               ('pending','destination_prepared','destination_paid','source_adjustment_pending','unknown') \
-               OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
-             FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(now_epoch)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if active.is_some() {
-            return Err(TransferError::AlreadyInProgress);
-        }
+    let active: Option<String> = sqlx::query_scalar(
+        "SELECT transfer_id FROM billing_transfer_intents \
+         WHERE beneficiary_id = ANY($1) AND (state IN \
+           ('pending','destination_prepared','destination_paid','source_adjustment_pending','unknown') \
+           OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
+         ORDER BY beneficiary_id, transfer_id LIMIT 1 FOR UPDATE",
+    )
+    .bind(&user_ids)
+    .bind(now_epoch)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if active.is_some() {
+        return Err(TransferError::AlreadyInProgress);
+    }
+    Ok(())
+}
+
+async fn ensure_no_pending_billing_mutation(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+) -> Result<(), TransferError> {
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(\
+             SELECT 1 FROM billing_sponsored_operations \
+             WHERE (beneficiary_id = $1 OR replacement_beneficiary_id = $1) \
+               AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown')\
+         ) OR EXISTS(\
+             SELECT 1 FROM billing_correction_requests \
+             WHERE beneficiary_id = $1 AND early_termination_confirmed_at_epoch IS NOT NULL \
+               AND state IN ('requested', 'approved', 'provider_pending', 'termination_pending', 'unknown')\
+         )",
+    )
+    .bind(beneficiary_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if pending {
+        return Err(TransferError::AlreadyInProgress);
     }
     Ok(())
 }
@@ -917,8 +948,17 @@ fn validate_offer_at_boundary(
             let founding_end = award
                 .original_end_epoch
                 .ok_or(TransferError::CorruptState)?;
+            let founding_offer = award.offer.billing_offer();
+            let expected_source = if request.effective_from <= founding_end {
+                founding_offer
+            } else {
+                award.offer.standard_billing_offer()
+            };
+            if parse_offer(source_offer)? != expected_source {
+                return Err(TransferError::SourceTermChanged);
+            }
             if request.effective_from < founding_end {
-                award.offer.billing_offer()
+                founding_offer
             } else {
                 award.offer.standard_billing_offer()
             }
@@ -1201,6 +1241,10 @@ mod tests {
         transfer.effective_from = 1_999;
         transfer.offer = BillingOffer::FoundingMonthly;
         assert!(validate_offer_at_boundary(&transfer, "founding_monthly", Some(&award)).is_ok());
+        assert!(matches!(
+            validate_offer_at_boundary(&transfer, "standard_monthly", Some(&award)),
+            Err(TransferError::SourceTermChanged)
+        ));
 
         transfer.effective_from = 2_000;
         transfer.offer = BillingOffer::StandardMonthly;
