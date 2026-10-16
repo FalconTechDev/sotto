@@ -33,6 +33,7 @@ use crate::auth::AuthUser;
 use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
 use crate::billing_operations::{self, BeginOperation, BillingOperationState};
 use crate::billing_refunds::{self, CorrectionReason, PayerKind};
+use crate::billing_transfers;
 use crate::cloud_provider::{
     accept_provider_invalidation, record_verified_event, register_verified_allocation,
     reject_verified_event, AllocationState, PayerKind as ProviderPayerKind, ProviderContext,
@@ -2028,6 +2029,13 @@ async fn sponsored_checkout(
     founding_allocator::lock_capacity(&mut tx)
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
+    let mut transfer_beneficiaries = vec![request.beneficiary_id.as_str()];
+    if let Some(replacement) = request.replacement_beneficiary_id.as_deref() {
+        transfer_beneficiaries.push(replacement);
+    }
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &transfer_beneficiaries, now)
+        .await
+        .map_err(Error::from)?;
     let incoming_beneficiary = request
         .replacement_beneficiary_id
         .as_deref()
@@ -2722,6 +2730,9 @@ async fn personal_checkout(
     founding_allocator::lock_capacity(&mut tx)
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let operation = billing_operations::begin_personal_operation(
         &mut tx,
         &user.user_id,
@@ -3009,6 +3020,9 @@ async fn personal_refund_request(
     }
     let reason = correction_reason(&request.reason)?;
     let mut tx = state.pool.begin().await?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let account = personal_billing::load_account(&mut tx, &user.user_id)
         .await
         .map_err(personal_billing_error)?
@@ -3064,6 +3078,9 @@ async fn personal_refund_confirm_early(
 ) -> Result<Json<PersonalRefundView>> {
     require_billing_corrections()?;
     let mut tx = state.pool.begin().await?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let request = billing_refunds::confirm_early_termination(
         &mut tx,
         &request_id,
@@ -3325,6 +3342,9 @@ async fn personal_cancel(
     }
     let billing = billing_config(&state)?;
     let mut tx = state.pool.begin().await?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let account = personal_billing::load_account(&mut tx, &user.user_id)
         .await
         .map_err(personal_billing_error)?

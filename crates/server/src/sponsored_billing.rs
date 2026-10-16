@@ -11,6 +11,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::billing_catalogue::BillingOffer;
+use crate::billing_transfers;
 use crate::error::Error;
 use crate::org;
 
@@ -288,6 +289,8 @@ pub enum SponsoredBillingError {
     FoundingAllocator(#[from] crate::founding_allocator::FoundingAllocatorError),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("payer transfer error: {0}")]
+    Transfer(#[from] billing_transfers::TransferError),
 }
 
 impl From<SponsoredBillingError> for Error {
@@ -309,6 +312,12 @@ impl From<SponsoredBillingError> for Error {
             SponsoredBillingError::BeneficiaryAlreadyCovered => {
                 Self::Conflict("beneficiary already has sponsored coverage".into())
             }
+            SponsoredBillingError::Transfer(
+                billing_transfers::TransferError::AlreadyInProgress,
+            ) => Self::Conflict(
+                "a payer transfer is already in progress for this beneficiary".into(),
+            ),
+            SponsoredBillingError::Transfer(error) => Self::from(error),
             SponsoredBillingError::SeatMissing => Self::NotFound("sponsored seat not found".into()),
             SponsoredBillingError::IdempotencyConflict => Self::Conflict(
                 "sponsored idempotency key conflicts with a different request".into(),
@@ -418,6 +427,12 @@ pub async fn begin_operation(
     now_epoch: i64,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     request.validate_identity()?;
+    let mut transfer_beneficiaries = vec![request.beneficiary_id.as_str()];
+    if let Some(replacement) = request.replacement_beneficiary_id.as_deref() {
+        transfer_beneficiaries.push(replacement);
+    }
+    billing_transfers::lock_and_check_no_live_transfer(tx, &transfer_beneficiaries, now_epoch)
+        .await?;
     let access = org::access_for_update(tx, organization_id, actor_user_id)
         .await
         .map_err(|_| SponsoredBillingError::Unauthorised)?;

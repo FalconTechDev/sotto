@@ -8,10 +8,14 @@ use uuid::Uuid;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_transfer, complete_source_adjustment,
-    mark_failed, record_destination_paid, record_destination_prepared, withdraw_transfer,
-    BeginTransfer, TransferError, TransferPayer, TransferRequest, TransferState,
+    lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
+    record_destination_prepared, withdraw_transfer, BeginTransfer, TransferError, TransferPayer,
+    TransferRequest, TransferState,
 };
 use sotto_server::db;
+use sotto_server::sponsored_billing::{
+    begin_operation, SponsoredBillingError, SponsoredSeatAction, SponsoredSeatRequest,
+};
 
 async fn pool_or_skip() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -61,6 +65,11 @@ async fn cleanup(pool: &PgPool, fixture: &str) {
         .execute(pool)
         .await
         .expect("clean sponsored operations");
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id LIKE $1")
+        .bind(&pattern)
+        .execute(pool)
+        .await
+        .expect("clean sponsored subscriptions");
     sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id LIKE $1")
         .bind(&pattern)
         .execute(pool)
@@ -105,7 +114,7 @@ fn personal_to_sponsor_request(
         offer: BillingOffer::FoundingMonthly,
         quote_version: 1,
         quote_expires_at_epoch: 1_800_001_000,
-        effective_from: 1_800_000_000,
+        effective_from: 1_802_592_000,
         effective_until: None,
         idempotency_key: key.into(),
     }
@@ -159,12 +168,15 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .expect("insert source operation");
     sqlx::query(
         "INSERT INTO billing_personal_accounts
-         (user_id, operation_id, offer, stripe_subscription_id, state, pending_expires_at_epoch)
-         VALUES ($1, $2, 'founding_monthly', $3, 'active', 1900000000)",
+         (user_id, operation_id, offer, stripe_subscription_id, state, pending_expires_at_epoch,
+          paid_through_epoch, paid_through_date)
+         VALUES ($1, $2, 'founding_monthly', $3, 'active', 1900000000, $4,
+                 to_timestamp($4)::date)",
     )
     .bind(&user)
     .bind(&operation)
     .bind(format!("sub_transfer_source_{fixture}"))
+    .bind(1_802_592_000_i64)
     .execute(&pool)
     .await
     .expect("insert active personal source");
@@ -178,8 +190,10 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .expect("find available founding place");
     sqlx::query(
         "INSERT INTO billing_founding_awards
-         (award_id, beneficiary_id, payer_id, offer, cohort_ordinal, original_start_date, original_end_date)
-         VALUES ($1, $2, $2, 'founding_monthly', $3, '2026-01-01', '2026-02-01')",
+         (award_id, beneficiary_id, payer_id, offer, cohort_ordinal, original_start_date, original_end_date,
+          original_start_epoch, original_end_epoch)
+         VALUES ($1, $2, $2, 'founding_monthly', $3, '2027-01-15', '2027-02-14',
+                 1800000000, 1802592000)",
     )
     .bind(&award)
     .bind(&user)
@@ -188,7 +202,8 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .await
     .expect("insert founding award");
 
-    let request = personal_to_sponsor_request(&user, &user, &org, "transfer-key");
+    let mut request = personal_to_sponsor_request(&user, &user, &org, "transfer-key");
+    request.offer = BillingOffer::StandardMonthly;
     let mut tx = pool.begin().await.expect("begin transfer");
     let created = begin_transfer(&mut tx, &request, 1_800_000_000)
         .await
@@ -198,6 +213,28 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         BeginTransfer::AlreadyExists(_) => panic!("first transfer unexpectedly existed"),
     };
     tx.commit().await.expect("commit transfer");
+
+    let sponsored_request = SponsoredSeatRequest {
+        action: SponsoredSeatAction::Add,
+        beneficiary_id: user.clone(),
+        replacement_beneficiary_id: None,
+        offer: BillingOffer::StandardMonthly,
+        quote_version: 1,
+        quote_expires_at_epoch: 1_800_001_000,
+        effective_from: 1_800_000_001,
+        effective_until: None,
+        idempotency_key: "seat-change-during-transfer".into(),
+    };
+    let mut tx = pool.begin().await.expect("begin sponsored mutation fence");
+    assert!(matches!(
+        begin_operation(&mut tx, &org, &user, &sponsored_request, 1_800_000_001).await,
+        Err(SponsoredBillingError::Transfer(
+            TransferError::AlreadyInProgress
+        ))
+    ));
+    tx.rollback()
+        .await
+        .expect("rollback sponsored mutation fence");
 
     let mut tx = pool.begin().await.expect("begin replay");
     let replay = begin_transfer(&mut tx, &request, 1_800_000_001)
@@ -341,18 +378,32 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     .expect("insert source operation");
     sqlx::query(
         "INSERT INTO billing_personal_accounts
-         (user_id, operation_id, offer, stripe_subscription_id, state, pending_expires_at_epoch)
-         VALUES ($1, $2, 'standard_monthly', $3, 'active', 1900000000)",
+         (user_id, operation_id, offer, stripe_subscription_id, state, pending_expires_at_epoch,
+          paid_through_epoch, paid_through_date)
+         VALUES ($1, $2, 'standard_monthly', $3, 'active', 1900000000, $4,
+                 to_timestamp($4)::date)",
     )
     .bind(&user)
     .bind(&operation)
     .bind(format!("sub_transfer_source_{fixture}"))
+    .bind(1_802_592_000_i64)
     .execute(&pool)
     .await
     .expect("insert active account");
 
     let mut request = personal_to_sponsor_request(&user, &user, &org, "live-transfer");
     request.counterparty_user_id = other.clone();
+    request.offer = BillingOffer::StandardMonthly;
+    let mut stale_boundary = request.clone();
+    stale_boundary.idempotency_key = "stale-renewal-boundary".into();
+    stale_boundary.effective_from += 1;
+    let mut tx = pool.begin().await.expect("begin stale boundary");
+    assert!(matches!(
+        begin_transfer(&mut tx, &stale_boundary, 1_800_000_000).await,
+        Err(TransferError::SourceTermChanged)
+    ));
+    tx.rollback().await.expect("rollback stale boundary");
+
     let mut tx = pool.begin().await.expect("begin first transfer");
     let first = begin_transfer(&mut tx, &request, 1_800_000_000)
         .await
@@ -376,6 +427,13 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
         .await
         .expect("counterparty accepts first transfer");
     tx.commit().await.expect("commit first transfer");
+
+    let mut tx = pool.begin().await.expect("begin mutation fence check");
+    assert!(matches!(
+        lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_000).await,
+        Err(TransferError::AlreadyInProgress)
+    ));
+    tx.rollback().await.expect("rollback mutation fence check");
 
     let mut second = request.clone();
     second.idempotency_key = "live-transfer-second".into();
@@ -440,6 +498,18 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
     .await
     .expect("insert source memberships");
     sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions
+         (organization_id, provider_customer_id, provider_subscription_id, status,
+          current_period_start, current_period_end)
+         VALUES ($1, $2, $3, 'active', 1800000000, 1802592000)",
+    )
+    .bind(&org)
+    .bind(format!("cus_transfer_source_{fixture}"))
+    .bind(format!("sub_transfer_source_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("insert source sponsored subscription");
+    sqlx::query(
         "INSERT INTO billing_sponsored_operations
          (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action,
           beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from,
@@ -478,7 +548,7 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         offer: BillingOffer::StandardMonthly,
         quote_version: 1,
         quote_expires_at_epoch: 1_800_001_000,
-        effective_from: 1_800_000_000,
+        effective_from: 1_802_592_000,
         effective_until: None,
         idempotency_key: "leave-sponsor".into(),
     };
@@ -517,7 +587,7 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
     let mut fresh = request;
     fresh.idempotency_key = "fresh-invitation".into();
     fresh.quote_expires_at_epoch = 1_800_002_000;
-    fresh.effective_from = 1_800_001_001;
+    fresh.effective_from = 1_802_592_000;
     let mut tx = pool.begin().await.expect("begin fresh invitation");
     let fresh_id = match begin_transfer(&mut tx, &fresh, 1_800_001_001)
         .await
