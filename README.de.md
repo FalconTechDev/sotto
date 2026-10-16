@@ -206,6 +206,27 @@ limits:    none (Team)
 Diese Beispiele sind illustrativ; echte Organisationen können andere Stufen, Trials und Limits
 zeigen.
 
+### Organisations-Auditprotokoll
+
+Organisationsinhaber und Administratoren können die aktuelle Teamaktivität anzeigen:
+
+```sh
+sotto org audit <org-id>
+sotto org audit <org-id> --limit 20
+```
+
+Verwende die ID, die `sotto org create <name>` ausgibt oder `sotto org ls` auflistet. Die Ergebnisse
+werden zuerst mit den neuesten Ereignissen angezeigt; standardmäßig werden 100 Ereignisse abgerufen,
+und der Server begrenzt `--limit` auf 1-500. Der Befehl zeigt pro Ereignis eine Zeile im Format
+`timestamp  action  actor` sowie optional `target=...`, `env=...` und `(detail)`. Es handelt sich um
+eine begrenzte Aktivitäts-/Metadatenansicht, nicht um eine Möglichkeit, Secret-Werte abzurufen; eine
+Seitennavigation oder ein vollständiges historisches Archiv gibt es nicht.
+
+In Sotto Cloud benötigt die Organisation eine wirksame Team-Berechtigung, einschließlich eines
+aktiven Team-Testzeitraums. Selbst gehostete Deployments überspringen diese Planprüfung, aber der
+Aufrufer braucht weiterhin die Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden
+sind, gibt der Befehl keine Zeilen aus und wird erfolgreich beendet.
+
 Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--expires-in-days`
 mit einem Wert von 1 bis 365 angibst; `sotto token ls` zeigt, wann jedes abläuft. Zwei Wochen
 vorher geben `sotto run` und `sotto export` eine Warnung im CI-Log aus.

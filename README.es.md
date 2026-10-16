@@ -206,6 +206,27 @@ limits:    none (Team)
 Estos ejemplos son ilustrativos; las organizaciones reales pueden mostrar niveles, pruebas y
 límites distintos.
 
+### Registro de auditoría de la organización
+
+Los propietarios y administradores de una organización pueden consultar la actividad reciente del
+equipo con:
+
+```sh
+sotto org audit <org-id>
+sotto org audit <org-id> --limit 20
+```
+
+Usa el ID que imprime `sotto org create <name>` o que muestra `sotto org ls`. Los resultados aparecen
+primero con los eventos más recientes; el valor predeterminado es de 100 eventos y el servidor limita
+`--limit` al rango 1-500. El comando muestra una línea por evento con el formato `timestamp  action  actor` y, de forma opcional, los campos `target=...`, `env=...` y `(detail)`. Es una vista acotada de
+actividad y metadatos, no una forma de recuperar valores secretos; no ofrece paginación ni un archivo
+histórico completo.
+
+En Sotto Cloud, la organización necesita una suscripción Team efectiva, incluido un periodo de
+prueba Team activo. Las implementaciones autoalojadas omiten esta comprobación del plan, pero quien
+ejecute el comando debe conservar el rol de propietario o administrador. Si no hay eventos, el
+comando no muestra filas y termina correctamente.
+
 Los tokens de máquina caducan. Uno nuevo dura 90 días, salvo que indiques `--expires-in-days` con
 un valor de 1 a 365; `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
 `sotto run` y `sotto export` muestran un aviso en el registro de la CI.

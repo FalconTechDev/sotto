@@ -206,6 +206,28 @@ limits:    none (Team)
 Ces exemples sont illustratifs ; les organisations réelles peuvent afficher des niveaux, essais et
 limites différents.
 
+### Journal d’audit de l’organisation
+
+Les propriétaires et administrateurs d’une organisation peuvent consulter l’activité récente de
+l’équipe avec :
+
+```sh
+sotto org audit <org-id>
+sotto org audit <org-id> --limit 20
+```
+
+Utilisez l’identifiant affiché par `sotto org create <name>` ou listé par `sotto org ls`. Les résultats
+sont classés du plus récent au plus ancien ; la valeur par défaut est de 100 événements et le serveur
+ramène `--limit` à une valeur comprise entre 1 et 500. La commande affiche une ligne par événement
+au format `timestamp  action  actor`, avec éventuellement les champs `target=...`, `env=...` et
+`(detail)`. Il s’agit d’une vue limitée de l’activité et des métadonnées, pas d’un moyen de récupérer
+des valeurs secrètes ; elle ne fournit ni pagination ni archive historique complète.
+
+Sur Sotto Cloud, l’organisation doit disposer du niveau Team effectif, y compris pendant un essai
+Team actif. Les déploiements auto-hébergés ignorent ce contrôle de forfait, mais l’appelant doit
+toujours avoir le rôle de propriétaire ou d’administrateur. S’il n’y a aucun événement, la commande
+n’affiche aucune ligne et se termine avec succès.
+
 Les tokens machine expirent. Un nouveau token dure 90 jours, sauf si vous passez
 `--expires-in-days` avec une valeur de 1 à 365 ; `sotto token ls` indique quand chacun expire.
 Deux semaines avant, `sotto run` et `sotto export` affichent un avertissement dans le journal de la CI.
