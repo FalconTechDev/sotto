@@ -3117,18 +3117,6 @@ async fn personal_portal(
     let customer = account.stripe_customer_id.clone().ok_or_else(|| {
         Error::Conflict("personal billing has not received a paid customer yet".into())
     })?;
-    let founding_end_epoch: Option<Option<i64>> = sqlx::query_scalar(
-        "SELECT original_end_epoch FROM billing_founding_awards WHERE beneficiary_id = $1",
-    )
-    .bind(&user.user_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let has_active_founding_term = founding_end_epoch
-        .is_some_and(|end_epoch| founding_term_is_active(end_epoch, billing_epoch()));
-    let portal_configuration_id = founding_portal_configuration(
-        has_active_founding_term,
-        billing.cloud_portal_configuration_id(),
-    )?;
     let founding = personal_founding_transition(&mut tx, &user.user_id).await?;
     tx.rollback().await?;
     let portal_url = billing
@@ -3136,7 +3124,7 @@ async fn personal_portal(
         .create_portal(
             &customer,
             &app_url(&billing.return_url),
-            portal_configuration_id,
+            billing.cloud_portal_configuration_id(),
         )
         .await
         .map_err(ProviderError::into_error)?;
@@ -3221,24 +3209,6 @@ async fn personal_founding_transition(
         standard_amount_pence: Some(offer.standard_billing_offer().expected_amount_pence()),
         status: Some(status.unwrap_or_else(|| "unresolved".into())),
         reason,
-    })
-}
-
-/// Keep an unresolved founding award on the restrictive portal configuration: without a recorded
-/// end we cannot prove that the customer's founding interval has finished.
-fn founding_term_is_active(end_epoch: Option<i64>, now_epoch: i64) -> bool {
-    end_epoch.is_none_or(|end_epoch| end_epoch > now_epoch)
-}
-
-fn founding_portal_configuration(
-    founding_term_active: bool,
-    configured_id: Option<&str>,
-) -> Result<Option<&str>> {
-    if !founding_term_active {
-        return Ok(None);
-    }
-    configured_id.map(Some).ok_or_else(|| {
-        Error::NotConfigured("founding billing portal configuration is not configured".into())
     })
 }
 
@@ -3374,27 +3344,12 @@ async fn create_portal(
         Error::BadRequest("this organisation has no billing account yet - subscribe first".into())
     })?;
 
-    let has_active_founding_seat: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM billing_sponsored_seats AS seat \
-         JOIN billing_founding_awards AS award ON award.beneficiary_id = seat.beneficiary_id \
-         WHERE seat.organization_id = $1 AND seat.state IN ('pending','active','scheduled_removal') \
-           AND award.payer_kind = 'sponsor' AND award.payer_id = $1 \
-           AND (award.original_end_epoch IS NULL OR award.original_end_epoch > $2))",
-    )
-    .bind(&org_id)
-    .bind(billing_epoch())
-    .fetch_one(&mut *tx)
-    .await?;
-    let portal_configuration_id = founding_portal_configuration(
-        has_active_founding_seat,
-        billing.cloud_portal_configuration_id(),
-    )?;
     let url = billing
         .provider
         .create_portal(
             &customer,
             &app_url(&billing.return_url),
-            portal_configuration_id,
+            billing.cloud_portal_configuration_id(),
         )
         .await
         .map_err(ProviderError::into_error)?;
@@ -8649,27 +8604,6 @@ mod tests {
             );
         }
         assert!(validate_cloud_portal_configuration(&configuration, "bpc_other", false).is_err());
-    }
-
-    #[test]
-    fn founding_portal_rules_keep_unknown_terms_restricted_then_restore_default_portal() {
-        assert!(founding_term_is_active(None, 100));
-        assert!(founding_term_is_active(Some(101), 100));
-        assert!(!founding_term_is_active(Some(100), 100));
-        assert!(!founding_term_is_active(Some(99), 100));
-
-        assert_eq!(
-            founding_portal_configuration(false, Some("bpc_safe")).unwrap(),
-            None
-        );
-        assert_eq!(
-            founding_portal_configuration(true, Some("bpc_safe")).unwrap(),
-            Some("bpc_safe")
-        );
-        assert!(matches!(
-            founding_portal_configuration(true, None),
-            Err(Error::NotConfigured(_))
-        ));
     }
 
     #[test]
