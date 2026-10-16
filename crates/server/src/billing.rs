@@ -7120,7 +7120,7 @@ async fn invoice_paid(
     billing_transfers::lock_and_check_no_live_transfer(
         tx,
         &[personal_user_id.as_str()],
-        event_created,
+        sponsored_billing::current_epoch(),
     )
     .await
     .map_err(Error::from)?;
