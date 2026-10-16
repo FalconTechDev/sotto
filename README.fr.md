@@ -62,9 +62,7 @@ méthode d'installation pour macOS. La formule distribue des versions de la CLI
 qui ont été examinées et requiert macOS 15 ou ultérieur. Apple Silicon est la
 plateforme principale ; Intel est pris en charge au mieux et relève du niveau
 Tier 3 de Homebrew. Homebrew prévoit de mettre fin à la prise en charge d'Intel
-en septembre 2027 ou après. Le tap reste un aperçu : la création de PR par le
-workflow est désactivée, et ni la proposition de mise à jour ni le test
-d'identité isolé n'ont été exécutés. Consultez le [guide d'installation et de
+en septembre 2027 ou après. Consultez le [guide d'installation et de
 prise en charge du tap](https://github.com/getsotto/homebrew-tap#readme) et le
 [registre de préparation au lancement](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md)
 avant de l'utiliser. Évitez cet aperçu pour les secrets de production critiques.
@@ -98,7 +96,7 @@ brew uninstall getsotto/tap/sotto
 
 La désinstallation de la formule conserve les fichiers du projet, les données
 locales Sotto, les entrées du trousseau et les autres installations de `sotto`.
-Vérifiez le binaire sélectionné et conservez votre kit de secours avant de
+Vérifiez le binaire sélectionné et conservez votre Emergency Kit avant de
 supprimer ou de remplacer une installation existante.
 
 ### Complétions du shell

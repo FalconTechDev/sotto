@@ -61,9 +61,7 @@ El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de
 instalación para macOS. La fórmula empaqueta versiones de la CLI revisadas y
 requiere macOS 15 o posterior. Apple Silicon es la plataforma principal; Intel
 se ofrece como mejor esfuerzo y Homebrew Tier 3. Homebrew prevé finalizar el
-soporte para Intel en septiembre de 2027 o después. El tap sigue en versión
-preliminar: la creación de PR del workflow está desactivada y aún no se han
-probado la propuesta del actualizador ni la prueba aislada de identidad. Consulta la
+soporte para Intel en septiembre de 2027 o después. Consulta la
 [guía de soporte e instalación del tap](https://github.com/getsotto/homebrew-tap#readme)
 y el [registro de preparación para el lanzamiento](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md)
 antes de usarlo. Evita esta versión preliminar para secretos críticos de

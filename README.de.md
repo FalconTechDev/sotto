@@ -61,10 +61,7 @@ Der [Sotto-Tap](https://github.com/getsotto/homebrew-tap) bietet einen weiteren
 Installationsweg für macOS. Die Formula stellt geprüfte CLI-Versionen bereit
 und setzt macOS 15 oder neuer voraus. Apple Silicon ist die primäre Plattform;
 Intel wird bestmöglich unterstützt und ist bei Homebrew Tier 3. Homebrew plant,
-den Intel-Support im September 2027 oder später einzustellen. Der Tap bleibt
-eine Vorschau: Die Erstellung von PRs durch den Workflow ist deaktiviert, und
-weder ein Update-Vorschlag noch der isolierte Identitätstest wurden ausgeführt.
-Lies vor der Nutzung die [Installations- und Supporthinweise des Taps](https://github.com/getsotto/homebrew-tap#readme)
+den Intel-Support im September 2027 oder später einzustellen. Lies vor der Nutzung die [Installations- und Supporthinweise des Taps](https://github.com/getsotto/homebrew-tap#readme)
 und den [Bericht zur Launch-Bereitschaft](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md).
 Verwende diese Vorschau nicht für kritische Produktionsgeheimnisse.
 
