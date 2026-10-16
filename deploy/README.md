@@ -74,13 +74,21 @@ only after recording that evidence. The worker switch does not enable Cloud sale
 Create a dedicated Stripe Customer Portal configuration for Cloud and set its id in
 `STRIPE_CLOUD_PORTAL_CONFIGURATION_ID`. Enable payment-method updates and period-end cancellation
 with no cancellation proration, and disable subscription updates. Sotto retrieves and checks this
-configuration before issuing Cloud quotes and checkout sessions, and before creating a founder's
-portal session while their founding term is active. Standard customers and founders whose recorded
-term has ended use Stripe's default portal configuration, so normal plan changes remain available.
-An award with no recorded end stays on the restricted configuration until its term is resolved.
-The restricted portal preserves the founding customer's selected monthly or annual interval while
-keeping payment-method and cancellation controls available. The id is not a secret; the API key
-needs read access to Customer Portal configurations and write access to create portal sessions.
+configuration before issuing Cloud quotes and checkout sessions, and passes it to Cloud portal
+sessions when configured. This applies the server owned price catalogue consistently: customers
+can't switch to a plan that Sotto doesn't track for invoice verification. When the variable is
+unset, portal sessions keep Stripe's default configuration as before. The configured portal allows
+payment-method updates and period-end cancellation, with subscription changes disabled.
+This applies to all Cloud customers, including existing organisation subscriptions that use the
+legacy Team billing path; those customers also receive period-end cancellation and cannot change
+plans in the portal once this configuration is set.
+
+Stripe does not allow customers to update or cancel a subscription while a subscription schedule
+is attached. Sotto's founding transition worker attaches such a schedule, so this portal setting
+does not provide a cancellation path for a schedule-managed founder. Keep the worker disabled until
+Sotto's cancellation route can safely end a scheduled subscription and that flow has passed a
+Stripe test-mode rehearsal. The id is not a secret; the API key needs read access to Customer
+Portal configurations and write access to create portal sessions.
 
 Hosted paid-invoice coverage intake and its refresh worker are staged separately and default off:
 `SOTTO_PROVIDER_REFRESH_INGEST_ENABLED=0` and `SOTTO_PROVIDER_REFRESH_WORKER_ENABLED=0`. These
