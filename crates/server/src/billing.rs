@@ -3126,6 +3126,13 @@ async fn operator_process_refund(
     let current = billing_refunds::load_for_operator(&mut tx, &request_id)
         .await
         .map_err(Error::from)?;
+    billing_transfers::lock_and_check_no_live_transfer(
+        &mut tx,
+        &[current.beneficiary_id.as_str()],
+        sponsored_billing::current_epoch(),
+    )
+    .await
+    .map_err(Error::from)?;
     let current = if current.state == billing_refunds::CorrectionState::Approved {
         let next = billing_refunds::begin_provider_refund(&mut tx, &request_id)
             .await
@@ -6705,12 +6712,7 @@ async fn apply_sponsored_subscription_state(
     period_start: Option<i64>,
     period_end: Option<i64>,
 ) -> Result<()> {
-    if terminal {
-        // Match invoice settlement's lock order before touching subscription or operation rows.
-        founding_allocator::lock_capacity(tx)
-            .await
-            .map_err(|error| Error::Internal(error.to_string()))?;
-    }
+    lock_sponsored_subscription_beneficiaries(tx, organization_id).await?;
     sqlx::query(
         "UPDATE billing_sponsored_subscriptions SET \
            provider_customer_id = COALESCE($2, provider_customer_id), \
@@ -6758,6 +6760,43 @@ async fn apply_sponsored_subscription_state(
         .await?;
     }
     Ok(())
+}
+
+async fn lock_sponsored_subscription_beneficiaries(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+) -> Result<()> {
+    // Subscription lifecycle and invoice settlement can rewrite every seat on the subscription.
+    // Take the shared lock before reading the affected set so a transfer cannot be accepted
+    // between enumerating beneficiaries and applying the provider event.
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    let beneficiary_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT beneficiary_id FROM billing_sponsored_seats \
+         WHERE organization_id = $1 AND state IN ('pending', 'active', 'scheduled_removal') \
+         UNION \
+         SELECT beneficiary_id FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown') \
+         UNION \
+         SELECT replacement_beneficiary_id FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND replacement_beneficiary_id IS NOT NULL \
+           AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown')",
+    )
+    .bind(organization_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let beneficiary_refs = beneficiary_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    billing_transfers::lock_and_check_no_live_transfer(
+        tx,
+        &beneficiary_refs,
+        sponsored_billing::current_epoch(),
+    )
+    .await
+    .map_err(Error::from)
 }
 
 async fn sponsored_subscription_updated(
@@ -6813,6 +6852,13 @@ async fn subscription_updated(
         return Ok(());
     };
     if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        billing_transfers::lock_and_check_no_live_transfer(
+            tx,
+            &[user_id.as_str()],
+            sponsored_billing::current_epoch(),
+        )
+        .await
+        .map_err(Error::from)?;
         let subscription_id = object["id"].as_str().ok_or_else(|| {
             Error::Config("personal subscription event has no subscription id".into())
         })?;
@@ -7061,19 +7107,23 @@ async fn invoice_paid(
             return Ok(());
         }
     }
-    let personal: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
-         WHERE stripe_subscription_id = $1)",
+    let personal_user_id: Option<String> = sqlx::query_scalar(
+        "SELECT user_id FROM billing_personal_accounts \
+         WHERE stripe_subscription_id = $1",
     )
     .bind(subscription_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if !personal {
+    let Some(personal_user_id) = personal_user_id else {
         return Ok(());
-    }
-    founding_allocator::lock_capacity(tx)
-        .await
-        .map_err(|error| Error::Internal(error.to_string()))?;
+    };
+    billing_transfers::lock_and_check_no_live_transfer(
+        tx,
+        &[personal_user_id.as_str()],
+        event_created,
+    )
+    .await
+    .map_err(Error::from)?;
     let period_end = verified_personal_invoice
         .map(|evidence| evidence.period_end)
         .or_else(|| invoice_period_end(object))
@@ -7204,6 +7254,7 @@ async fn sponsored_invoice_paid(
     let Some(organization_id) = organization_id else {
         return Ok(None);
     };
+    lock_sponsored_subscription_beneficiaries(tx, &organization_id).await?;
     let payment_reference = object["payment_intent"]
         .as_str()
         .or_else(|| object["id"].as_str())
@@ -7523,6 +7574,13 @@ async fn subscription_deleted(
     object: &serde_json::Value,
 ) -> Result<()> {
     if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        billing_transfers::lock_and_check_no_live_transfer(
+            tx,
+            &[user_id.as_str()],
+            sponsored_billing::current_epoch(),
+        )
+        .await
+        .map_err(Error::from)?;
         let subscription_id = object["id"].as_str().ok_or_else(|| {
             Error::Config("personal subscription event has no subscription id".into())
         })?;

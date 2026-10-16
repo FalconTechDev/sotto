@@ -14,7 +14,8 @@ use sotto_server::billing_transfers::{
 };
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
-    begin_operation, SponsoredBillingError, SponsoredSeatAction, SponsoredSeatRequest,
+    begin_operation, complete_paid_checkout, SponsoredBillingError, SponsoredProviderEvidence,
+    SponsoredSeatAction, SponsoredSeatRequest,
 };
 
 async fn pool_or_skip() -> Option<PgPool> {
@@ -204,6 +205,40 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
 
     let mut request = personal_to_sponsor_request(&user, &user, &org, "transfer-key");
     request.offer = BillingOffer::StandardMonthly;
+    let inflight_operation = format!("transfer-test-{fixture}-inflight-operation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, state) \
+         VALUES ($1, $2, $3, $1, $1, 'add', $3, 'standard_monthly', 1, 1800001000, 1802592000, $1, 'pending')",
+    )
+    .bind(&inflight_operation)
+    .bind(&org)
+    .bind(&user)
+    .execute(&pool)
+    .await
+    .expect("seed in-flight sponsored operation");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin transfer during provider change");
+    assert!(matches!(
+        begin_transfer(&mut tx, &request, 1_800_000_000).await,
+        Err(TransferError::AlreadyInProgress)
+    ));
+    tx.rollback()
+        .await
+        .expect("rollback transfer blocked by provider change");
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET state = 'failed', result_code = 'fixture_done' \
+         WHERE operation_id = $1",
+    )
+    .bind(&inflight_operation)
+    .execute(&pool)
+    .await
+    .expect("finish in-flight fixture operation");
+
     let mut tx = pool.begin().await.expect("begin transfer");
     let created = begin_transfer(&mut tx, &request, 1_800_000_000)
         .await
@@ -235,6 +270,79 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     tx.rollback()
         .await
         .expect("rollback sponsored mutation fence");
+
+    let missing_beneficiary_request = SponsoredSeatRequest {
+        beneficiary_id: format!("transfer-test-{fixture}-missing"),
+        ..sponsored_request.clone()
+    };
+    let mut tx = pool.begin().await.expect("begin missing beneficiary check");
+    assert!(matches!(
+        begin_operation(
+            &mut tx,
+            &org,
+            &user,
+            &missing_beneficiary_request,
+            1_800_000_001
+        )
+        .await,
+        Err(SponsoredBillingError::Transfer(
+            TransferError::BeneficiaryMissing
+        ))
+    ));
+    tx.rollback()
+        .await
+        .expect("rollback missing beneficiary check");
+
+    let pending_operation = format!("transfer-test-{fixture}-pending-operation");
+    let pending_seat = format!("transfer-test-{fixture}-pending-seat");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, state) \
+         VALUES ($1, $2, $3, $1, $1, 'add', $3, 'standard_monthly', 1, 1800001000, 1802592000, $1, 'checkout_created')",
+    )
+    .bind(&pending_operation)
+    .bind(&org)
+    .bind(&user)
+    .execute(&pool)
+    .await
+    .expect("seed an operation awaiting provider settlement");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_seats \
+         (seat_id, organization_id, beneficiary_id, offer, effective_from, state, operation_id) \
+         VALUES ($1, $2, $3, 'standard_monthly', 1802592000, 'pending', $4)",
+    )
+    .bind(&pending_seat)
+    .bind(&org)
+    .bind(&user)
+    .bind(&pending_operation)
+    .execute(&pool)
+    .await
+    .expect("seed pending seat");
+    let evidence = SponsoredProviderEvidence {
+        customer_id: Some(format!("cus_transfer_{fixture}")),
+        subscription_id: format!("sub_transfer_{fixture}"),
+        schedule_id: None,
+        checkout_session_id: Some(format!("cs_transfer_{fixture}")),
+        payment_reference: format!("pi_transfer_{fixture}"),
+        provider_item_id: Some(format!("si_transfer_{fixture}")),
+    };
+    let mut tx = pool.begin().await.expect("begin late provider settlement");
+    assert!(matches!(
+        complete_paid_checkout(&mut tx, &pending_operation, &evidence).await,
+        Err(SponsoredBillingError::Transfer(
+            TransferError::AlreadyInProgress
+        ))
+    ));
+    tx.rollback().await.expect("rollback late settlement");
+    let pending_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_sponsored_seats WHERE seat_id = $1")
+            .bind(&pending_seat)
+            .fetch_one(&pool)
+            .await
+            .expect("load pending seat after blocked settlement");
+    assert_eq!(pending_state, "pending");
 
     let mut tx = pool.begin().await.expect("begin replay");
     let replay = begin_transfer(&mut tx, &request, 1_800_000_001)

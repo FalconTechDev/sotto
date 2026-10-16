@@ -615,6 +615,7 @@ pub async fn record_provider_update(
     current_period_end: Option<i64>,
     provider_item_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    lock_operation_beneficiaries(tx, operation_id).await?;
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'provider_pending', \
          provider_customer_id = $2, provider_subscription_id = $3, provider_item_id = $4, updated_at = now() \
@@ -729,6 +730,7 @@ pub async fn complete_paid_checkout(
     operation_id: &str,
     evidence: &SponsoredProviderEvidence,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    lock_operation_beneficiaries(tx, operation_id).await?;
     let organization_id: String = sqlx::query_scalar(
         "SELECT organization_id FROM billing_sponsored_operations WHERE operation_id = $1",
     )
@@ -792,6 +794,27 @@ pub async fn complete_paid_checkout(
     .execute(&mut **tx)
     .await?;
     load_operation(tx, operation_id).await
+}
+
+async fn lock_operation_beneficiaries(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<(), SponsoredBillingError> {
+    let beneficiaries: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT beneficiary_id, replacement_beneficiary_id \
+         FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((beneficiary_id, replacement_beneficiary_id)) = beneficiaries else {
+        return Ok(());
+    };
+    let mut ids = vec![beneficiary_id];
+    ids.extend(replacement_beneficiary_id);
+    let references = ids.iter().map(String::as_str).collect::<Vec<_>>();
+    billing_transfers::lock_and_check_no_live_transfer(tx, &references, current_epoch()).await?;
+    Ok(())
 }
 
 /// Preserve paid evidence when a founding place can no longer be awarded.
