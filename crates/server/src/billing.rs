@@ -322,6 +322,8 @@ pub struct SponsoredSubscriptionSnapshot {
     pub customer_id: Option<String>,
     pub subscription_id: String,
     pub status: SubscriptionStatus,
+    pub cancel_at_period_end: bool,
+    pub cancel_at: Option<i64>,
     pub current_period_start: Option<i64>,
     pub current_period_end: Option<i64>,
     pub schedule_id: Option<String>,
@@ -3982,6 +3984,18 @@ fn sponsored_subscription_snapshot(
     requested_id: &str,
 ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
     let base = subscription_snapshot(object, requested_id)?;
+    let cancel_at_period_end = object["cancel_at_period_end"]
+        .as_bool()
+        .ok_or_else(ProviderError::malformed_response)?;
+    let cancel_at = match object.get("cancel_at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .filter(|timestamp| *timestamp >= 0)
+                .ok_or_else(ProviderError::malformed_response)?,
+        ),
+    };
     let items = object["items"]["data"]
         .as_array()
         .ok_or_else(ProviderError::malformed_response)?
@@ -4010,6 +4024,8 @@ fn sponsored_subscription_snapshot(
         customer_id: object["customer"].as_str().map(str::to_string),
         subscription_id: base.id,
         status: base.status,
+        cancel_at_period_end,
+        cancel_at,
         current_period_start: subscription_period_start(object),
         current_period_end: subscription_period_end(object),
         schedule_id: object["schedule"].as_str().map(str::to_string),
@@ -7798,6 +7814,7 @@ mod tests {
         let value = match (method.as_str(), path.as_str()) {
             ("GET", "/v1/subscriptions/sub_scheduled") => serde_json::json!({
                 "id":"sub_scheduled", "customer":"cus_test", "status":"active",
+                "cancel_at_period_end":false, "cancel_at":null,
                 "schedule":"sched_test", "items":{"data":[{
                     "id":"si_test", "price":{"id":"price_founding_monthly"}, "quantity":1,
                     "current_period_start":1705184000, "current_period_end":1707776000
@@ -7830,6 +7847,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_transition") => serde_json::json!({
                 "id":"sub_transition", "customer":"cus_test", "status":"active",
+                "cancel_at_period_end":false, "cancel_at":null,
                 "schedule":"sched_transition", "items":{"data":[{
                     "id":"si_transition", "price":{"id":"price_founding_monthly"}, "quantity":1,
                     "current_period_start":1705184000, "current_period_end":1707776000
@@ -7872,6 +7890,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
                 "id":"sub_unscheduled", "customer":"cus_test", "status":"active",
+                "cancel_at_period_end":false, "cancel_at":null,
                 "items":{"data":[{
                     "id":"si_test", "price":{"id":"price_standard_monthly"}, "quantity":1,
                     "current_period_start":1700000000, "current_period_end":1702592000
@@ -9321,6 +9340,8 @@ mod tests {
             "id": "sub-sponsored",
             "customer": "cus-sponsored",
             "status": "active",
+            "cancel_at_period_end": false,
+            "cancel_at": null,
             "current_period_start": 1,
             "current_period_end": 2,
             "schedule": "sub_sched",
@@ -9336,6 +9357,25 @@ mod tests {
         assert_eq!(snapshot.current_period_start, Some(1_700_000_000));
         assert_eq!(snapshot.current_period_end, Some(1_702_678_400));
         assert_eq!(snapshot.schedule_id.as_deref(), Some("sub_sched"));
+        assert!(!snapshot.cancel_at_period_end);
+        assert_eq!(snapshot.cancel_at, None);
+
+        let mut scheduled_cancellation = subscription.clone();
+        scheduled_cancellation["cancel_at_period_end"] = serde_json::json!(false);
+        scheduled_cancellation["cancel_at"] = serde_json::json!(1_702_678_400);
+        let snapshot =
+            sponsored_subscription_snapshot(&scheduled_cancellation, "sub-sponsored").unwrap();
+        assert!(snapshot.cancel_at.is_some());
+
+        let malformed_cancellation = serde_json::json!({
+            "id":"sub-sponsored", "status":"active", "items":{"data":[]}
+        });
+        assert_eq!(
+            sponsored_subscription_snapshot(&malformed_cancellation, "sub-sponsored")
+                .unwrap_err()
+                .kind,
+            ProviderErrorKind::Unknown
+        );
 
         let invoice = serde_json::json!({
             "lines": {"data": [{

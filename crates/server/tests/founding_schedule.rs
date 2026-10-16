@@ -32,6 +32,7 @@ struct CancellationWorkerProvider {
     updates: Arc<AtomicUsize>,
     cancellation_keys: Arc<Mutex<Vec<String>>>,
     request_during_update: bool,
+    provider_cancel_at_period_end: bool,
 }
 
 impl CancellationWorkerProvider {
@@ -43,11 +44,16 @@ impl CancellationWorkerProvider {
         }
     }
 
-    fn snapshot(subscription_id: &str) -> SponsoredSubscriptionSnapshot {
+    fn snapshot(
+        subscription_id: &str,
+        cancel_at_period_end: bool,
+    ) -> SponsoredSubscriptionSnapshot {
         SponsoredSubscriptionSnapshot {
             customer_id: Some("cus_founding_schedule".into()),
             subscription_id: subscription_id.into(),
             status: SubscriptionStatus::Active,
+            cancel_at_period_end,
+            cancel_at: None,
             current_period_start: Some(1_700_000_000),
             current_period_end: Some(1_702_592_000),
             schedule_id: Some("sched_founding_schedule".into()),
@@ -109,7 +115,10 @@ impl SubscriptionProvider for CancellationWorkerProvider {
         &self,
         subscription_id: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
-        Ok(Self::snapshot(subscription_id))
+        Ok(Self::snapshot(
+            subscription_id,
+            self.provider_cancel_at_period_end,
+        ))
     }
 
     async fn update_personal_subscription(
@@ -143,7 +152,10 @@ impl SubscriptionProvider for CancellationWorkerProvider {
             .await
             .map_err(|_| Self::unsupported())?;
         }
-        Ok(Self::snapshot(subscription_id))
+        Ok(Self::snapshot(
+            subscription_id,
+            self.provider_cancel_at_period_end,
+        ))
     }
 }
 
@@ -355,6 +367,7 @@ async fn founding_schedule_retargets_and_cancellation_wins_provider_races() {
         updates: updates.clone(),
         cancellation_keys: cancellation_keys.clone(),
         request_during_update: false,
+        provider_cancel_at_period_end: false,
     };
     assert!(
         founding_schedule_worker::run_once(pool, &provider, &catalogue)
@@ -403,14 +416,48 @@ async fn founding_schedule_retargets_and_cancellation_wins_provider_races() {
     .bind(user)
     .execute(pool)
     .await
-    .expect("reset account for in-flight cancellation race");
+    .expect("simulate stale reactivation webhook state");
     sqlx::query(
         "UPDATE billing_founding_awards SET original_start_epoch = 1600000000, \
            original_end_epoch = 1750000000 WHERE award_id = 'founding-schedule-award'",
     )
     .execute(pool)
     .await
-    .expect("pin verified founding boundary for worker race");
+    .expect("pin verified founding boundary for worker reconciliation");
+    let provider = CancellationWorkerProvider {
+        pool: pool.clone(),
+        cancellations: cancellations.clone(),
+        updates: updates.clone(),
+        cancellation_keys: cancellation_keys.clone(),
+        request_during_update: false,
+        provider_cancel_at_period_end: true,
+    };
+    assert!(
+        founding_schedule_worker::run_once(pool, &provider, &catalogue)
+            .await
+            .expect("worker trusts current provider cancellation state")
+    );
+    assert_eq!(cancellations.load(Ordering::Relaxed), 1);
+    assert_eq!(updates.load(Ordering::Relaxed), 0);
+    let reconciled: (String, bool) = sqlx::query_as(
+        "SELECT job.state, account.cancel_at_period_end \
+         FROM billing_founding_schedule_jobs AS job \
+         JOIN billing_personal_accounts AS account ON account.user_id = job.beneficiary_id \
+         WHERE job.award_id = 'founding-schedule-award'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read provider cancellation reconciliation");
+    assert_eq!(reconciled, ("not_required".into(), true));
+
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET cancel_at_period_end = FALSE, \
+           cancellation_requested_at = NULL WHERE user_id = $1",
+    )
+    .bind(user)
+    .execute(pool)
+    .await
+    .expect("reset account for in-flight cancellation race");
     sqlx::query(
         "UPDATE billing_founding_schedule_jobs SET state = 'pending', \
            provider_schedule_id = NULL, last_error_code = NULL, lease_token = NULL, \
@@ -426,6 +473,7 @@ async fn founding_schedule_retargets_and_cancellation_wins_provider_races() {
         updates: updates.clone(),
         cancellation_keys: cancellation_keys.clone(),
         request_during_update: true,
+        provider_cancel_at_period_end: false,
     };
     assert!(
         founding_schedule_worker::run_once(pool, &provider, &catalogue)

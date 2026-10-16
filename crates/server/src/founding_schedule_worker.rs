@@ -143,10 +143,20 @@ async fn process_job(
             let current = provider
                 .get_sponsored_subscription(&job.subscription_id)
                 .await?;
-            if current.subscription_id != job.subscription_id
-                || current.items.len() != 1
-                || current.items[0].quantity != 1
-            {
+            if current.subscription_id != job.subscription_id {
+                return Err(local_error("local_binding_missing"));
+            }
+            if current.cancel_at_period_end || current.cancel_at.is_some() {
+                founding_schedule::record_personal_cancellation(
+                    pool,
+                    &job.beneficiary_id,
+                    &job.subscription_id,
+                )
+                .await
+                .map_err(|_| local_error("local_evidence_invalid"))?;
+                return Ok(None);
+            }
+            if current.items.len() != 1 || current.items[0].quantity != 1 {
                 return Err(local_error("local_evidence_invalid"));
             }
             let current_end = current
@@ -427,6 +437,8 @@ mod tests {
                 customer_id: Some("cus".into()),
                 subscription_id: "sub".into(),
                 status: crate::billing::SubscriptionStatus::Active,
+                cancel_at_period_end: false,
+                cancel_at: None,
                 current_period_start: Some(start),
                 current_period_end: Some(end),
                 schedule_id: None,
