@@ -291,13 +291,19 @@ pub async fn build_transfer_request(
     draft: &TransferDraft,
     now_epoch: i64,
 ) -> Result<TransferRequest, TransferError> {
-    founding_allocator::lock_capacity(tx).await?;
     if draft.quote_expires_at_epoch > now_epoch.saturating_add(TRANSFER_QUOTE_SECONDS) {
         return Err(TransferError::InvalidField("quote expiry"));
     }
     if draft.quote_version != TRANSFER_QUOTE_VERSION {
         return Err(TransferError::InvalidField("quote version"));
     }
+
+    // Do a read-only authority check before taking the global billing lock. Besides preventing
+    // billing-state disclosure to strangers, this keeps unauthorised quote requests from
+    // serialising every checkout and invoice settlement. Authority is checked again under the
+    // normal locks after source state has been derived below.
+    preauthorise_transfer_draft(tx, actor_user_id, draft, now_epoch).await?;
+    founding_allocator::lock_capacity(tx).await?;
 
     let personal = sqlx::query_as::<_, (String, Option<i64>)>(
         "SELECT offer, paid_through_epoch FROM billing_personal_accounts \
@@ -397,6 +403,120 @@ pub async fn build_transfer_request(
         offer_at_transfer_boundary(&source_offer, request.effective_from, award.as_ref())?;
     request.validate(now_epoch)?;
     Ok(request)
+}
+
+async fn preauthorise_transfer_draft(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    draft: &TransferDraft,
+    now_epoch: i64,
+) -> Result<(), TransferError> {
+    // An inactive/missing source is still allowed to reach SourceInactive for its beneficiary.
+    // Otherwise consider the currently active source payer(s), without locking rows or exposing
+    // which one exists to an unauthorised caller.
+    let personal_source: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
+         WHERE user_id = $1 AND state = 'active' AND cancel_at_period_end = FALSE \
+           AND cancellation_requested_at IS NULL AND stripe_subscription_id IS NOT NULL)",
+    )
+    .bind(&draft.beneficiary_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let sponsored_sources: Vec<String> = sqlx::query_scalar(
+        "SELECT seat.organization_id \
+         FROM billing_sponsored_seats AS seat \
+         JOIN billing_sponsored_subscriptions AS subscription \
+           ON subscription.organization_id = seat.organization_id \
+         WHERE seat.beneficiary_id = $1 AND seat.state = 'active' \
+           AND subscription.status = 'active' \
+           AND subscription.provider_subscription_id IS NOT NULL \
+           AND subscription.current_period_end IS NOT NULL \
+           AND seat.effective_from <= $2 \
+           AND (seat.effective_until IS NULL OR \
+                seat.effective_until >= subscription.current_period_end) \
+         ORDER BY seat.organization_id LIMIT 2",
+    )
+    .bind(&draft.beneficiary_id)
+    .bind(now_epoch)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut source_candidates = Vec::new();
+    if personal_source || sponsored_sources.is_empty() {
+        source_candidates.push((TransferPayer::Personal, None));
+    }
+    source_candidates.extend(
+        sponsored_sources
+            .iter()
+            .map(|organization_id| (TransferPayer::Sponsor, Some(organization_id.as_str()))),
+    );
+
+    let mut organization_ids = sponsored_sources
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if draft.destination_kind == TransferPayer::Sponsor {
+        organization_ids.insert(
+            draft
+                .destination_organization_id
+                .as_deref()
+                .ok_or(TransferError::CorruptState)?,
+        );
+    }
+
+    let mut organization_authority = std::collections::BTreeMap::new();
+    for organization_id in organization_ids {
+        for user_id in [actor_user_id, draft.counterparty_user_id.as_str()] {
+            let allowed: bool = sqlx::query_scalar(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM organizations AS o \
+                   JOIN organization_memberships AS m ON m.org_id = o.id \
+                   WHERE o.id = $1 AND m.user_id = $2 \
+                     AND o.lifecycle_state = 'active' AND m.role IN ('owner','admin'))",
+            )
+            .bind(organization_id)
+            .bind(user_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            organization_authority.insert((organization_id, user_id), allowed);
+        }
+    }
+
+    let destination_organization_id = draft.destination_organization_id.as_deref();
+    let permitted = source_candidates
+        .into_iter()
+        .any(|(source_kind, source_org)| {
+            let actor_source = payer_authorised(
+                source_kind,
+                source_org,
+                &draft.beneficiary_id,
+                actor_user_id,
+                &organization_authority,
+            );
+            let actor_destination = payer_authorised(
+                draft.destination_kind,
+                destination_organization_id,
+                &draft.beneficiary_id,
+                actor_user_id,
+                &organization_authority,
+            );
+            let counterparty_source = payer_authorised(
+                source_kind,
+                source_org,
+                &draft.beneficiary_id,
+                &draft.counterparty_user_id,
+                &organization_authority,
+            );
+            let counterparty_destination = payer_authorised(
+                draft.destination_kind,
+                destination_organization_id,
+                &draft.beneficiary_id,
+                &draft.counterparty_user_id,
+                &organization_authority,
+            );
+            (actor_source && counterparty_destination) || (actor_destination && counterparty_source)
+        });
+    permitted.then_some(()).ok_or(TransferError::Unauthorised)
 }
 
 fn offer_at_transfer_boundary(

@@ -155,12 +155,14 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     let beneficiary = format!("transfer-api-test-{fixture}-beneficiary");
     let owner = format!("transfer-api-test-{fixture}-owner");
     let stranger = format!("transfer-api-test-{fixture}-stranger");
+    let inactive_beneficiary = format!("transfer-api-test-{fixture}-inactive-beneficiary");
     let org_id = format!("transfer-api-test-{fixture}-destination");
     let operation = format!("transfer-api-test-{fixture}-operation");
     cleanup(&pool, &fixture).await;
     insert_user(&pool, &beneficiary).await;
     insert_user(&pool, &owner).await;
     insert_user(&pool, &stranger).await;
+    insert_user(&pool, &inactive_beneficiary).await;
     sqlx::query("INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)")
         .bind(&org_id)
         .bind(&owner)
@@ -213,6 +215,41 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
         .await
         .expect("issue stranger session");
     let app = app(pool.clone(), true);
+    let quote_for_paid_beneficiary = serde_json::json!({
+        "beneficiary_id": beneficiary,
+        "counterparty_user_id": owner,
+        "destination_kind": "sponsor",
+        "destination_organization_id": org_id,
+    });
+    let (paid_status, paid_body) = request(
+        &app,
+        "POST",
+        "/billing/transfers/quote",
+        &stranger_token,
+        Some(quote_for_paid_beneficiary.to_string()),
+    )
+    .await;
+    let quote_for_inactive_beneficiary = serde_json::json!({
+        "beneficiary_id": inactive_beneficiary,
+        "counterparty_user_id": owner,
+        "destination_kind": "sponsor",
+        "destination_organization_id": org_id,
+    });
+    let (inactive_status, inactive_body) = request(
+        &app,
+        "POST",
+        "/billing/transfers/quote",
+        &stranger_token,
+        Some(quote_for_inactive_beneficiary.to_string()),
+    )
+    .await;
+    assert_eq!(paid_status, StatusCode::FORBIDDEN, "{paid_body}");
+    assert_eq!(inactive_status, StatusCode::FORBIDDEN, "{inactive_body}");
+    assert_eq!(
+        paid_body, inactive_body,
+        "quote failures must not disclose source billing state"
+    );
+
     let draft = serde_json::json!({
         "beneficiary_id": beneficiary,
         "counterparty_user_id": owner,
