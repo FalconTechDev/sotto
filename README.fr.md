@@ -616,11 +616,16 @@ L'espace de travail contient quatre crates :
 - `crates/server` : l'API de synchronisation basée sur Axum.
 - `crates/wasm` : les liaisons `wasm-bindgen` qui exposent le noyau aux clients web.
 
+Le client navigateur dans `web/` est une application React et Vite qui exécute le noyau via `crates/wasm`.
+
 ## Prérequis
 
 - [Rustup](https://rustup.rs/) avec Rust stable 1.89 ou plus récent
 - Les composants `clippy` et `rustfmt`
 - La cible `wasm32-unknown-unknown`
+- Pour le client web : Node.js 22 (la version de la CI) et `wasm-pack` (la CI épingle la v0.15.0)
+- Pour le serveur et ses tests avec base de données : Postgres 16, que fournit `docker compose up -d`
+- Pour les vérifications des scripts : Python 3.11 ou plus récent
 
 Le fichier `rust-toolchain.toml` inclus demande à Rustup d'installer automatiquement les composants et la
 cible requis.
@@ -683,9 +688,15 @@ Le client navigateur exécute le même noyau cryptographique via WebAssembly (`w
 ```sh
 cd web
 npm ci
-npm run dev      # dev server (proxies the API to localhost:8080)
-npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run dev        # dev server (proxies the API to localhost:8080)
+npm run build      # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run typecheck  # TypeScript checks; needs the WASM bindings a build generates
+npm test           # unit tests (Vitest)
+npm run smoke      # load the WASM core under Node and exercise it
 ```
+
+La suite Playwright du tunnel (`npm run e2e`) nécessite une base de données et un build de
+production préalable ; [`web/e2e/README.md`](web/e2e/README.md) explique la mise en place.
 
 ## Vérifications de développement
 
@@ -715,7 +726,10 @@ se déchiffre à l'octet près en WASM à partir de vecteurs de référence part
 wasm-pack test --node crates/wasm
 ```
 
-La compilation web et son audit de dépendances s'exécutent en CI (`.github/workflows/ci.yml`).
+Le build web, son audit de dépendances et la vérification des traductions du README
+(`scripts/check-readme-i18n`) s'exécutent aussi en CI (`.github/workflows/ci.yml`).
+[CONTRIBUTING.md](CONTRIBUTING.md) renvoie aux guides du fuzzing, des preuves Kani, de la couverture
+et des contrôles d'assurance.
 
 ## Télémétrie
 

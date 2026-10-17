@@ -594,11 +594,16 @@ The workspace contains four crates:
 - `crates/server` - the Axum-based synchronisation API.
 - `crates/wasm` - `wasm-bindgen` bindings that expose the core to web clients.
 
+The browser client in `web/` is a React and Vite app that runs the core through `crates/wasm`.
+
 ## Prerequisites
 
 - [Rustup](https://rustup.rs/) with stable Rust 1.89 or newer
 - The `clippy` and `rustfmt` components
 - The `wasm32-unknown-unknown` target
+- For the web client: Node.js 22 (what CI uses) and `wasm-pack` (CI pins v0.15.0)
+- For the server and its database tests: Postgres 16, which `docker compose up -d` provides
+- For the script checks: Python 3.11 or newer
 
 The checked-in `rust-toolchain.toml` asks Rustup to install the required components and
 target automatically.
@@ -660,9 +665,15 @@ The browser client runs the same crypto core via WebAssembly (`web/`):
 ```sh
 cd web
 npm ci
-npm run dev      # dev server (proxies the API to localhost:8080)
-npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run dev        # dev server (proxies the API to localhost:8080)
+npm run build      # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run typecheck  # TypeScript checks; needs the WASM bindings a build generates
+npm test           # unit tests (Vitest)
+npm run smoke      # load the WASM core under Node and exercise it
 ```
+
+The Playwright funnel suite (`npm run e2e`) needs a database and a production build first;
+[`web/e2e/README.md`](web/e2e/README.md) explains the setup.
 
 ## Development checks
 
@@ -692,7 +703,9 @@ decrypts byte-for-byte in WASM from shared golden vectors:
 wasm-pack test --node crates/wasm
 ```
 
-The web build and its dependency audit run in CI (`.github/workflows/ci.yml`).
+The web build, its dependency audit, and the README translation check (`scripts/check-readme-i18n`)
+also run in CI (`.github/workflows/ci.yml`). [CONTRIBUTING.md](CONTRIBUTING.md) links the guides for
+fuzzing, Kani proofs, coverage, and the assurance checks.
 
 ## Telemetry
 

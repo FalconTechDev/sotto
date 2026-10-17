@@ -614,11 +614,16 @@ Der Workspace enthält vier Crates:
 - `crates/server`: die Axum-basierte Synchronisierungs-API.
 - `crates/wasm`: `wasm-bindgen`-Anbindungen, die den Kern für Web-Clients bereitstellen.
 
+Der Browser-Client in `web/` ist eine React- und Vite-App, die den Kern über `crates/wasm` nutzt.
+
 ## Voraussetzungen
 
 - [Rustup](https://rustup.rs/) mit stabilem Rust 1.89 oder neuer
 - Die Komponenten `clippy` und `rustfmt`
 - Das Target `wasm32-unknown-unknown`
+- Für den Web-Client: Node.js 22 (wie in der CI) und `wasm-pack` (die CI pinnt v0.15.0)
+- Für den Server und seine Datenbanktests: Postgres 16, das `docker compose up -d` bereitstellt
+- Für die Skriptprüfungen: Python 3.11 oder neuer
 
 Die eingecheckte `rust-toolchain.toml` lässt Rustup die benötigten Komponenten und das Target automatisch installieren.
 
@@ -680,9 +685,15 @@ Der Browser-Client nutzt denselben Krypto-Kern über WebAssembly (`web/`):
 ```sh
 cd web
 npm ci
-npm run dev      # dev server (proxies the API to localhost:8080)
-npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run dev        # dev server (proxies the API to localhost:8080)
+npm run build      # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run typecheck  # TypeScript checks; needs the WASM bindings a build generates
+npm test           # unit tests (Vitest)
+npm run smoke      # load the WASM core under Node and exercise it
 ```
+
+Die Playwright-Funnel-Suite (`npm run e2e`) braucht eine Datenbank und vorher einen
+Produktions-Build; [`web/e2e/README.md`](web/e2e/README.md) erklärt die Einrichtung.
 
 ## Entwicklungsprüfungen
 
@@ -712,7 +723,10 @@ entschlüsselt in WASM Byte für Byte aus gemeinsamen Referenzvektoren:
 wasm-pack test --node crates/wasm
 ```
 
-Der Web-Build und sein Abhängigkeits-Audit laufen in der CI (`.github/workflows/ci.yml`).
+Der Web-Build, sein Abhängigkeits-Audit und die Prüfung der README-Übersetzungen
+(`scripts/check-readme-i18n`) laufen ebenfalls in der CI (`.github/workflows/ci.yml`).
+[CONTRIBUTING.md](CONTRIBUTING.md) verlinkt die Anleitungen für Fuzzing, Kani-Beweise, Coverage und
+die Assurance-Prüfungen.
 
 ## Telemetrie
 

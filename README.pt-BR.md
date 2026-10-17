@@ -604,11 +604,16 @@ O workspace contém quatro crates:
 - `crates/server`: a API de sincronização baseada em Axum.
 - `crates/wasm`: bindings `wasm-bindgen` que expõem o núcleo aos clientes web.
 
+O cliente do navegador em `web/` é um app React e Vite que roda o núcleo por meio de `crates/wasm`.
+
 ## Pré-requisitos
 
 - [Rustup](https://rustup.rs/) com Rust estável 1.89 ou mais recente
 - Os componentes `clippy` e `rustfmt`
 - O target `wasm32-unknown-unknown`
+- Para o cliente web: Node.js 22 (o que o CI usa) e `wasm-pack` (o CI fixa a v0.15.0)
+- Para o servidor e seus testes com banco de dados: Postgres 16, que `docker compose up -d` fornece
+- Para as verificações de scripts: Python 3.11 ou mais recente
 
 O `rust-toolchain.toml` incluído pede ao Rustup para instalar automaticamente os componentes e o target necessários.
 
@@ -669,9 +674,15 @@ O cliente do navegador roda o mesmo núcleo criptográfico via WebAssembly (`web
 ```sh
 cd web
 npm ci
-npm run dev      # dev server (proxies the API to localhost:8080)
-npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run dev        # dev server (proxies the API to localhost:8080)
+npm run build      # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run typecheck  # TypeScript checks; needs the WASM bindings a build generates
+npm test           # unit tests (Vitest)
+npm run smoke      # load the WASM core under Node and exercise it
 ```
+
+A suíte Playwright do funil (`npm run e2e`) precisa de um banco de dados e de um build de produção
+antes; [`web/e2e/README.md`](web/e2e/README.md) explica a preparação.
 
 ## Verificações de desenvolvimento
 
@@ -701,7 +712,10 @@ A verificação cruzada entre implementações prova que os builds nativo e WASM
 wasm-pack test --node crates/wasm
 ```
 
-O build web e sua auditoria de dependências rodam no CI (`.github/workflows/ci.yml`).
+O build web, sua auditoria de dependências e a verificação das traduções do README
+(`scripts/check-readme-i18n`) também rodam no CI (`.github/workflows/ci.yml`).
+[CONTRIBUTING.md](CONTRIBUTING.md) aponta para os guias de fuzzing, provas Kani, cobertura e
+verificações de garantia.
 
 ## Telemetria
 
