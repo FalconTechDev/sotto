@@ -160,6 +160,11 @@ enum Command {
     Unlock,
     /// Lock the store (clear the cached session).
     Lock,
+    /// Validate the current project's agent task declarations.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     /// Show identity, session, and project status.
     Status {
         /// Output as a JSON object.
@@ -331,6 +336,12 @@ enum EnvCommand {
 }
 
 #[derive(Subcommand)]
+enum TaskCommand {
+    /// Validate `sotto.tasks.toml` without opening the local secret store.
+    Validate,
+}
+
+#[derive(Subcommand)]
 enum TokenCommand {
     /// Create a machine token for the active environment; prints the SOTTO_TOKEN once.
     Create {
@@ -450,6 +461,20 @@ fn run() -> Result<()> {
     // Completions need neither the store nor the keychain - handle before touching either.
     if let Some(Command::Completions { shell }) = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
+        return Ok(());
+    }
+
+    // Task declaration validation needs only the project config and task file. Handle it before
+    // opening local state or the keychain, so validation cannot prompt or initialise secret data.
+    if let Some(Command::Task {
+        command: TaskCommand::Validate,
+    }) = &cli.command
+    {
+        let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+        let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+        let count = manifest.tasks().len();
+        let noun = if count == 1 { "task" } else { "tasks" };
+        println!("valid: {count} {noun}");
         return Ok(());
     }
 
@@ -685,6 +710,9 @@ fn run() -> Result<()> {
             eprintln!("locked");
             Ok(())
         }
+        Command::Task { command } => match command {
+            TaskCommand::Validate => unreachable!("task validation is handled before store init"),
+        },
         Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
