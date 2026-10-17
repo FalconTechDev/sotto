@@ -10,7 +10,8 @@ ALTER TABLE billing_transfer_intents
     ADD COLUMN source_schedule_id TEXT,
     ADD COLUMN destination_setup_session_id TEXT,
     ADD COLUMN destination_setup_intent_id TEXT,
-    ADD COLUMN last_execution_error_code TEXT;
+    ADD COLUMN last_execution_error_code TEXT,
+    ADD COLUMN execution_manual_review_required BOOLEAN NOT NULL DEFAULT FALSE;
 
 ALTER TABLE billing_transfer_intents
     ADD CONSTRAINT billing_transfer_execution_lease_pair CHECK (

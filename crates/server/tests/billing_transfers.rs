@@ -8,10 +8,10 @@ use uuid::Uuid;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_transfer, claim_transfer_for_execution,
-    complete_source_adjustment, finish_execution_lease, lock_and_check_no_live_transfer,
-    mark_failed, record_destination_paid, record_destination_prepared, release_execution_lease,
-    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
-    TransferRequest, TransferState,
+    claim_transfer_for_manual_recovery, complete_source_adjustment, finish_execution_lease,
+    lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
+    record_destination_prepared, release_execution_lease, withdraw_transfer, BeginTransfer,
+    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferState,
 };
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
@@ -319,6 +319,38 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
             .await
             .expect("current worker clears its own lease")
     );
+
+    let rejected_attempt = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("claim provider step")
+        .expect("transfer remains due after lease completion");
+    release_execution_lease(
+        &pool,
+        &transfer.transfer_id,
+        &rejected_attempt.lease_token,
+        TransferExecutionFailure::ProviderRejected,
+    )
+    .await
+    .expect("park a definitively rejected provider step for review");
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("manual review blocks automatic polling")
+        .is_none());
+    let manual_retry = claim_transfer_for_manual_recovery(&pool, &transfer.transfer_id)
+        .await
+        .expect("explicit reconciliation can claim manual review")
+        .expect("manual recovery is due on demand");
+    finish_execution_lease(&pool, &transfer.transfer_id, &manual_retry.lease_token)
+        .await
+        .expect("manual recovery clears the review marker after success");
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'pending', result_code = NULL, \
+         execution_next_attempt_at = now() WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("restore pending fixture for transition coverage");
 
     let sponsored_request = SponsoredSeatRequest {
         action: SponsoredSeatAction::Add,

@@ -266,6 +266,7 @@ pub struct TransferLease {
 
 pub const TRANSFER_EXECUTION_LEASE_SECONDS: i64 = 120;
 const MAX_TRANSFER_RETRY_DELAY_SECONDS: i64 = 60 * 60;
+const MAX_AUTOMATIC_TRANSFER_ATTEMPTS: i32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferExecutionFailure {
@@ -286,7 +287,11 @@ impl TransferExecutionFailure {
     }
 
     const fn needs_unknown_state(self) -> bool {
-        matches!(self, Self::ProviderOutcomeUnknown)
+        matches!(self, Self::ProviderOutcomeUnknown | Self::ProviderRejected)
+    }
+
+    const fn requires_manual_review(self, attempts: i32) -> bool {
+        matches!(self, Self::ProviderRejected) || attempts >= MAX_AUTOMATIC_TRANSFER_ATTEMPTS
     }
 }
 
@@ -1247,7 +1252,7 @@ pub async fn mark_failed(
 /// of rows (one here), skips work owned by another live lease, and returns expired leases to
 /// the same stable provider operation keys after a process restart.
 pub async fn claim_due(pool: &PgPool) -> Result<Option<TransferLease>, TransferError> {
-    claim_due_matching(pool, None).await
+    claim_due_matching(pool, None, false).await
 }
 
 /// Claim a known transfer after an operator or callback has requested immediate reconciliation.
@@ -1259,12 +1264,25 @@ pub async fn claim_transfer_for_execution(
     if transfer_id.trim().is_empty() {
         return Err(TransferError::InvalidField("transfer_id"));
     }
-    claim_due_matching(pool, Some(transfer_id)).await
+    claim_due_matching(pool, Some(transfer_id), false).await
+}
+
+/// Claim an item parked for operator reconciliation. Callers must establish operator authority
+/// before invoking this path; it deliberately bypasses the due time only for a manual-review row.
+pub async fn claim_transfer_for_manual_recovery(
+    pool: &PgPool,
+    transfer_id: &str,
+) -> Result<Option<TransferLease>, TransferError> {
+    if transfer_id.trim().is_empty() {
+        return Err(TransferError::InvalidField("transfer_id"));
+    }
+    claim_due_matching(pool, Some(transfer_id), true).await
 }
 
 async fn claim_due_matching(
     pool: &PgPool,
     only_transfer_id: Option<&str>,
+    manual_recovery: bool,
 ) -> Result<Option<TransferLease>, TransferError> {
     let lease_token = Uuid::new_v4().to_string();
     let mut tx = pool.begin().await?;
@@ -1273,7 +1291,8 @@ async fn claim_due_matching(
              SELECT transfer.transfer_id FROM billing_transfer_intents AS transfer \
              WHERE transfer.state IN ('pending','destination_prepared','destination_paid', \
                              'source_adjustment_pending','unknown') \
-               AND transfer.execution_next_attempt_at <= now() \
+               AND (transfer.execution_next_attempt_at <= now() \
+                    OR ($4 AND transfer.execution_manual_review_required)) \
                AND (transfer.execution_lease_until IS NULL OR transfer.execution_lease_until <= now()) \
                AND ($3::TEXT IS NULL OR transfer.transfer_id = $3) \
              ORDER BY transfer.execution_next_attempt_at, transfer.created_at, transfer.transfer_id \
@@ -1291,6 +1310,7 @@ async fn claim_due_matching(
     .bind(TRANSFER_EXECUTION_LEASE_SECONDS)
     .bind(&lease_token)
     .bind(only_transfer_id)
+    .bind(manual_recovery)
     .fetch_optional(&mut *tx)
     .await?;
     let lease = row
@@ -1330,20 +1350,32 @@ pub async fn release_execution_lease(
         tx.rollback().await?;
         return Ok(false);
     };
+    let manual_review_required = failure.requires_manual_review(attempts);
+    let unknown_state_required = failure.needs_unknown_state() || manual_review_required;
+    let result_code =
+        if manual_review_required && failure != TransferExecutionFailure::ProviderRejected {
+            "automatic_retry_limit_reached"
+        } else {
+            failure.as_str()
+        };
     let row = sqlx::query(
         "UPDATE billing_transfer_intents SET \
              state = CASE WHEN $3 THEN 'unknown' ELSE state END, \
              last_execution_error_code = $4, \
-             result_code = CASE WHEN $3 THEN $4 ELSE result_code END, \
+             result_code = CASE WHEN $3 THEN $5 ELSE result_code END, \
+             execution_manual_review_required = $6, \
              execution_lease_token = NULL, execution_lease_until = NULL, \
-             execution_next_attempt_at = now() + ($5 * interval '1 second'), updated_at = now() \
+             execution_next_attempt_at = CASE WHEN $6 THEN 'infinity'::timestamptz \
+                 ELSE now() + ($7 * interval '1 second') END, updated_at = now() \
          WHERE transfer_id = $1 AND execution_lease_token = $2 \
          RETURNING transfer_id",
     )
     .bind(transfer_id)
     .bind(lease_token)
-    .bind(failure.needs_unknown_state())
+    .bind(unknown_state_required)
     .bind(failure.as_str())
+    .bind(result_code)
+    .bind(manual_review_required)
     .bind(transfer_retry_delay_seconds(failure, attempts))
     .fetch_optional(&mut *tx)
     .await?;
@@ -1370,7 +1402,9 @@ pub async fn finish_execution_lease(
 ) -> Result<bool, TransferError> {
     let rows = sqlx::query(
         "UPDATE billing_transfer_intents SET execution_lease_token = NULL, \
-             execution_lease_until = NULL, execution_next_attempt_at = now(), updated_at = now() \
+             execution_lease_until = NULL, execution_next_attempt_at = now(), \
+             execution_manual_review_required = FALSE, result_code = NULL, \
+             last_execution_error_code = NULL, updated_at = now() \
          WHERE transfer_id = $1 AND execution_lease_token = $2",
     )
     .bind(transfer_id)
@@ -1742,7 +1776,8 @@ mod tests {
     use super::{
         offer_at_transfer_boundary, transfer_retry_delay_seconds, validate_offer_at_boundary,
         validate_source_term, TransferError, TransferExecutionFailure, TransferPayer,
-        TransferRequest, TransferState, MAX_TRANSFER_RETRY_DELAY_SECONDS,
+        TransferRequest, TransferState, MAX_AUTOMATIC_TRANSFER_ATTEMPTS,
+        MAX_TRANSFER_RETRY_DELAY_SECONDS,
     };
     use crate::billing_catalogue::BillingOffer;
 
@@ -1920,10 +1955,15 @@ mod tests {
     }
 
     #[test]
-    fn only_ambiguous_provider_results_move_execution_to_unknown() {
+    fn rejected_or_exhausted_provider_work_requires_manual_review() {
         assert!(TransferExecutionFailure::ProviderOutcomeUnknown.needs_unknown_state());
         assert!(!TransferExecutionFailure::RetryableProvider.needs_unknown_state());
         assert!(!TransferExecutionFailure::LocalEvidenceChanged.needs_unknown_state());
-        assert!(!TransferExecutionFailure::ProviderRejected.needs_unknown_state());
+        assert!(TransferExecutionFailure::ProviderRejected.needs_unknown_state());
+        assert!(TransferExecutionFailure::ProviderRejected.requires_manual_review(1));
+        assert!(TransferExecutionFailure::RetryableProvider
+            .requires_manual_review(MAX_AUTOMATIC_TRANSFER_ATTEMPTS));
+        assert!(!TransferExecutionFailure::RetryableProvider
+            .requires_manual_review(MAX_AUTOMATIC_TRANSFER_ATTEMPTS - 1));
     }
 }
