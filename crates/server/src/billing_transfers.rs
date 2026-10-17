@@ -118,6 +118,7 @@ pub struct TransferRequest {
     pub beneficiary_id: String,
     pub source_kind: TransferPayer,
     pub source_organization_id: Option<String>,
+    pub source_provider_subscription_id: String,
     pub destination_kind: TransferPayer,
     pub destination_organization_id: Option<String>,
     pub offer: BillingOffer,
@@ -139,6 +140,7 @@ impl TransferRequest {
             (&self.actor_user_id, "actor_user_id"),
             (&self.counterparty_user_id, "counterparty_user_id"),
             (&self.beneficiary_id, "beneficiary_id"),
+            (&self.source_provider_subscription_id, "source subscription"),
             (&self.idempotency_key, "idempotency_key"),
         ] {
             if value.trim().is_empty() {
@@ -196,6 +198,7 @@ impl TransferRequest {
             &self.beneficiary_id,
             self.source_kind.as_str(),
             self.source_organization_id.as_deref().unwrap_or(""),
+            &self.source_provider_subscription_id,
             self.destination_kind.as_str(),
             self.destination_organization_id.as_deref().unwrap_or(""),
             self.offer.as_str(),
@@ -239,8 +242,52 @@ pub struct TransferIntent {
     pub destination_payment_reference: Option<String>,
     pub source_adjustment_reference: Option<String>,
     pub founding_award_id: Option<String>,
+    pub execution_lease_token: Option<String>,
+    pub execution_lease_until_epoch: Option<i64>,
+    pub execution_attempt_count: i32,
+    pub destination_customer_id: Option<String>,
+    pub destination_schedule_id: Option<String>,
+    pub source_schedule_id: Option<String>,
+    pub destination_setup_session_id: Option<String>,
+    pub destination_setup_intent_id: Option<String>,
+    pub last_execution_error_code: Option<String>,
     pub state: TransferState,
     pub result_code: Option<String>,
+}
+
+/// A claimed transfer row. The lease token fences an older worker after another worker
+/// reclaims an expired lease; provider idempotency keys remain stable across leases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferLease {
+    pub transfer: TransferIntent,
+    pub lease_token: String,
+    pub lease_until_epoch: i64,
+}
+
+pub const TRANSFER_EXECUTION_LEASE_SECONDS: i64 = 120;
+const MAX_TRANSFER_RETRY_DELAY_SECONDS: i64 = 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferExecutionFailure {
+    RetryableProvider,
+    ProviderOutcomeUnknown,
+    LocalEvidenceChanged,
+    ProviderRejected,
+}
+
+impl TransferExecutionFailure {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetryableProvider => "provider_retryable",
+            Self::ProviderOutcomeUnknown => "provider_outcome_unknown",
+            Self::LocalEvidenceChanged => "local_evidence_changed",
+            Self::ProviderRejected => "provider_rejected",
+        }
+    }
+
+    const fn needs_unknown_state(self) -> bool {
+        matches!(self, Self::ProviderOutcomeUnknown)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,16 +352,17 @@ pub async fn build_transfer_request(
     preauthorise_transfer_draft(tx, actor_user_id, draft, now_epoch).await?;
     founding_allocator::lock_capacity(tx).await?;
 
-    let personal = sqlx::query_as::<_, (String, Option<i64>)>(
-        "SELECT offer, paid_through_epoch FROM billing_personal_accounts \
+    let personal = sqlx::query_as::<_, (String, Option<i64>, String)>(
+        "SELECT offer, paid_through_epoch, stripe_subscription_id FROM billing_personal_accounts \
          WHERE user_id = $1 AND state = 'active' AND cancel_at_period_end = FALSE \
            AND cancellation_requested_at IS NULL AND stripe_subscription_id IS NOT NULL",
     )
     .bind(&draft.beneficiary_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let sponsored = sqlx::query_as::<_, (String, String, i64)>(
-        "SELECT seat.organization_id, seat.offer, subscription.current_period_end \
+    let sponsored = sqlx::query_as::<_, (String, String, i64, String)>(
+        "SELECT seat.organization_id, seat.offer, subscription.current_period_end, \
+                subscription.provider_subscription_id \
          FROM billing_sponsored_seats AS seat \
          JOIN billing_sponsored_subscriptions AS subscription \
            ON subscription.organization_id = seat.organization_id \
@@ -332,16 +380,23 @@ pub async fn build_transfer_request(
     .fetch_all(&mut **tx)
     .await?;
 
-    let (source_kind, source_organization_id, source_offer, effective_from) =
+    let (source_kind, source_organization_id, source_offer, effective_from, source_subscription_id) =
         match (personal, sponsored.as_slice()) {
-            (Some((offer, Some(boundary))), []) => (TransferPayer::Personal, None, offer, boundary),
-            (None, [(organization_id, offer, boundary)]) => (
+            (Some((offer, Some(boundary), subscription_id)), []) => (
+                TransferPayer::Personal,
+                None,
+                offer,
+                boundary,
+                subscription_id,
+            ),
+            (None, [(organization_id, offer, boundary, subscription_id)]) => (
                 TransferPayer::Sponsor,
                 Some(organization_id.clone()),
                 offer.clone(),
                 *boundary,
+                subscription_id.clone(),
             ),
-            (None, []) | (Some((_, None)), []) => return Err(TransferError::SourceInactive),
+            (None, []) | (Some((_, None, _)), []) => return Err(TransferError::SourceInactive),
             _ => return Err(TransferError::CorruptState),
         };
 
@@ -351,6 +406,7 @@ pub async fn build_transfer_request(
         beneficiary_id: draft.beneficiary_id.clone(),
         source_kind,
         source_organization_id,
+        source_provider_subscription_id: source_subscription_id,
         destination_kind: draft.destination_kind,
         destination_organization_id: draft.destination_organization_id.clone(),
         offer: parse_offer(&source_offer)?,
@@ -661,8 +717,8 @@ pub async fn begin_transfer(
          (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, source_organization_id, \
           destination_kind, destination_organization_id, offer, quote_version, quote_expires_at_epoch, \
           effective_from, effective_until, idempotency_key, request_hash, provider_idempotency_key, \
-          founding_award_id, state) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+          founding_award_id, state, source_provider_subscription_id) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
     )
     .bind(&transfer_id)
     .bind(&request.actor_user_id)
@@ -682,6 +738,7 @@ pub async fn begin_transfer(
     .bind(provider_key)
     .bind(founding_award_id)
     .bind(initial_state.as_str())
+    .bind(&request.source_provider_subscription_id)
     .execute(&mut **tx)
     .await?;
     Ok(BeginTransfer::Created(
@@ -716,7 +773,7 @@ pub async fn accept_transfer(
     if invitation.state == TransferState::Pending {
         return Ok(invitation);
     }
-    let request = request_from_intent(&invitation);
+    let request = request_from_intent(&invitation)?;
     authorise_transfer_parties(tx, &request).await?;
     let current = load_transfer(tx, transfer_id).await?;
     if current.counterparty_user_id != user_id {
@@ -728,7 +785,7 @@ pub async fn accept_transfer(
     if current.state != TransferState::AwaitingConsent {
         return Err(TransferError::InvalidTransition);
     }
-    let request = request_from_intent(&current);
+    let request = request_from_intent(&current)?;
     request.validate_timing(now_epoch)?;
     let source_offer = ensure_source_active(tx, &request, now_epoch).await?;
     ensure_no_pending_billing_mutation(tx, &request.beneficiary_id).await?;
@@ -935,13 +992,17 @@ async fn authorise_transfer_parties(
     }
 }
 
-fn request_from_intent(intent: &TransferIntent) -> TransferRequest {
-    TransferRequest {
+fn request_from_intent(intent: &TransferIntent) -> Result<TransferRequest, TransferError> {
+    Ok(TransferRequest {
         actor_user_id: intent.actor_user_id.clone(),
         counterparty_user_id: intent.counterparty_user_id.clone(),
         beneficiary_id: intent.beneficiary_id.clone(),
         source_kind: intent.source_kind,
         source_organization_id: intent.source_organization_id.clone(),
+        source_provider_subscription_id: intent
+            .source_provider_subscription_id
+            .clone()
+            .ok_or(TransferError::CorruptState)?,
         destination_kind: intent.destination_kind,
         destination_organization_id: intent.destination_organization_id.clone(),
         offer: intent.offer,
@@ -950,7 +1011,7 @@ fn request_from_intent(intent: &TransferIntent) -> TransferRequest {
         effective_from: intent.effective_from,
         effective_until: intent.effective_until,
         idempotency_key: intent.idempotency_key.clone(),
-    }
+    })
 }
 
 pub async fn record_destination_prepared(
@@ -1001,9 +1062,11 @@ pub async fn record_destination_paid(
         return Err(TransferError::InvalidField("payment_reference"));
     }
     let updated = sqlx::query(
-        "UPDATE billing_transfer_intents SET state = 'destination_paid', \
+        "UPDATE billing_transfer_intents SET \
+         state = CASE WHEN state = 'source_adjustment_pending' THEN state ELSE 'destination_paid' END, \
          destination_payment_reference = $2, updated_at = now() \
-         WHERE transfer_id = $1 AND state = 'destination_prepared' RETURNING transfer_id",
+         WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending') \
+         RETURNING transfer_id",
     )
     .bind(transfer_id)
     .bind(payment_reference)
@@ -1038,7 +1101,8 @@ pub async fn begin_source_adjustment(
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'source_adjustment_pending', \
          source_operation_id = $2, updated_at = now() \
-         WHERE transfer_id = $1 AND state = 'destination_paid' RETURNING transfer_id",
+         WHERE transfer_id = $1 AND state IN ('destination_prepared','destination_paid') \
+         RETURNING transfer_id",
     )
     .bind(transfer_id)
     .bind(source_operation_id)
@@ -1074,6 +1138,24 @@ pub async fn complete_source_adjustment(
     }
     if transfer.state != TransferState::SourceAdjustmentPending {
         return Err(TransferError::InvalidTransition);
+    }
+    if transfer
+        .source_adjustment_reference
+        .as_deref()
+        .is_some_and(|stored| stored != source_adjustment_reference)
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    if transfer.destination_payment_reference.is_none() {
+        sqlx::query(
+            "UPDATE billing_transfer_intents SET source_adjustment_reference = $2, \
+             updated_at = now() WHERE transfer_id = $1 AND state = 'source_adjustment_pending'",
+        )
+        .bind(transfer_id)
+        .bind(source_adjustment_reference)
+        .execute(&mut **tx)
+        .await?;
+        return load_transfer(tx, transfer_id).await;
     }
     if let Some(award_id) = transfer.founding_award_id.as_deref() {
         let destination_payer = match transfer.destination_kind {
@@ -1160,13 +1242,161 @@ pub async fn mark_failed(
     Ok(current)
 }
 
+/// Claim one accepted transfer for provider reconciliation. The query takes a bounded number
+/// of rows (one here), skips work owned by another live lease, and returns expired leases to
+/// the same stable provider operation keys after a process restart.
+pub async fn claim_due(
+    pool: &PgPool,
+    now_epoch: i64,
+) -> Result<Option<TransferLease>, TransferError> {
+    claim_due_matching(pool, now_epoch, None).await
+}
+
+/// Claim a known transfer after an operator or callback has requested immediate reconciliation.
+/// It obeys the same lease and due-time checks as the ordinary worker poll.
+pub async fn claim_transfer_for_execution(
+    pool: &PgPool,
+    transfer_id: &str,
+    now_epoch: i64,
+) -> Result<Option<TransferLease>, TransferError> {
+    if transfer_id.trim().is_empty() {
+        return Err(TransferError::InvalidField("transfer_id"));
+    }
+    claim_due_matching(pool, now_epoch, Some(transfer_id)).await
+}
+
+async fn claim_due_matching(
+    pool: &PgPool,
+    now_epoch: i64,
+    only_transfer_id: Option<&str>,
+) -> Result<Option<TransferLease>, TransferError> {
+    let lease_token = Uuid::new_v4().to_string();
+    let lease_until_epoch = now_epoch.saturating_add(TRANSFER_EXECUTION_LEASE_SECONDS);
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "WITH candidate AS (\
+             SELECT transfer_id FROM billing_transfer_intents \
+             WHERE state IN ('pending','destination_prepared','destination_paid', \
+                             'source_adjustment_pending','unknown') \
+               AND execution_next_attempt_at <= to_timestamp($1) \
+               AND (execution_lease_until IS NULL OR execution_lease_until <= to_timestamp($1)) \
+               AND ($4::TEXT IS NULL OR transfer_id = $4) \
+             ORDER BY execution_next_attempt_at, created_at, transfer_id \
+             LIMIT 1 FOR UPDATE SKIP LOCKED \
+         ) \
+         UPDATE billing_transfer_intents AS transfer SET \
+             execution_lease_token = $2, \
+             execution_lease_until = to_timestamp($3), \
+             execution_attempt_count = transfer.execution_attempt_count + 1, \
+             updated_at = to_timestamp($1) \
+         FROM candidate WHERE transfer.transfer_id = candidate.transfer_id \
+         RETURNING transfer.*, EXTRACT(EPOCH FROM transfer.execution_lease_until)::BIGINT \
+             AS execution_lease_until_epoch",
+    )
+    .bind(now_epoch)
+    .bind(&lease_token)
+    .bind(lease_until_epoch)
+    .bind(only_transfer_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let lease = row
+        .map(|row| {
+            Ok::<TransferLease, TransferError>(TransferLease {
+                transfer: transfer_from_row(&row)?,
+                lease_token,
+                lease_until_epoch,
+            })
+        })
+        .transpose()?;
+    tx.commit().await?;
+    Ok(lease)
+}
+
+/// Release a worker lease after a retryable or ambiguous result. A provider timeout is recorded
+/// as unknown but retains the same intent and stable idempotency identity for the next retrieval.
+pub async fn release_execution_lease(
+    pool: &PgPool,
+    transfer_id: &str,
+    lease_token: &str,
+    now_epoch: i64,
+    failure: TransferExecutionFailure,
+) -> Result<bool, TransferError> {
+    if transfer_id.trim().is_empty() || lease_token.trim().is_empty() {
+        return Err(TransferError::InvalidField("execution lease"));
+    }
+    let mut tx = pool.begin().await?;
+    let attempts = sqlx::query_scalar::<_, i32>(
+        "SELECT execution_attempt_count FROM billing_transfer_intents \
+         WHERE transfer_id = $1 AND execution_lease_token = $2 FOR UPDATE",
+    )
+    .bind(transfer_id)
+    .bind(lease_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(attempts) = attempts else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let row = sqlx::query(
+        "UPDATE billing_transfer_intents SET \
+             state = CASE WHEN $4 THEN 'unknown' ELSE state END, \
+             last_execution_error_code = $5, \
+             result_code = CASE WHEN $4 THEN $5 ELSE result_code END, \
+             execution_lease_token = NULL, execution_lease_until = NULL, \
+             execution_next_attempt_at = to_timestamp($6), updated_at = to_timestamp($2) \
+         WHERE transfer_id = $1 AND execution_lease_token = $3 \
+         RETURNING transfer_id",
+    )
+    .bind(transfer_id)
+    .bind(now_epoch)
+    .bind(lease_token)
+    .bind(failure.needs_unknown_state())
+    .bind(failure.as_str())
+    .bind(now_epoch.saturating_add(transfer_retry_delay_seconds(failure, attempts)))
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row.is_some())
+}
+
+fn transfer_retry_delay_seconds(failure: TransferExecutionFailure, attempts: i32) -> i64 {
+    if matches!(failure, TransferExecutionFailure::LocalEvidenceChanged) {
+        return MAX_TRANSFER_RETRY_DELAY_SECONDS;
+    }
+    let exponent = attempts.clamp(0, 12) as u32;
+    15_i64
+        .saturating_mul(1_i64 << exponent)
+        .min(MAX_TRANSFER_RETRY_DELAY_SECONDS)
+}
+
+/// Remove a lease after the worker has durably advanced the transfer. The token check prevents
+/// an expired worker from clearing a newer worker's lease.
+pub async fn finish_execution_lease(
+    pool: &PgPool,
+    transfer_id: &str,
+    lease_token: &str,
+) -> Result<bool, TransferError> {
+    let rows = sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_lease_token = NULL, \
+             execution_lease_until = NULL, execution_next_attempt_at = now(), updated_at = now() \
+         WHERE transfer_id = $1 AND execution_lease_token = $2",
+    )
+    .bind(transfer_id)
+    .bind(lease_token)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows == 1)
+}
+
 pub async fn load_for_actor(
     pool: &PgPool,
     transfer_id: &str,
     actor_user_id: &str,
 ) -> Result<Option<TransferIntent>, TransferError> {
     let row = sqlx::query(
-        "SELECT * FROM billing_transfer_intents WHERE transfer_id = $1 AND actor_user_id = $2",
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents WHERE transfer_id = $1 AND actor_user_id = $2",
     )
     .bind(transfer_id)
     .bind(actor_user_id)
@@ -1181,7 +1411,8 @@ pub async fn load_for_participant(
     user_id: &str,
 ) -> Result<Option<TransferIntent>, TransferError> {
     let row = sqlx::query(
-        "SELECT * FROM billing_transfer_intents WHERE transfer_id = $1 \
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents WHERE transfer_id = $1 \
          AND (actor_user_id = $2 OR counterparty_user_id = $2)",
     )
     .bind(transfer_id)
@@ -1206,7 +1437,8 @@ pub async fn list_for_participant(
     limit: i64,
 ) -> Result<Vec<TransferIntent>, TransferError> {
     let rows = sqlx::query(
-        "SELECT * FROM billing_transfer_intents \
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents \
          WHERE (actor_user_id = $1 OR counterparty_user_id = $1) \
            AND ($2::text IS NULL OR transfer_id < $2) \
          ORDER BY transfer_id DESC LIMIT $3",
@@ -1226,8 +1458,9 @@ async fn ensure_source_active(
 ) -> Result<String, TransferError> {
     let source = match request.source_kind {
         TransferPayer::Personal => {
-            sqlx::query_as::<_, (String, Option<i64>)>(
-                "SELECT offer, paid_through_epoch FROM billing_personal_accounts \
+            sqlx::query_as::<_, (String, Option<i64>, String)>(
+                "SELECT offer, paid_through_epoch, stripe_subscription_id \
+                 FROM billing_personal_accounts \
                  WHERE user_id = $1 AND state = 'active' AND cancel_at_period_end = FALSE \
                    AND cancellation_requested_at IS NULL AND stripe_subscription_id IS NOT NULL \
                  FOR UPDATE",
@@ -1241,8 +1474,9 @@ async fn ensure_source_active(
                 .source_organization_id
                 .as_deref()
                 .ok_or(TransferError::CorruptState)?;
-            sqlx::query_as::<_, (String, Option<i64>)>(
-                "SELECT seat.offer, subscription.current_period_end \
+            sqlx::query_as::<_, (String, Option<i64>, String)>(
+                "SELECT seat.offer, subscription.current_period_end, \
+                        subscription.provider_subscription_id \
                  FROM billing_sponsored_seats AS seat \
                  JOIN billing_sponsored_subscriptions AS subscription \
                    ON subscription.organization_id = seat.organization_id \
@@ -1266,13 +1500,16 @@ async fn ensure_source_active(
 }
 
 fn validate_source_term(
-    source: Option<(String, Option<i64>)>,
+    source: Option<(String, Option<i64>, String)>,
     request: &TransferRequest,
     now_epoch: i64,
 ) -> Result<String, TransferError> {
-    let Some((offer, paid_through)) = source else {
+    let Some((offer, paid_through, subscription_id)) = source else {
         return Err(TransferError::SourceInactive);
     };
+    if subscription_id != request.source_provider_subscription_id {
+        return Err(TransferError::SourceTermChanged);
+    }
     if paid_through
         .is_none_or(|boundary| boundary <= now_epoch || boundary != request.effective_from)
     {
@@ -1355,7 +1592,8 @@ async fn load_by_idempotency(
     idempotency_key: &str,
 ) -> Result<Option<TransferIntent>, TransferError> {
     let row = sqlx::query(
-        "SELECT * FROM billing_transfer_intents WHERE actor_user_id = $1 AND idempotency_key = $2 FOR UPDATE",
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents WHERE actor_user_id = $1 AND idempotency_key = $2 FOR UPDATE",
     )
     .bind(actor_user_id)
     .bind(idempotency_key)
@@ -1369,7 +1607,10 @@ async fn load_transfer(
     transfer_id: &str,
 ) -> Result<TransferIntent, TransferError> {
     let row =
-        sqlx::query("SELECT * FROM billing_transfer_intents WHERE transfer_id = $1 FOR UPDATE")
+        sqlx::query(
+            "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+             FROM billing_transfer_intents WHERE transfer_id = $1 FOR UPDATE",
+        )
             .bind(transfer_id)
             .fetch_optional(&mut **tx)
             .await?
@@ -1381,7 +1622,10 @@ async fn load_transfer_snapshot(
     tx: &mut Transaction<'_, Postgres>,
     transfer_id: &str,
 ) -> Result<TransferIntent, TransferError> {
-    let row = sqlx::query("SELECT * FROM billing_transfer_intents WHERE transfer_id = $1")
+    let row = sqlx::query(
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
         .bind(transfer_id)
         .fetch_optional(&mut **tx)
         .await?
@@ -1415,6 +1659,16 @@ fn transfer_from_row(row: &sqlx::postgres::PgRow) -> Result<TransferIntent, Tran
         destination_payment_reference: row.try_get("destination_payment_reference")?,
         source_adjustment_reference: row.try_get("source_adjustment_reference")?,
         founding_award_id: row.try_get("founding_award_id")?,
+        execution_lease_token: row.try_get("execution_lease_token")?,
+        execution_lease_until_epoch: row
+            .try_get::<Option<i64>, _>("execution_lease_until_epoch")?,
+        execution_attempt_count: row.try_get("execution_attempt_count")?,
+        destination_customer_id: row.try_get("destination_customer_id")?,
+        destination_schedule_id: row.try_get("destination_schedule_id")?,
+        source_schedule_id: row.try_get("source_schedule_id")?,
+        destination_setup_session_id: row.try_get("destination_setup_session_id")?,
+        destination_setup_intent_id: row.try_get("destination_setup_intent_id")?,
+        last_execution_error_code: row.try_get("last_execution_error_code")?,
         state: TransferState::parse(&row.try_get::<String, _>("state")?)?,
         result_code: row.try_get("result_code")?,
     })
@@ -1494,8 +1748,9 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        offer_at_transfer_boundary, validate_offer_at_boundary, validate_source_term,
-        TransferError, TransferPayer, TransferRequest, TransferState,
+        offer_at_transfer_boundary, transfer_retry_delay_seconds, validate_offer_at_boundary,
+        validate_source_term, TransferError, TransferExecutionFailure, TransferPayer,
+        TransferRequest, TransferState, MAX_TRANSFER_RETRY_DELAY_SECONDS,
     };
     use crate::billing_catalogue::BillingOffer;
 
@@ -1506,6 +1761,7 @@ mod tests {
             beneficiary_id: "user".into(),
             source_kind: TransferPayer::Personal,
             source_organization_id: None,
+            source_provider_subscription_id: "sub_source".into(),
             destination_kind: TransferPayer::Sponsor,
             destination_organization_id: Some("org".into()),
             offer: BillingOffer::StandardMonthly,
@@ -1547,7 +1803,7 @@ mod tests {
         transfer.effective_from = 3_000;
         assert_eq!(
             validate_source_term(
-                Some(("standard_monthly".into(), Some(3_000))),
+                Some(("standard_monthly".into(), Some(3_000), "sub_source".into(),)),
                 &transfer,
                 1_000,
             )
@@ -1556,7 +1812,19 @@ mod tests {
         );
         assert!(matches!(
             validate_source_term(
-                Some(("standard_monthly".into(), Some(3_001))),
+                Some(("standard_monthly".into(), Some(3_001), "sub_source".into(),)),
+                &transfer,
+                1_000,
+            ),
+            Err(TransferError::SourceTermChanged)
+        ));
+        assert!(matches!(
+            validate_source_term(
+                Some((
+                    "standard_monthly".into(),
+                    Some(3_000),
+                    "sub_replaced".into(),
+                )),
                 &transfer,
                 1_000,
             ),
@@ -1637,5 +1905,33 @@ mod tests {
         assert!(TransferState::SourceAdjustmentPending.is_live());
         assert!(!TransferState::Completed.is_live());
         assert!(!TransferState::Failed.is_live());
+    }
+
+    #[test]
+    fn transfer_retry_delay_is_bounded_and_local_drift_waits_longer() {
+        assert_eq!(
+            transfer_retry_delay_seconds(TransferExecutionFailure::RetryableProvider, 0),
+            15
+        );
+        assert_eq!(
+            transfer_retry_delay_seconds(TransferExecutionFailure::RetryableProvider, 4),
+            240
+        );
+        assert_eq!(
+            transfer_retry_delay_seconds(TransferExecutionFailure::RetryableProvider, 100),
+            MAX_TRANSFER_RETRY_DELAY_SECONDS
+        );
+        assert_eq!(
+            transfer_retry_delay_seconds(TransferExecutionFailure::LocalEvidenceChanged, 0),
+            MAX_TRANSFER_RETRY_DELAY_SECONDS
+        );
+    }
+
+    #[test]
+    fn only_ambiguous_provider_results_move_execution_to_unknown() {
+        assert!(TransferExecutionFailure::ProviderOutcomeUnknown.needs_unknown_state());
+        assert!(!TransferExecutionFailure::RetryableProvider.needs_unknown_state());
+        assert!(!TransferExecutionFailure::LocalEvidenceChanged.needs_unknown_state());
+        assert!(!TransferExecutionFailure::ProviderRejected.needs_unknown_state());
     }
 }

@@ -402,6 +402,7 @@ fn quote_id(request: &TransferRequest) -> String {
         request.beneficiary_id.as_str(),
         request.source_kind.as_str(),
         request.source_organization_id.as_deref().unwrap_or(""),
+        request.source_provider_subscription_id.as_str(),
         request.destination_kind.as_str(),
         request.destination_organization_id.as_deref().unwrap_or(""),
         request.offer.as_str(),
@@ -429,6 +430,10 @@ fn quote_id_from_intent(intent: &TransferIntent) -> String {
         intent.beneficiary_id.as_str(),
         intent.source_kind.as_str(),
         intent.source_organization_id.as_deref().unwrap_or(""),
+        intent
+            .source_provider_subscription_id
+            .as_deref()
+            .unwrap_or(""),
         intent.destination_kind.as_str(),
         intent.destination_organization_id.as_deref().unwrap_or(""),
         intent.offer.as_str(),
@@ -491,6 +496,7 @@ mod tests {
             beneficiary_id: "beneficiary".into(),
             source_kind: TransferPayer::Personal,
             source_organization_id: None,
+            source_provider_subscription_id: "sub_source".into(),
             destination_kind: TransferPayer::Sponsor,
             destination_organization_id: Some("org".into()),
             offer: BillingOffer::StandardMonthly,
@@ -520,6 +526,9 @@ mod tests {
         changed = original.clone();
         changed.source_kind = TransferPayer::Sponsor;
         changed.source_organization_id = Some("source org".into());
+        assert_ne!(quote_id(&original), quote_id(&changed));
+        changed = original.clone();
+        changed.source_provider_subscription_id = "sub_changed".into();
         assert_ne!(quote_id(&original), quote_id(&changed));
         changed = original.clone();
         changed.destination_organization_id = Some("different org".into());

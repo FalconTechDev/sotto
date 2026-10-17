@@ -7,9 +7,10 @@ use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
-    accept_transfer, begin_source_adjustment, begin_transfer, complete_source_adjustment,
-    lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
-    record_destination_prepared, withdraw_transfer, BeginTransfer, TransferError, TransferPayer,
+    accept_transfer, begin_source_adjustment, begin_transfer, claim_transfer_for_execution,
+    complete_source_adjustment, finish_execution_lease, lock_and_check_no_live_transfer,
+    mark_failed, record_destination_paid, record_destination_prepared, release_execution_lease,
+    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
     TransferRequest, TransferState,
 };
 use sotto_server::db;
@@ -104,12 +105,18 @@ fn personal_to_sponsor_request(
     org: &str,
     key: &str,
 ) -> TransferRequest {
+    let fixture = actor
+        .strip_prefix("transfer-test-")
+        .and_then(|value| value.strip_suffix("-user"));
     TransferRequest {
         actor_user_id: actor.into(),
         counterparty_user_id: actor.into(),
         beneficiary_id: beneficiary.into(),
         source_kind: TransferPayer::Personal,
         source_organization_id: None,
+        source_provider_subscription_id: fixture
+            .map(|fixture| format!("sub_transfer_source_{fixture}"))
+            .unwrap_or_else(|| "sub_transfer_source".into()),
         destination_kind: TransferPayer::Sponsor,
         destination_organization_id: Some(org.into()),
         offer: BillingOffer::FoundingMonthly,
@@ -249,6 +256,54 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     };
     tx.commit().await.expect("commit transfer");
 
+    let lease = claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_000)
+        .await
+        .expect("claim accepted transfer")
+        .expect("accepted transfer is due");
+    assert_eq!(lease.transfer.transfer_id, transfer.transfer_id);
+    assert_eq!(lease.transfer.execution_attempt_count, 1);
+    assert!(
+        claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_001)
+            .await
+            .expect("live lease prevents a second claim")
+            .is_none()
+    );
+    assert!(release_execution_lease(
+        &pool,
+        &transfer.transfer_id,
+        &lease.lease_token,
+        1_800_000_000,
+        TransferExecutionFailure::RetryableProvider,
+    )
+    .await
+    .expect("release retryable lease"));
+    assert!(
+        claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_029)
+            .await
+            .expect("backoff prevents an early retry")
+            .is_none()
+    );
+    let retry = claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_030)
+        .await
+        .expect("claim after retry delay")
+        .expect("transfer becomes due after its delay");
+    assert_ne!(lease.lease_token, retry.lease_token);
+    assert_eq!(retry.transfer.execution_attempt_count, 2);
+    assert_eq!(
+        retry.transfer.provider_idempotency_key, transfer.provider_idempotency_key,
+        "a retry keeps the same provider operation identity"
+    );
+    assert!(
+        !finish_execution_lease(&pool, &transfer.transfer_id, &lease.lease_token)
+            .await
+            .expect("stale worker cannot clear the new lease")
+    );
+    assert!(
+        finish_execution_lease(&pool, &transfer.transfer_id, &retry.lease_token)
+            .await
+            .expect("current worker clears its own lease")
+    );
+
     let sponsored_request = SponsoredSeatRequest {
         action: SponsoredSeatAction::Add,
         beneficiary_id: user.clone(),
@@ -373,15 +428,36 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     )
     .await
     .expect("record destination preparation");
-    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
-        .await
-        .expect("record destination payment");
     begin_source_adjustment(&mut tx, &transfer.transfer_id, "source-operation")
         .await
         .expect("begin source adjustment");
     complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
         .await
-        .expect("complete source adjustment");
+        .expect("record verified source schedule while destination invoice is pending");
+    let awaiting_invoice: String =
+        sqlx::query_scalar("SELECT state FROM billing_transfer_intents WHERE transfer_id = $1")
+            .bind(&transfer.transfer_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read pending transfer state");
+    assert_eq!(
+        awaiting_invoice,
+        TransferState::SourceAdjustmentPending.as_str()
+    );
+    let payer_before_invoice: (String, String) = sqlx::query_as(
+        "SELECT payer_kind, payer_id FROM billing_founding_awards WHERE award_id = $1",
+    )
+    .bind(&award)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("founding payer stays unchanged before paid invoice");
+    assert_eq!(payer_before_invoice, ("personal".into(), user.clone()));
+    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
+        .await
+        .expect("record destination payment after source scheduling");
+    complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
+        .await
+        .expect("complete local handover after both provider facts are verified");
     tx.commit().await.expect("commit transfer completion");
 
     let state: String =
@@ -659,6 +735,7 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         beneficiary_id: beneficiary.clone(),
         source_kind: TransferPayer::Sponsor,
         source_organization_id: Some(org),
+        source_provider_subscription_id: format!("sub_transfer_source_{fixture}"),
         destination_kind: TransferPayer::Personal,
         destination_organization_id: None,
         offer: BillingOffer::StandardMonthly,
