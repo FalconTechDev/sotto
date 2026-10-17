@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -77,12 +77,14 @@ impl ApprovalStore {
         ensure_database_file(&path)?;
         verify_private_file(&path)?;
 
-        let connection = Connection::open(&path)?;
+        let mut connection = Connection::open(&path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => {
-                connection.execute_batch(
+                transaction.execute_batch(
                     "CREATE TABLE IF NOT EXISTS approvals (
                         project_id TEXT NOT NULL CHECK (length(project_id) > 0),
                         project_root TEXT NOT NULL CHECK (length(project_root) > 0),
@@ -104,6 +106,7 @@ impl ApprovalStore {
                 ))
             }
         }
+        transaction.commit()?;
 
         Ok(Self { connection })
     }
@@ -457,36 +460,42 @@ mod tests {
 
     #[test]
     fn concurrent_cli_writers_preserve_every_approval() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().to_path_buf();
-        let workers = (0..8)
-            .map(|index| {
-                let path = path.clone();
-                std::thread::spawn(move || {
-                    ApprovalStore::open(&path)
-                        .unwrap()
-                        .approve(
-                            "project-a",
-                            "/repo/a",
-                            &format!("task-{index}"),
-                            "dev",
-                            &"d".repeat(64),
-                        )
-                        .unwrap();
+        let worker_count = 16;
+        for _ in 0..8 {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().to_path_buf();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(worker_count));
+            let workers = (0..worker_count)
+                .map(|index| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        ApprovalStore::open(&path)
+                            .unwrap()
+                            .approve(
+                                "project-a",
+                                "/repo/a",
+                                &format!("task-{index}"),
+                                "dev",
+                                &"d".repeat(64),
+                            )
+                            .unwrap();
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        for worker in workers {
-            worker.join().unwrap();
-        }
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().unwrap();
+            }
 
-        assert_eq!(
-            ApprovalStore::open(temp.path())
-                .unwrap()
-                .list("project-a", "/repo/a")
-                .unwrap()
-                .len(),
-            8
-        );
+            assert_eq!(
+                ApprovalStore::open(temp.path())
+                    .unwrap()
+                    .list("project-a", "/repo/a")
+                    .unwrap()
+                    .len(),
+                worker_count
+            );
+        }
     }
 }
