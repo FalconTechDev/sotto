@@ -346,6 +346,8 @@ enum TaskCommand {
     Approvals,
     /// Revoke approval for one task and environment.
     Revoke { name: String },
+    /// Run one locally approved task with the selected Sotto environment.
+    Run { name: String },
 }
 
 #[derive(Subcommand)]
@@ -505,6 +507,13 @@ fn run() -> Result<()> {
                     )
                 })?;
                 return revoke_task_approval(name, environment);
+            }
+            TaskCommand::Run { .. } => {
+                cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task execution".into(),
+                    )
+                })?;
             }
             TaskCommand::Validate => {}
         }
@@ -749,6 +758,16 @@ fn run() -> Result<()> {
             | TaskCommand::Revoke { .. } => {
                 unreachable!("task commands are handled before store init")
             }
+            TaskCommand::Run { name } => run_approved_task_cli(
+                &app,
+                &cwd,
+                &name,
+                cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task execution".into(),
+                    )
+                })?,
+            ),
         },
         Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
@@ -928,6 +947,40 @@ fn run() -> Result<()> {
     }
 }
 
+fn run_approved_task_cli(app: &App, cwd: &Path, task_name: &str, environment: &str) -> Result<()> {
+    let (_, discovered_root) = Config::discover(cwd)?;
+    let project_root = std::fs::canonicalize(&discovered_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let approvals = open_task_approval_store(&project_root)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Io(format!("starting task runtime: {error}")))?;
+    let (cancel, receiver) = tokio::sync::watch::channel(false);
+    let signal_sender = cancel.clone();
+    runtime.spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = signal_sender.send(true);
+        }
+    });
+    let run = sotto_cli::agent_runner::run_approved_task(
+        app,
+        &approvals,
+        cwd,
+        task_name,
+        environment,
+        receiver,
+    )?;
+    let outcome = runtime.block_on(run)?;
+    match outcome.status {
+        sotto_cli::agent_runner::TaskRunStatus::Completed => {
+            eprintln!("{}", outcome.summary());
+            Ok(())
+        }
+        _ => Err(Error::Input(outcome.summary())),
+    }
+}
+
 fn approve_task(name: &str, environment: &str) -> Result<()> {
     if !prompts::can_prompt() {
         return Err(Error::MissingArgument(
@@ -976,10 +1029,10 @@ fn approve_task(name: &str, environment: &str) -> Result<()> {
         task.working_directory(&project_root)
     );
     println!("Sotto environment: {environment:?}");
-    match task.timeout_seconds() {
-        Some(seconds) => println!("Declared execution limit: {seconds} seconds"),
-        None => println!("Declared execution limit: not set"),
-    }
+    let timeout = task
+        .timeout_seconds()
+        .unwrap_or(sotto_cli::agent_tasks::DEFAULT_TASK_TIMEOUT_SECONDS);
+    println!("Execution timeout: {timeout} seconds");
     println!(
         "Trust warning: Sotto is not a sandbox. Current project code will receive this environment's plaintext secrets and may disclose them."
     );

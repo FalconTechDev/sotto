@@ -23,6 +23,8 @@ const MAX_ARGUMENTS: usize = 128;
 const MAX_TEXT_LENGTH: usize = 4096;
 const MAX_TASK_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 256;
+pub const DEFAULT_TASK_TIMEOUT_SECONDS: u64 = 600;
+pub const MAX_TASK_TIMEOUT_SECONDS: u64 = 3600;
 
 /// A validated manifest stored at the Sotto project root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -444,6 +446,16 @@ fn validate_task(task: &TaskDeclaration, index: usize) -> Result<()> {
             "must be greater than zero when specified",
         ));
     }
+    if task
+        .timeout_seconds
+        .is_some_and(|seconds| seconds > MAX_TASK_TIMEOUT_SECONDS)
+    {
+        return Err(task_error(
+            index,
+            "timeout_seconds",
+            "must not exceed 3600 seconds",
+        ));
+    }
     Ok(())
 }
 
@@ -648,5 +660,14 @@ environments = ["dev"]
         let (root, manifest) = TaskManifest::discover(&nested).unwrap();
         assert_eq!(root, project);
         assert_eq!(manifest.tasks[0].name, "test");
+    }
+
+    #[test]
+    fn rejects_task_timeouts_above_the_execution_limit() {
+        let too_long = VALID.replace(
+            "environments = [\"dev\"]",
+            "environments = [\"dev\"]\ntimeout_seconds = 3601",
+        );
+        assert!(TaskManifest::parse(Path::new("tasks.toml"), &too_long).is_err());
     }
 }
