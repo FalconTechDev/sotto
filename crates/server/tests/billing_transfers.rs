@@ -7,12 +7,14 @@ use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
-    accept_transfer, begin_source_adjustment, begin_transfer, claim_transfer_for_execution,
-    claim_transfer_for_manual_recovery, complete_source_adjustment, complete_source_restoration,
-    finish_execution_lease, lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
-    record_destination_prepared, record_destination_schedule, record_destination_setup_completion,
-    release_execution_lease, request_source_restoration, withdraw_transfer, BeginTransfer,
-    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferState,
+    accept_transfer, begin_source_adjustment, begin_source_restoration_payment, begin_transfer,
+    claim_transfer_for_execution, claim_transfer_for_manual_recovery, complete_source_adjustment,
+    complete_source_restoration, finish_execution_lease, lock_and_check_no_live_transfer,
+    mark_failed, record_destination_paid, record_destination_prepared, record_destination_schedule,
+    record_destination_setup_completion, record_source_restoration_payment,
+    record_source_restoration_subscription, release_execution_lease, request_source_restoration,
+    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
+    TransferRequest, TransferState,
 };
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
@@ -680,6 +682,18 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     .await
     .expect("insert owner");
     sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, \
+          current_period_start, current_period_end) \
+         VALUES ($1, $2, $3, 'active', 1800000000, 1802592000)",
+    )
+    .bind(&org)
+    .bind(format!("cus_transfer_destination_{fixture}"))
+    .bind(format!("sub_transfer_destination_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("insert destination sponsor subscription at the source boundary");
+    sqlx::query(
         "INSERT INTO billing_operations
          (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id,
           offer, quote_version, quote_expires_at_epoch, provider_idempotency_key)
@@ -848,6 +862,26 @@ async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation
         .begin()
         .await
         .expect("begin provider restoration result");
+    assert!(matches!(
+        complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored").await,
+        Err(TransferError::InvalidTransition)
+    ));
+    let operation_id = format!("{transfer_id}:source-restoration");
+    begin_source_restoration_payment(&mut tx, &transfer_id, &operation_id)
+        .await
+        .expect("persist stable recovery operation");
+    record_source_restoration_subscription(&mut tx, &transfer_id, &operation_id, "sub_restored")
+        .await
+        .expect("bind replacement subscription");
+    record_source_restoration_payment(
+        &mut tx,
+        &transfer_id,
+        &operation_id,
+        "sub_restored",
+        "pi_restoration_paid",
+    )
+    .await
+    .expect("record paid recovery invoice");
     let failed = complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored")
         .await
         .expect("record verified source restoration");
@@ -859,6 +893,10 @@ async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation
     assert_eq!(
         failed.source_restoration_reference.as_deref(),
         Some("schedule_source_restored")
+    );
+    assert_eq!(
+        failed.source_restoration_payment_reference.as_deref(),
+        Some("pi_restoration_paid")
     );
     assert!(matches!(
         complete_source_restoration(&mut tx, &transfer_id, "different_restoration").await,

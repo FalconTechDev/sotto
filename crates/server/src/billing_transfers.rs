@@ -246,6 +246,9 @@ pub struct TransferIntent {
     pub destination_payment_reference: Option<String>,
     pub source_adjustment_reference: Option<String>,
     pub source_restoration_reference: Option<String>,
+    pub source_restoration_operation_id: Option<String>,
+    pub source_restoration_provider_subscription_id: Option<String>,
+    pub source_restoration_payment_reference: Option<String>,
     pub founding_award_id: Option<String>,
     pub execution_lease_token: Option<String>,
     pub execution_lease_until_epoch: Option<i64>,
@@ -874,6 +877,21 @@ pub async fn lock_and_check_no_live_transfer_except(
             .await?;
     if locked_user_ids.len() != user_ids.len() {
         return Err(TransferError::BeneficiaryMissing);
+    }
+
+    // Invoice settlement may be permitted to update one live transfer. Lock that row before
+    // billing_personal_accounts is locked by the caller, matching the worker's
+    // capacity -> beneficiary -> transfer -> billing-account order.
+    if !allowed_transfer_ids.is_empty() {
+        sqlx::query_scalar::<_, String>(
+            "SELECT transfer_id FROM billing_transfer_intents \
+             WHERE transfer_id = ANY($1) AND beneficiary_id = ANY($2) \
+             ORDER BY transfer_id FOR UPDATE",
+        )
+        .bind(allowed_transfer_ids)
+        .bind(&user_ids)
+        .fetch_all(&mut **tx)
+        .await?;
     }
 
     let active: Option<String> = sqlx::query_scalar(
@@ -1571,6 +1589,11 @@ pub async fn complete_source_restoration(
     if transfer.state != TransferState::SourceRestorationPending
         || transfer.source_adjustment_reference.is_none()
         || transfer.destination_payment_reference.is_some()
+        || transfer.source_restoration_operation_id.is_none()
+        || transfer
+            .source_restoration_provider_subscription_id
+            .is_none()
+        || transfer.source_restoration_payment_reference.is_none()
     {
         return Err(TransferError::InvalidTransition);
     }
@@ -1588,6 +1611,124 @@ pub async fn complete_source_restoration(
     )
     .bind(transfer_id)
     .bind(restoration_reference)
+    .execute(&mut **tx)
+    .await?;
+    load_transfer(tx, transfer_id).await
+}
+
+/// Persist the replacement subscription returned for an original personal payer. The stable
+/// operation id is written before provider I/O; the subscription binding is added after Stripe
+/// accepts the idempotent create request.
+pub async fn record_source_restoration_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    operation_id: &str,
+    subscription_id: &str,
+) -> Result<TransferIntent, TransferError> {
+    if operation_id.trim().is_empty() || subscription_id.trim().is_empty() {
+        return Err(TransferError::InvalidField(
+            "source_restoration_subscription",
+        ));
+    }
+    let transfer = load_transfer(tx, transfer_id).await?;
+    if transfer.state != TransferState::SourceRestorationPending {
+        return Err(TransferError::InvalidTransition);
+    }
+    if transfer
+        .source_restoration_operation_id
+        .as_deref()
+        .is_some_and(|stored| stored != operation_id)
+        || transfer
+            .source_restoration_provider_subscription_id
+            .as_deref()
+            .is_some_and(|stored| stored != subscription_id)
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET source_restoration_operation_id = $2, \
+         source_restoration_provider_subscription_id = $3, updated_at = now() \
+         WHERE transfer_id = $1 AND state = 'source_restoration_pending'",
+    )
+    .bind(transfer_id)
+    .bind(operation_id)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?;
+    load_transfer(tx, transfer_id).await
+}
+
+/// Persist the idempotent recovery operation before creating a replacement subscription.
+pub async fn begin_source_restoration_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    operation_id: &str,
+) -> Result<TransferIntent, TransferError> {
+    if operation_id.trim().is_empty() {
+        return Err(TransferError::InvalidField(
+            "source_restoration_operation_id",
+        ));
+    }
+    let transfer = load_transfer(tx, transfer_id).await?;
+    if transfer.state != TransferState::SourceRestorationPending {
+        return Err(TransferError::InvalidTransition);
+    }
+    if transfer
+        .source_restoration_operation_id
+        .as_deref()
+        .is_some_and(|stored| stored != operation_id)
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET source_restoration_operation_id = $2, \
+         updated_at = now() WHERE transfer_id = $1 AND state = 'source_restoration_pending'",
+    )
+    .bind(transfer_id)
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    load_transfer(tx, transfer_id).await
+}
+
+/// Record an authenticated, paid recovery invoice. Merely creating or activating a subscription
+/// never releases the transfer fence; the worker must still read the replacement back from Stripe.
+pub async fn record_source_restoration_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    operation_id: &str,
+    subscription_id: &str,
+    payment_reference: &str,
+) -> Result<TransferIntent, TransferError> {
+    if operation_id.trim().is_empty()
+        || subscription_id.trim().is_empty()
+        || payment_reference.trim().is_empty()
+    {
+        return Err(TransferError::InvalidField("source_restoration_payment"));
+    }
+    let transfer = load_transfer(tx, transfer_id).await?;
+    if transfer.state != TransferState::SourceRestorationPending
+        || transfer.source_restoration_operation_id.as_deref() != Some(operation_id)
+        || transfer
+            .source_restoration_provider_subscription_id
+            .as_deref()
+            != Some(subscription_id)
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    if transfer
+        .source_restoration_payment_reference
+        .as_deref()
+        .is_some_and(|stored| stored != payment_reference)
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET source_restoration_payment_reference = $2, \
+         updated_at = now() WHERE transfer_id = $1 AND state = 'source_restoration_pending'",
+    )
+    .bind(transfer_id)
+    .bind(payment_reference)
     .execute(&mut **tx)
     .await?;
     load_transfer(tx, transfer_id).await
@@ -2107,6 +2248,11 @@ pub(crate) fn transfer_from_row(
         destination_payment_reference: row.try_get("destination_payment_reference")?,
         source_adjustment_reference: row.try_get("source_adjustment_reference")?,
         source_restoration_reference: row.try_get("source_restoration_reference")?,
+        source_restoration_operation_id: row.try_get("source_restoration_operation_id")?,
+        source_restoration_provider_subscription_id: row
+            .try_get("source_restoration_provider_subscription_id")?,
+        source_restoration_payment_reference: row
+            .try_get("source_restoration_payment_reference")?,
         founding_award_id: row.try_get("founding_award_id")?,
         execution_lease_token: row.try_get("execution_lease_token")?,
         execution_lease_until_epoch: row
