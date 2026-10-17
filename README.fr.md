@@ -220,6 +220,12 @@ sotto pull                   # download the ciphertext you already pushed
 
 Vous avez besoin de l'Emergency Kit imprimé par `sotto init` ; sans lui, un nouvel appareil ne peut pas déchiffrer le coffre.
 
+Si vous perdez l'Emergency Kit, `sotto reset` donne de nouvelles clés à votre compte. C'est une
+réinitialisation, pas une récupération : tout ce qui est chiffré avec les anciennes clés devient
+définitivement illisible, et les administrateurs de l'organisation doivent vous accorder à nouveau
+les environnements partagés. Si un appareil peut encore déverrouiller le coffre, exportez d'abord ce
+dont vous avez besoin.
+
 ### Environnements
 
 Utilisez `--env` pour sélectionner un environnement pour une seule commande sans modifier celui par défaut du projet :
@@ -231,19 +237,33 @@ sotto ls --env staging
 
 `--env` ne s'applique qu'à cette commande ; `sotto env use` modifie l'environnement par défaut.
 
-Listez les environnements, changez celui par défaut ou prévisualisez une copie entre environnements existants :
+Listez les environnements, changez celui par défaut, comparez-en deux ou prévisualisez une copie entre eux :
 
 ```sh
 sotto env ls                          # list environments; the active one is marked
 sotto env use staging                 # switch the project's active environment
+sotto env diff dev staging            # compare keys; values stay hidden without --reveal
 sotto env copy dev staging            # preview additions and updates without writing
 sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
 ```
 
-Sans `--confirm`, la copie est une simulation. Une copie confirmée ajoute et met à jour les secrets,
-mais laisse intactes les clés présentes uniquement dans la destination.
+`env diff` marque chaque clé avec `=` (même valeur), `!` (valeurs différentes), `<` (seulement dans
+le premier environnement) ou `>` (seulement dans le second). Sans `--confirm`, la copie est une
+simulation. Une copie confirmée ajoute et met à jour les secrets, mais laisse intactes les clés
+présentes uniquement dans la destination.
 
 ### Partager un secret
+
+`sotto share` chiffre un secret dans un lien à usage unique. La clé se trouve après le `#` du lien,
+une partie que les navigateurs n'envoient jamais à un serveur : le serveur ne détient donc que du
+texte chiffré. Créer un lien nécessite `sotto login` ; le destinataire n'a besoin d'aucun compte.
+Ouvrir le lien ne consomme pas de consultation ; révéler le secret, si.
+
+```sh
+sotto share DATABASE_URL                           # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto share DATABASE_URL --passphrase              # also require a passphrase; send it separately
+```
 
 Dans un terminal interactif, chaque limite omise ouvre son propre menu. Le menu des consultations
 propose 1, 2, 3, 5 ou 10 consultations ainsi qu'une valeur personnalisée ; le menu de durée propose
@@ -259,19 +279,56 @@ de sélection dans un terminal interactif, fournissez le nom et les deux limites
 `sotto share DATABASE_URL --views 3 --expire 3600`. Les invites de déverrouillage et de phrase
 secrète peuvent toujours s'appliquer.
 
+Un serveur peut appliquer des limites plus strictes à certains comptes. Lorsqu'il refuse une demande,
+la CLI affiche la raison donnée par le serveur et ne crée aucun lien.
+
 Utilisez `sotto share --no-copy` pour désactiver la copie interactive, ou `--copy` pour la demander explicitement.
 Ces options contrôlent uniquement le presse-papiers ; `--no-copy` n'ignore pas les menus de limites du partage.
 
+Un lien cesse de fonctionner lorsque ses consultations sont épuisées, lorsqu'il expire ou lorsque
+vous le révoquez. La révocation empêche le serveur de continuer à fournir le texte chiffré, mais ne
+l'efface pas du serveur :
+
+```sh
+sotto shares ls              # your 100 most recent links: views used, expiry, revocation
+sotto shares ls --json
+sotto shares revoke <token>  # the token is the part of the link between /s/ and #
+```
+
+`sotto shares ls` n'affiche jamais le texte chiffré ni la clé du lien.
+
 ### Travailler en équipe
+
+Les équipes partagent des environnements au sein d'une organisation. Chaque membre reçoit sa propre
+copie scellée de la clé d'un environnement (un grant), et le serveur vérifie les rôles et les grants
+à chaque requête sans pouvoir rien lire.
 
 ```sh
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
-sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
-sotto org plan <org-id>                    # tier, trial, and limits for this organisation
-sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
-sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
+sotto push                                 # create it on the server before sharing
+sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prints their user id
+sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
+
+Le membre exécute la commande affichée dans sa propre copie du projet :
+
+```sh
+sotto clone <project-id> <env-id> --org <org-id>
+```
+
+Pour voir qui a accès, retirer quelqu'un ou faire tourner vous-même la clé d'un environnement :
+
+```sh
+sotto org members <org-id>                 # members, roles and user ids
+sotto org remove <org-id> <user-id>        # remove a member and rotate every environment they held
+sotto rotate                               # rotate the active environment's key
+```
+
+Retirer un membre fait tourner la clé de chaque environnement auquel il avait accès et révoque les
+tokens machine qu'il a créés dans l'organisation, en les nommant pour que vous puissiez les recréer.
+La rotation protège ce qui est écrit ensuite. Les valeurs que le membre a déjà vues restent exposées :
+changez-les à leur source.
 
 #### Forfait de l'organisation
 
@@ -326,6 +383,11 @@ toujours avoir le rôle de propriétaire ou d’administrateur. S’il n’y a a
 n’affiche aucune ligne et se termine avec succès.
 
 ### Tokens machine et CI
+
+Un token machine permet à la CI ou à un service de lire un environnement sans mot de passe ni
+Emergency Kit. Lorsque `SOTTO_TOKEN` est défini, `sotto run` et `sotto export` récupèrent et
+déchiffrent cet environnement à chaque exécution ; définissez aussi `SOTTO_SERVER`, comme le montre
+l'exemple [GitHub Actions](#github-actions).
 
 Les tokens machine expirent. Un nouveau token dure 90 jours, sauf si vous passez
 `--expires-in-days` avec une valeur de 1 à 365 ; `sotto token ls` indique quand chacun expire.
@@ -502,6 +564,21 @@ border = "#331144"
 Enregistré sous `synth.toml`, ce fichier ajoute un thème `synth`. Appliquez-le avec
 `sotto theme set synth`, ou pour une seule commande avec `sotto --theme synth <command>`.
 
+### Variables d'environnement
+
+La CLI lit ces variables :
+
+- `SOTTO_SERVER` : l'URL du serveur, qui remplace celle enregistrée par `sotto login`. Avec
+  `SOTTO_TOKEN`, elle est obligatoire sauf si `sotto login` a enregistré un serveur sur cette machine.
+- `SOTTO_TOKEN` : un token machine. `sotto run` et `sotto export` lisent alors l'environnement du
+  token au lieu du coffre local.
+- `SOTTO_PASSWORD` : le mot de passe principal, pour les scripts qui ne peuvent pas répondre à une
+  invite. Préférez l'invite masquée lorsque c'est possible.
+- `SOTTO_SECRET_KEY` : la Secret Key de votre Emergency Kit, pour lancer `sotto setup` sans invite.
+- `SOTTO_DATA_DIR` : déplace le répertoire de données local, qui contient le magasin chiffré, les
+  réglages enregistrés (comme le serveur) et les thèmes personnalisés.
+- `SOTTO_THEME` et `NO_COLOR` : le style de la sortie ; voir [Thèmes de sortie](#thèmes-de-sortie).
+
 ## Auto-hébergement
 
 Une seule commande démarre un déploiement complet : Postgres, le serveur et Caddy avec HTTPS
@@ -671,6 +748,8 @@ appareils clients, et le serveur ne voit que du texte chiffré plus des métadon
 des métadonnées, la manière dont la surface web (retéléchargée à chaque visite, donc plus faible) est durcie, et comment vérifier
 les versions signées. Le modèle d'adversaire complet, les garanties et les non-objectifs explicites sont publiés dans
 [THREAT-MODEL.md](THREAT-MODEL.md). Signalez les vulnérabilités en privé selon SECURITY.md.
+
+Le périmètre et les éléments préparés pour un audit indépendant se trouvent dans [SECURITY-AUDIT-SCOPE.md](SECURITY-AUDIT-SCOPE.md).
 
 ## Contribution
 

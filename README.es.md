@@ -217,6 +217,11 @@ sotto pull                   # download the ciphertext you already pushed
 
 Necesitas el Emergency Kit que imprime `sotto init`; sin él, un dispositivo nuevo no puede descifrar la bóveda.
 
+Si pierdes el Emergency Kit, `sotto reset` da claves nuevas a tu cuenta. Es un restablecimiento, no
+una recuperación: todo lo cifrado con las claves antiguas queda ilegible para siempre, y los
+administradores de la organización deben volver a concederte los entornos compartidos. Si algún
+dispositivo todavía puede desbloquear la bóveda, exporta antes lo que necesites.
+
 ### Entornos
 
 Usa `--env` para elegir un entorno para un solo comando sin cambiar el entorno predeterminado del proyecto:
@@ -228,19 +233,32 @@ sotto ls --env staging
 
 `--env` se aplica solo a ese comando; `sotto env use` cambia el entorno predeterminado.
 
-Lista los entornos, cambia el predeterminado o previsualiza una copia entre entornos existentes:
+Lista los entornos, cambia el predeterminado, compara dos o previsualiza una copia entre ellos:
 
 ```sh
 sotto env ls                          # list environments; the active one is marked
 sotto env use staging                 # switch the project's active environment
+sotto env diff dev staging            # compare keys; values stay hidden without --reveal
 sotto env copy dev staging            # preview additions and updates without writing
 sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
 ```
 
-Sin `--confirm`, la copia es una simulación. Una copia confirmada añade y actualiza secretos,
-pero deja intactas las claves que solo existen en el destino.
+`env diff` marca cada clave con `=` (mismo valor), `!` (valores distintos), `<` (solo en el primer
+entorno) o `>` (solo en el segundo). Sin `--confirm`, la copia es una simulación. Una copia confirmada
+añade y actualiza secretos, pero deja intactas las claves que solo existen en el destino.
 
 ### Compartir un secreto
+
+`sotto share` cifra un secreto en un enlace de un solo uso. La clave va después del `#` del enlace,
+una parte que los navegadores nunca envían a un servidor, así que el servidor solo guarda texto
+cifrado. Crear un enlace requiere `sotto login`; quien lo recibe no necesita cuenta. Abrir el enlace
+no consume una visualización; revelar el secreto sí.
+
+```sh
+sotto share DATABASE_URL                           # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto share DATABASE_URL --passphrase              # also require a passphrase; send it separately
+```
 
 En un terminal interactivo, cada límite omitido abre su propio menú. El menú de visualizaciones
 ofrece 1, 2, 3, 5 o 10 visualizaciones y un valor personalizado; el menú de duración ofrece sin
@@ -256,19 +274,55 @@ menús de selección en un terminal interactivo, proporciona el nombre y ambos l
 `sotto share DATABASE_URL --views 3 --expire 3600`. Es posible que todavía se soliciten el
 desbloqueo y la frase de contraseña.
 
+Un servidor puede aplicar límites más estrictos a algunas cuentas. Cuando rechaza una solicitud, la
+CLI muestra el motivo que da el servidor y no crea ningún enlace.
+
 Usa `sotto share --no-copy` para desactivar la copia interactiva, o `--copy` para solicitarla explícitamente.
 Estas opciones solo controlan el portapapeles; `--no-copy` no omite los menús de límites del enlace.
 
+Un enlace deja de funcionar cuando se agotan sus visualizaciones, cuando caduca o cuando lo revocas.
+Revocarlo impide que el servidor siga entregando el texto cifrado, pero no lo borra del servidor:
+
+```sh
+sotto shares ls              # your 100 most recent links: views used, expiry, revocation
+sotto shares ls --json
+sotto shares revoke <token>  # the token is the part of the link between /s/ and #
+```
+
+`sotto shares ls` nunca muestra el texto cifrado ni la clave del enlace.
+
 ### Trabajo en equipo
+
+Los equipos comparten entornos mediante una organización. Cada miembro recibe su propia copia
+sellada de la clave de un entorno (una concesión), y el servidor comprueba roles y concesiones en
+cada solicitud sin poder leer nada.
 
 ```sh
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
-sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
-sotto org plan <org-id>                    # tier, trial, and limits for this organisation
-sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
-sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
+sotto push                                 # create it on the server before sharing
+sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prints their user id
+sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
+
+El miembro ejecuta el comando impreso en su propia copia del proyecto:
+
+```sh
+sotto clone <project-id> <env-id> --org <org-id>
+```
+
+Para ver quién tiene acceso, eliminar a alguien o rotar tú mismo la clave de un entorno:
+
+```sh
+sotto org members <org-id>                 # members, roles and user ids
+sotto org remove <org-id> <user-id>        # remove a member and rotate every environment they held
+sotto rotate                               # rotate the active environment's key
+```
+
+Eliminar a un miembro rota la clave de todos los entornos a los que tenía acceso y revoca los tokens
+de máquina que creó en la organización, nombrando cada uno para que puedas volver a crearlo. La
+rotación protege lo que se escriba después. Los valores que el miembro ya vio siguen expuestos, así
+que cámbialos en su origen.
 
 #### Plan de la organización
 
@@ -322,6 +376,10 @@ ejecute el comando debe conservar el rol de propietario o administrador. Si no h
 comando no muestra filas y termina correctamente.
 
 ### Tokens de máquina y CI
+
+Un token de máquina permite que la CI o un servicio lean un entorno sin contraseña ni Emergency Kit.
+Con `SOTTO_TOKEN` definido, `sotto run` y `sotto export` obtienen y descifran ese entorno en cada
+ejecución; define también `SOTTO_SERVER`, como muestra el ejemplo de [GitHub Actions](#github-actions).
 
 Los tokens de máquina caducan. Uno nuevo dura 90 días, salvo que indiques `--expires-in-days` con
 un valor de 1 a 365; `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
@@ -498,6 +556,21 @@ border = "#331144"
 Guardado como `synth.toml`, ese archivo añade un tema `synth`. Aplícalo con
 `sotto theme set synth`, o para un solo comando con `sotto --theme synth <command>`.
 
+### Variables de entorno
+
+La CLI lee estas variables:
+
+- `SOTTO_SERVER`: la URL del servidor, que sustituye a la guardada por `sotto login`. Con
+  `SOTTO_TOKEN` es obligatoria salvo que `sotto login` haya guardado un servidor en esa máquina.
+- `SOTTO_TOKEN`: un token de máquina. `sotto run` y `sotto export` leen entonces el entorno del token
+  en lugar de la bóveda local.
+- `SOTTO_PASSWORD`: la contraseña maestra, para scripts que no pueden responder a una solicitud.
+  Siempre que puedas, usa la solicitud oculta.
+- `SOTTO_SECRET_KEY`: la Secret Key de tu Emergency Kit, para ejecutar `sotto setup` sin solicitud.
+- `SOTTO_DATA_DIR`: mueve el directorio de datos local, que contiene el almacén cifrado, los ajustes
+  guardados (como el servidor) y los temas personalizados.
+- `SOTTO_THEME` y `NO_COLOR`: el estilo de la salida; consulta [Temas de salida](#temas-de-salida).
+
 ## Autoalojamiento
 
 Un solo comando levanta un despliegue completo: Postgres, el servidor y Caddy con HTTPS
@@ -667,6 +740,8 @@ auditado de forma independiente**: consulta [SECURITY.md](SECURITY.md) para el m
 cómo se refuerza la superficie web (que se vuelve a descargar en cada visita y es, por tanto, más débil) y cómo verificar las
 versiones firmadas. El modelo de adversario completo, las garantías y los no objetivos explícitos están publicados en
 [THREAT-MODEL.md](THREAT-MODEL.md). Reporta vulnerabilidades en privado según SECURITY.md.
+
+El alcance y las pruebas preparados para una auditoría independiente están en [SECURITY-AUDIT-SCOPE.md](SECURITY-AUDIT-SCOPE.md).
 
 ## Contribución
 

@@ -213,6 +213,11 @@ sotto pull                   # download the ciphertext you already pushed
 
 You need the Emergency Kit printed by `sotto init`; without it, a new device cannot decrypt the vault.
 
+If you lose the Emergency Kit, `sotto reset` gives your account fresh keys. It is a reset, not a
+recovery: everything encrypted under the old keys becomes permanently unreadable, and organisation
+admins must grant your shared environments again. If a device can still unlock the vault, export
+what you need from it first.
+
 ### Environments
 
 Use `--env` to select an environment for one command without changing the project's default:
@@ -224,19 +229,32 @@ sotto ls --env staging
 
 `--env` lasts for that command only; `sotto env use` changes the default.
 
-List environments, switch the default, or preview a copy between existing environments:
+List environments, switch the default, compare two, or preview a copy between them:
 
 ```sh
 sotto env ls                          # list environments; the active one is marked
 sotto env use staging                 # switch the project's active environment
+sotto env diff dev staging            # compare keys; values stay hidden without --reveal
 sotto env copy dev staging            # preview additions and updates without writing
 sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
 ```
 
-Without `--confirm`, copying is a dry-run. A confirmed copy adds and updates secrets but
-leaves keys that exist only in the destination untouched.
+`env diff` marks each key `=` (same value), `!` (different values), `<` (only in the first
+environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
+copy adds and updates secrets but leaves keys that exist only in the destination untouched.
 
 ### Share a secret
+
+`sotto share` encrypts one secret into a one-time link. The key sits after the `#` in the link,
+which browsers never send to a server, so the server only ever holds ciphertext. Creating a link
+needs `sotto login`; the recipient needs no account. Opening the link does not use a view, and
+revealing the secret does.
+
+```sh
+sotto share DATABASE_URL                           # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto share DATABASE_URL --passphrase              # also require a passphrase; send it separately
+```
 
 In an interactive terminal, each omitted share limit opens its own menu. The view menu offers
 1, 2, 3, 5 or 10 views and a custom value; the lifetime menu offers no expiry, 1 hour, 1 day,
@@ -250,19 +268,55 @@ its existing default applies: one view and no expiry. To bypass all three select
 interactive terminal, supply the name and both limits, for example
 `sotto share DATABASE_URL --views 3 --expire 3600`. Unlock and passphrase prompts may still apply.
 
+A server can apply tighter limits to some accounts. When it refuses a request, the CLI prints the
+server's reason and creates no link.
+
 Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
 These flags control the clipboard only; `--no-copy` does not skip the share limit menus.
 
+A link stops working when its views run out, when it expires, or when you revoke it. Revoking stops
+the server handing out the ciphertext; it does not erase it from the server:
+
+```sh
+sotto shares ls              # your 100 most recent links: views used, expiry, revocation
+sotto shares ls --json
+sotto shares revoke <token>  # the token is the part of the link between /s/ and #
+```
+
+`sotto shares ls` never shows the ciphertext or the key in the link.
+
 ### Work with a team
+
+Teams share environments through an organisation. Each member receives their own sealed copy of an
+environment's key (a grant), and the server checks roles and grants on every request without being
+able to read anything.
 
 ```sh
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
-sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
-sotto org plan <org-id>                    # tier, trial, and limits for this organisation
-sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
-sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
+sotto push                                 # create it on the server before sharing
+sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prints their user id
+sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
+
+The member runs the printed command in their own checkout:
+
+```sh
+sotto clone <project-id> <env-id> --org <org-id>
+```
+
+To see who has access, remove someone, or rotate an environment's key yourself:
+
+```sh
+sotto org members <org-id>                 # members, roles and user ids
+sotto org remove <org-id> <user-id>        # remove a member and rotate every environment they held
+sotto rotate                               # rotate the active environment's key
+```
+
+Removing a member rotates the key of every environment they could access and revokes the machine
+tokens they created in the organisation, naming each so you can recreate it. Rotation protects what
+is written afterwards. Values the member has already seen stay exposed, so change them at their
+source.
 
 #### Organisation plan
 
@@ -313,6 +367,10 @@ Self-hosted deployments skip this plan gate, but the caller still needs the owne
 events are available, the command prints no rows and exits successfully.
 
 ### Machine tokens and CI
+
+A machine token lets CI or a service read one environment without a password or Emergency Kit.
+With `SOTTO_TOKEN` set, `sotto run` and `sotto export` fetch and decrypt that environment on each
+run; set `SOTTO_SERVER` too, as the [GitHub Actions](#github-actions) example shows.
 
 Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-days` with anything
 from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
@@ -484,6 +542,21 @@ border = "#331144"
 Saved as `synth.toml`, that file adds a `synth` theme. Apply it with `sotto theme set synth`,
 or for one command with `sotto --theme synth <command>`.
 
+### Environment variables
+
+The CLI reads these variables:
+
+- `SOTTO_SERVER`: the server URL, overriding the one saved by `sotto login`. With `SOTTO_TOKEN`,
+  it is required unless `sotto login` saved a server on that machine.
+- `SOTTO_TOKEN`: a machine token. `sotto run` and `sotto export` then read the token's environment
+  instead of the local vault.
+- `SOTTO_PASSWORD`: the master password, for scripts that cannot answer a prompt. Prefer the hidden
+  prompt where you can.
+- `SOTTO_SECRET_KEY`: the Secret Key from your Emergency Kit, for `sotto setup` without a prompt.
+- `SOTTO_DATA_DIR`: moves the local data directory, which holds the encrypted store, saved settings
+  such as the server, and custom themes.
+- `SOTTO_THEME` and `NO_COLOR`: output styling; see [Output themes](#output-themes).
+
 ## Self-hosting
 
 One command brings up a complete deployment - Postgres, the server, and Caddy with automatic
@@ -652,6 +725,8 @@ yet independently audited** - see [SECURITY.md](SECURITY.md) for the model, the 
 exposure, how the (re-fetched, weaker) web surface is hardened, and how to verify signed releases.
 The full adversary model, guarantees, and explicit non-goals are published in
 [THREAT-MODEL.md](THREAT-MODEL.md). Report vulnerabilities privately per SECURITY.md.
+
+The scope and evidence prepared for an independent audit are in [SECURITY-AUDIT-SCOPE.md](SECURITY-AUDIT-SCOPE.md).
 
 ## Contributing
 

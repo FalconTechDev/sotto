@@ -216,6 +216,11 @@ sotto pull                   # download the ciphertext you already pushed
 
 Você precisa do Emergency Kit exibido por `sotto init`; sem ele, um novo dispositivo não consegue descriptografar o cofre.
 
+Se você perder o Emergency Kit, `sotto reset` dá chaves novas à sua conta. É uma redefinição, não
+uma recuperação: tudo o que foi criptografado com as chaves antigas fica ilegível para sempre, e os
+administradores da organização precisam conceder de novo os ambientes compartilhados. Se algum
+dispositivo ainda consegue desbloquear o cofre, exporte antes o que você precisa.
+
 ### Ambientes
 
 Use `--env` para selecionar um ambiente para um único comando sem alterar o padrão do projeto:
@@ -227,19 +232,32 @@ sotto ls --env staging
 
 `--env` vale apenas para esse comando; `sotto env use` altera o ambiente padrão.
 
-Liste os ambientes, altere o padrão ou visualize uma cópia entre ambientes existentes:
+Liste os ambientes, altere o padrão, compare dois ou visualize uma cópia entre eles:
 
 ```sh
 sotto env ls                          # list environments; the active one is marked
 sotto env use staging                 # switch the project's active environment
+sotto env diff dev staging            # compare keys; values stay hidden without --reveal
 sotto env copy dev staging            # preview additions and updates without writing
 sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
 ```
 
-Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada adiciona e atualiza segredos,
-mas mantém intactas as chaves que existem apenas no destino.
+`env diff` marca cada chave com `=` (mesmo valor), `!` (valores diferentes), `<` (só no primeiro
+ambiente) ou `>` (só no segundo). Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada
+adiciona e atualiza segredos, mas mantém intactas as chaves que existem apenas no destino.
 
 ### Compartilhar um segredo
+
+`sotto share` criptografa um segredo em um link de uso único. A chave fica depois do `#` no link,
+uma parte que os navegadores nunca enviam a um servidor, então o servidor só guarda texto cifrado.
+Criar um link exige `sotto login`; quem recebe não precisa de conta. Abrir o link não consome uma
+visualização; revelar o segredo, sim.
+
+```sh
+sotto share DATABASE_URL                           # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto share DATABASE_URL --passphrase              # also require a passphrase; send it separately
+```
 
 Em um terminal interativo, cada limite omitido abre seu próprio menu. O menu de visualizações
 oferece 1, 2, 3, 5 ou 10 visualizações e um valor personalizado; o menu de duração oferece sem
@@ -255,19 +273,55 @@ em um terminal interativo, forneça o nome e ambos os limites, por exemplo
 `sotto share DATABASE_URL --views 3 --expire 3600`. As solicitações de desbloqueio e frase secreta
 ainda podem ser exibidas.
 
+Um servidor pode aplicar limites mais rígidos a algumas contas. Quando ele recusa uma solicitação, a
+CLI mostra o motivo informado pelo servidor e não cria nenhum link.
+
 Use `sotto share --no-copy` para desativar a cópia interativa, ou `--copy` para solicitá-la explicitamente.
 Essas opções controlam apenas a área de transferência; `--no-copy` não ignora os menus de limites do compartilhamento.
 
+Um link deixa de funcionar quando suas visualizações acabam, quando expira ou quando você o revoga.
+Revogar impede que o servidor continue entregando o texto cifrado, mas não o apaga do servidor:
+
+```sh
+sotto shares ls              # your 100 most recent links: views used, expiry, revocation
+sotto shares ls --json
+sotto shares revoke <token>  # the token is the part of the link between /s/ and #
+```
+
+`sotto shares ls` nunca mostra o texto cifrado nem a chave do link.
+
 ### Trabalhar em equipe
+
+Equipes compartilham ambientes por meio de uma organização. Cada membro recebe sua própria cópia
+selada da chave de um ambiente (uma concessão), e o servidor verifica papéis e concessões em cada
+solicitação sem conseguir ler nada.
 
 ```sh
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
-sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
-sotto org plan <org-id>                    # tier, trial, and limits for this organisation
-sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
-sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
+sotto push                                 # create it on the server before sharing
+sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prints their user id
+sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
+
+O membro executa o comando exibido na própria cópia do projeto:
+
+```sh
+sotto clone <project-id> <env-id> --org <org-id>
+```
+
+Para ver quem tem acesso, remover alguém ou rotacionar você mesmo a chave de um ambiente:
+
+```sh
+sotto org members <org-id>                 # members, roles and user ids
+sotto org remove <org-id> <user-id>        # remove a member and rotate every environment they held
+sotto rotate                               # rotate the active environment's key
+```
+
+Remover um membro rotaciona a chave de todos os ambientes a que ele tinha acesso e revoga os tokens
+de máquina que ele criou na organização, citando cada um para que você possa recriá-lo. A rotação
+protege o que for escrito depois. Valores que o membro já viu continuam expostos, então troque-os na
+origem.
 
 #### Plano da organização
 
@@ -321,6 +375,10 @@ ainda precisa ter o papel de proprietário ou administrador. Se não houver even
 imprime linhas e termina com sucesso.
 
 ### Tokens de máquina e CI
+
+Um token de máquina permite que a CI ou um serviço leia um ambiente sem senha nem Emergency Kit.
+Com `SOTTO_TOKEN` definido, `sotto run` e `sotto export` buscam e descriptografam esse ambiente a
+cada execução; defina também `SOTTO_SERVER`, como mostra o exemplo de [GitHub Actions](#github-actions).
 
 Tokens de máquina expiram. Um token novo dura 90 dias, a menos que você passe
 `--expires-in-days` com um valor de 1 a 365; `sotto token ls` mostra quando cada um termina.
@@ -494,6 +552,21 @@ border = "#331144"
 Salvo como `synth.toml`, esse arquivo adiciona um tema `synth`. Aplique-o com
 `sotto theme set synth`, ou para um único comando com `sotto --theme synth <command>`.
 
+### Variáveis de ambiente
+
+A CLI lê estas variáveis:
+
+- `SOTTO_SERVER`: a URL do servidor, que substitui a salva por `sotto login`. Com `SOTTO_TOKEN`, é
+  obrigatória, a menos que `sotto login` tenha salvo um servidor nessa máquina.
+- `SOTTO_TOKEN`: um token de máquina. `sotto run` e `sotto export` passam a ler o ambiente do token
+  em vez do cofre local.
+- `SOTTO_PASSWORD`: a senha mestra, para scripts que não conseguem responder a uma solicitação.
+  Sempre que puder, prefira a solicitação oculta.
+- `SOTTO_SECRET_KEY`: a Secret Key do seu Emergency Kit, para rodar `sotto setup` sem solicitação.
+- `SOTTO_DATA_DIR`: muda o diretório de dados local, que guarda o armazenamento criptografado, as
+  configurações salvas (como o servidor) e os temas personalizados.
+- `SOTTO_THEME` e `NO_COLOR`: o estilo da saída; consulte [Temas de saída](#temas-de-saída).
+
 ## Auto-hospedagem
 
 Um comando sobe uma implantação completa: Postgres, servidor e Caddy com HTTPS automático, a partir de
@@ -660,6 +733,8 @@ auditado de forma independente**: consulte [SECURITY.md](SECURITY.md) para o mod
 superfície web (baixada de novo a cada visita e, por isso, mais fraca) é reforçada e como verificar releases assinadas. O
 modelo completo de adversários, garantias e não objetivos explícitos está publicado em [THREAT-MODEL.md](THREAT-MODEL.md).
 Relate vulnerabilidades em privado conforme SECURITY.md.
+
+O escopo e as evidências preparados para uma auditoria independente estão em [SECURITY-AUDIT-SCOPE.md](SECURITY-AUDIT-SCOPE.md).
 
 ## Contribuindo
 
