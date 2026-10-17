@@ -8,10 +8,11 @@ use uuid::Uuid;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_transfer, claim_transfer_for_execution,
-    claim_transfer_for_manual_recovery, complete_source_adjustment, finish_execution_lease,
-    lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
-    record_destination_prepared, release_execution_lease, withdraw_transfer, BeginTransfer,
-    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferState,
+    claim_transfer_for_manual_recovery, complete_source_adjustment, complete_source_restoration,
+    finish_execution_lease, lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
+    record_destination_prepared, release_execution_lease, request_source_restoration,
+    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
+    TransferRequest, TransferState,
 };
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
@@ -691,6 +692,118 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     ));
     tx.rollback().await.expect("rollback unauthorised transfer");
 
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().to_string();
+    let user = format!("transfer-test-{fixture}-user");
+    let org = format!("transfer-test-{fixture}-org");
+    let transfer_id = format!("transfer:test-{fixture}");
+    cleanup(&pool, &fixture).await;
+
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'transfer-test', $1)",
+    )
+    .bind(&user)
+    .execute(&pool)
+    .await
+    .expect("insert beneficiary");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)",
+    )
+    .bind(&org)
+    .bind(&user)
+    .execute(&pool)
+    .await
+    .expect("insert destination organisation");
+    sqlx::query(
+        "INSERT INTO billing_transfer_intents \
+         (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+          destination_kind, destination_organization_id, offer, quote_version, \
+          quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+          provider_idempotency_key, source_provider_subscription_id, \
+          destination_provider_subscription_id, destination_operation_id, source_operation_id, \
+          source_adjustment_reference, state) \
+         VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
+                 2000000000, 2000000100, $1, $1, $1, 'sub_source', 'sub_destination', \
+                 'op_destination', 'op_source', 'schedule_source', 'source_adjustment_pending')",
+    )
+    .bind(&transfer_id)
+    .bind(&user)
+    .bind(&org)
+    .execute(&pool)
+    .await
+    .expect("insert transfer after source schedule adjustment");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin source restoration request");
+    let restoration =
+        request_source_restoration(&mut tx, &transfer_id, "destination_initial_payment_failed")
+            .await
+            .expect("begin compensating source restoration");
+    assert_eq!(restoration.state, TransferState::SourceRestorationPending);
+    assert_eq!(
+        request_source_restoration(&mut tx, &transfer_id, "destination_initial_payment_failed")
+            .await
+            .expect("repeat restoration request is idempotent")
+            .state,
+        TransferState::SourceRestorationPending
+    );
+    tx.commit()
+        .await
+        .expect("persist restoration pending state");
+
+    let mut tx = pool.begin().await.expect("begin fenced billing mutation");
+    assert!(matches!(
+        lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_001).await,
+        Err(TransferError::AlreadyInProgress)
+    ));
+    tx.rollback().await.expect("rollback fenced mutation");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin provider restoration result");
+    let failed = complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored")
+        .await
+        .expect("record verified source restoration");
+    assert_eq!(failed.state, TransferState::Failed);
+    assert_eq!(
+        failed.result_code.as_deref(),
+        Some("destination_initial_payment_failed")
+    );
+    assert_eq!(
+        failed.source_restoration_reference.as_deref(),
+        Some("schedule_source_restored")
+    );
+    assert!(matches!(
+        complete_source_restoration(&mut tx, &transfer_id, "different_restoration").await,
+        Err(TransferError::ResultConflict)
+    ));
+    assert_eq!(
+        complete_source_restoration(&mut tx, &transfer_id, "schedule_source_restored")
+            .await
+            .expect("repeat restoration confirmation is idempotent")
+            .state,
+        TransferState::Failed
+    );
+    tx.commit().await.expect("persist failed transfer");
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin mutation after restoration");
+    lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_001)
+        .await
+        .expect("verified restoration releases the beneficiary fence");
+    tx.rollback().await.expect("finish mutation check");
     cleanup(&pool, &fixture).await;
 }
 

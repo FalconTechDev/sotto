@@ -579,6 +579,7 @@ mod tests {
             source_provider_subscription_id: None,
             destination_payment_reference: None,
             source_adjustment_reference: None,
+            source_restoration_reference: None,
             founding_award_id: None,
             execution_lease_token: None,
             execution_lease_until_epoch: None,

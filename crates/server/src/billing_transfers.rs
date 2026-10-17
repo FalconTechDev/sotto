@@ -64,6 +64,7 @@ pub enum TransferState {
     DestinationPrepared,
     DestinationPaid,
     SourceAdjustmentPending,
+    SourceRestorationPending,
     Completed,
     Failed,
     Unknown,
@@ -77,6 +78,7 @@ impl TransferState {
             Self::DestinationPrepared => "destination_prepared",
             Self::DestinationPaid => "destination_paid",
             Self::SourceAdjustmentPending => "source_adjustment_pending",
+            Self::SourceRestorationPending => "source_restoration_pending",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Unknown => "unknown",
@@ -90,6 +92,7 @@ impl TransferState {
             "destination_prepared" => Ok(Self::DestinationPrepared),
             "destination_paid" => Ok(Self::DestinationPaid),
             "source_adjustment_pending" => Ok(Self::SourceAdjustmentPending),
+            "source_restoration_pending" => Ok(Self::SourceRestorationPending),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "unknown" => Ok(Self::Unknown),
@@ -106,6 +109,7 @@ impl TransferState {
                 | Self::DestinationPrepared
                 | Self::DestinationPaid
                 | Self::SourceAdjustmentPending
+                | Self::SourceRestorationPending
                 | Self::Unknown
         )
     }
@@ -241,6 +245,7 @@ pub struct TransferIntent {
     pub source_provider_subscription_id: Option<String>,
     pub destination_payment_reference: Option<String>,
     pub source_adjustment_reference: Option<String>,
+    pub source_restoration_reference: Option<String>,
     pub founding_award_id: Option<String>,
     pub execution_lease_token: Option<String>,
     pub execution_lease_until_epoch: Option<i64>,
@@ -427,7 +432,7 @@ pub async fn build_transfer_request(
     let live_transfer: Option<String> = sqlx::query_scalar(
         "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
          AND (state IN ('pending','destination_prepared','destination_paid', \
-                        'source_adjustment_pending','unknown') \
+                        'source_adjustment_pending','source_restoration_pending','unknown') \
               OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
          ORDER BY transfer_id LIMIT 1 FOR UPDATE",
     )
@@ -676,7 +681,7 @@ pub async fn begin_transfer(
     request.validate_timing(now_epoch)?;
     let live: Option<String> = sqlx::query_scalar(
         "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
-         AND state IN ('awaiting_consent','pending','destination_prepared','destination_paid','source_adjustment_pending','unknown') \
+         AND state IN ('awaiting_consent','pending','destination_prepared','destination_paid','source_adjustment_pending','source_restoration_pending','unknown') \
          FOR UPDATE",
     )
     .bind(&request.beneficiary_id)
@@ -852,7 +857,7 @@ pub async fn lock_and_check_no_live_transfer(
     let active: Option<String> = sqlx::query_scalar(
         "SELECT transfer_id FROM billing_transfer_intents \
          WHERE beneficiary_id = ANY($1) AND (state IN \
-           ('pending','destination_prepared','destination_paid','source_adjustment_pending','unknown') \
+           ('pending','destination_prepared','destination_paid','source_adjustment_pending','source_restoration_pending','unknown') \
            OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
          ORDER BY beneficiary_id, transfer_id LIMIT 1 FOR UPDATE",
     )
@@ -1094,7 +1099,9 @@ pub async fn record_destination_paid(
     load_transfer(tx, transfer_id).await
 }
 
-/// Record that the source adjustment has been created after the destination payment is verified.
+/// Begin the source adjustment after the destination has been prepared. It can precede the
+/// destination's first paid invoice so the source is ready to end at the renewal boundary. If
+/// that payment then fails, the source must be restored before this transfer can become failed.
 /// The provider call itself is outside this transaction; the operation id makes a retry safe.
 pub async fn begin_source_adjustment(
     tx: &mut Transaction<'_, Postgres>,
@@ -1219,6 +1226,93 @@ pub async fn complete_source_adjustment(
     load_transfer(tx, transfer_id).await
 }
 
+/// Start compensation after the destination's first payment definitively failed, but the source
+/// schedule had already been adjusted. The transfer remains live until the caller has restored
+/// the source subscription and records that provider-verified result with
+/// `complete_source_restoration`.
+pub async fn request_source_restoration(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    failure_code: &str,
+) -> Result<TransferIntent, TransferError> {
+    if failure_code.trim().is_empty() {
+        return Err(TransferError::InvalidField("failure_code"));
+    }
+    let transfer = load_transfer(tx, transfer_id).await?;
+    if transfer.state == TransferState::SourceRestorationPending
+        && transfer.result_code.as_deref() == Some(failure_code)
+    {
+        return Ok(transfer);
+    }
+    if transfer.state == TransferState::Failed
+        && transfer.result_code.as_deref() == Some(failure_code)
+        && transfer.source_restoration_reference.is_some()
+    {
+        return Ok(transfer);
+    }
+    if transfer.state != TransferState::SourceAdjustmentPending
+        || transfer.source_adjustment_reference.is_none()
+        || transfer.destination_payment_reference.is_some()
+    {
+        return Err(TransferError::InvalidTransition);
+    }
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'source_restoration_pending', \
+         result_code = $2, updated_at = now() \
+         WHERE transfer_id = $1 AND state = 'source_adjustment_pending'",
+    )
+    .bind(transfer_id)
+    .bind(failure_code)
+    .execute(&mut **tx)
+    .await?;
+    load_transfer(tx, transfer_id).await
+}
+
+/// Record provider-read-back evidence that the source subscription no longer ends at the
+/// transfer boundary. Only then does the transfer become failed and release its live-beneficiary
+/// fence. A provider object id or stable operation receipt may be used as the reference.
+pub async fn complete_source_restoration(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    restoration_reference: &str,
+) -> Result<TransferIntent, TransferError> {
+    if restoration_reference.trim().is_empty() {
+        return Err(TransferError::InvalidField("source_restoration_reference"));
+    }
+    founding_allocator::lock_capacity(tx).await?;
+    let transfer = load_transfer(tx, transfer_id).await?;
+    if transfer.state == TransferState::Failed && transfer.source_restoration_reference.is_some() {
+        return if transfer.source_restoration_reference.as_deref() == Some(restoration_reference) {
+            Ok(transfer)
+        } else {
+            Err(TransferError::ResultConflict)
+        };
+    }
+    if transfer.state != TransferState::SourceRestorationPending
+        || transfer.source_adjustment_reference.is_none()
+        || transfer.destination_payment_reference.is_some()
+    {
+        return Err(TransferError::InvalidTransition);
+    }
+    if transfer
+        .source_restoration_reference
+        .as_deref()
+        .is_some_and(|stored| stored != restoration_reference)
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'failed', \
+         source_restoration_reference = $2, updated_at = now() \
+         WHERE transfer_id = $1 AND state = 'source_restoration_pending'",
+    )
+    .bind(transfer_id)
+    .bind(restoration_reference)
+    .execute(&mut **tx)
+    .await?;
+    load_transfer(tx, transfer_id).await
+}
+
 pub async fn mark_failed(
     tx: &mut Transaction<'_, Postgres>,
     transfer_id: &str,
@@ -1290,7 +1384,7 @@ async fn claim_due_matching(
         "WITH candidate AS (\
              SELECT transfer.transfer_id FROM billing_transfer_intents AS transfer \
              WHERE transfer.state IN ('pending','destination_prepared','destination_paid', \
-                             'source_adjustment_pending','unknown') \
+                             'source_adjustment_pending','source_restoration_pending','unknown') \
                AND (transfer.execution_next_attempt_at <= now() \
                     OR ($4 AND transfer.execution_manual_review_required)) \
                AND (transfer.execution_lease_until IS NULL OR transfer.execution_lease_until <= now()) \
@@ -1684,6 +1778,7 @@ fn transfer_from_row(row: &sqlx::postgres::PgRow) -> Result<TransferIntent, Tran
         source_provider_subscription_id: row.try_get("source_provider_subscription_id")?,
         destination_payment_reference: row.try_get("destination_payment_reference")?,
         source_adjustment_reference: row.try_get("source_adjustment_reference")?,
+        source_restoration_reference: row.try_get("source_restoration_reference")?,
         founding_award_id: row.try_get("founding_award_id")?,
         execution_lease_token: row.try_get("execution_lease_token")?,
         execution_lease_until_epoch: row
@@ -1930,6 +2025,7 @@ mod tests {
         assert!(TransferState::Pending.is_live());
         assert!(TransferState::AwaitingConsent.is_live());
         assert!(TransferState::SourceAdjustmentPending.is_live());
+        assert!(TransferState::SourceRestorationPending.is_live());
         assert!(!TransferState::Completed.is_live());
         assert!(!TransferState::Failed.is_live());
     }
