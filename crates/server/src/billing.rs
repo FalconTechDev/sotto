@@ -6148,25 +6148,7 @@ async fn prepare_sponsored_invoice_coverage(
             ));
         }
     };
-    let Some(payment_reference) = invoice.get("payment_intent").and_then(stripe_reference) else {
-        let event = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
-        return Ok(SponsoredInvoiceCoveragePreparation::Rejected {
-            context,
-            event: Box::new(event),
-            reason: "sponsored_invoice_payment_reference_missing",
-        });
-    };
-    if !settlement
-        .evidence_reference()
-        .ends_with(&format!(":payment:{payment_reference}"))
-    {
-        let event = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
-        return Ok(SponsoredInvoiceCoveragePreparation::Rejected {
-            context,
-            event: Box::new(event),
-            reason: "sponsored_invoice_payment_reference_changed",
-        });
-    }
+    let payment_reference = settlement.payment_intent_id().to_owned();
     let period_start = settlement.period_start();
     let period_end = settlement.period_end();
     let event = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
