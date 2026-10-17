@@ -109,6 +109,7 @@ enum Advance {
     WaitingForInvoice,
 }
 
+#[derive(Debug)]
 enum ExecutionError {
     Provider(ProviderError),
     Local(&'static str),
@@ -1023,53 +1024,18 @@ async fn restore_personal_source(
         .await
         .map_err(|_| ExecutionError::Local("source_operation_lookup_failed"))?
         .ok_or(ExecutionError::Local("source_operation_missing"))?;
-        let restored = if let Some(existing) = provider
-            .find_personal_source_restoration_subscription(
-                &operation_id,
-                &transfer.transfer_id,
-                &transfer.beneficiary_id,
-                customer_id,
-                payment_method_id,
-                catalogue.id_for(transfer.offer),
-                &allocation_reference,
-            )
-            .await?
-        {
-            existing
-        } else {
-            if !restoration_create_retry_is_safe(epoch_now(), created_at) {
-                return Err(ExecutionError::Local(
-                    "source_restoration_idempotency_window_elapsed",
-                ));
-            }
-            provider
-                .create_personal_source_restoration_subscription(
-                    &transfer.transfer_id,
-                    &transfer.beneficiary_id,
-                    customer_id,
-                    payment_method_id,
-                    transfer.offer,
-                    catalogue.id_for(transfer.offer),
-                    &allocation_reference,
-                    &operation_id,
-                    &format!("{}:source-restoration", transfer.provider_idempotency_key),
-                )
-                .await?
-        };
-        if restored.customer_id.as_deref() != Some(customer_id)
-            || restored.default_payment_method_id.as_deref() != Some(payment_method_id)
-            || !matches!(
-                restored.status,
-                SubscriptionStatus::Active | SubscriptionStatus::Incomplete
-            )
-            || restored.items.len() != 1
-            || restored.items[0].provider_price_id != catalogue.id_for(transfer.offer)
-            || restored.items[0].quantity != 1
-        {
-            return Err(ExecutionError::Local(
-                "source_restoration_provider_binding_invalid",
-            ));
-        }
+        let restored = resolve_personal_source_restoration_subscription(
+            provider,
+            transfer,
+            customer_id,
+            payment_method_id,
+            catalogue.id_for(transfer.offer),
+            &allocation_reference,
+            &operation_id,
+            created_at,
+            epoch_now(),
+        )
+        .await?;
         let mut tx = pool
             .begin()
             .await
@@ -1110,6 +1076,68 @@ async fn restore_personal_source(
             .map_err(|_| ExecutionError::Local("transfer_commit_failed"))?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_personal_source_restoration_subscription(
+    provider: &dyn SubscriptionProvider,
+    transfer: &TransferIntent,
+    customer_id: &str,
+    payment_method_id: &str,
+    price_id: &str,
+    allocation_reference: &str,
+    operation_id: &str,
+    operation_created_at_epoch: i64,
+    now_epoch: i64,
+) -> Result<crate::billing::SponsoredSubscriptionSnapshot, ExecutionError> {
+    let restored = if let Some(existing) = provider
+        .find_personal_source_restoration_subscription(
+            operation_id,
+            &transfer.transfer_id,
+            &transfer.beneficiary_id,
+            customer_id,
+            payment_method_id,
+            price_id,
+            allocation_reference,
+        )
+        .await?
+    {
+        existing
+    } else {
+        if !restoration_create_retry_is_safe(now_epoch, operation_created_at_epoch) {
+            return Err(ExecutionError::Local(
+                "source_restoration_idempotency_window_elapsed",
+            ));
+        }
+        provider
+            .create_personal_source_restoration_subscription(
+                &transfer.transfer_id,
+                &transfer.beneficiary_id,
+                customer_id,
+                payment_method_id,
+                transfer.offer,
+                price_id,
+                allocation_reference,
+                operation_id,
+                &format!("{}:source-restoration", transfer.provider_idempotency_key),
+            )
+            .await?
+    };
+    if restored.customer_id.as_deref() != Some(customer_id)
+        || restored.default_payment_method_id.as_deref() != Some(payment_method_id)
+        || !matches!(
+            restored.status,
+            SubscriptionStatus::Active | SubscriptionStatus::Incomplete
+        )
+        || restored.items.len() != 1
+        || restored.items[0].provider_price_id != price_id
+        || restored.items[0].quantity != 1
+    {
+        return Err(ExecutionError::Local(
+            "source_restoration_provider_binding_invalid",
+        ));
+    }
+    Ok(restored)
 }
 
 async fn seed_personal_destination(
@@ -1750,6 +1778,88 @@ fn opaque_transfer_id(transfer_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::billing::{SponsoredSubscriptionItem, SponsoredSubscriptionSnapshot};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TimeoutThenFoundProvider {
+        searches: AtomicUsize,
+        creates: AtomicUsize,
+        subscription: SponsoredSubscriptionSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl SubscriptionProvider for TimeoutThenFoundProvider {
+        async fn create_checkout(
+            &self,
+            _org_id: &str,
+            _customer: Option<&str>,
+            _success_url: &str,
+            _cancel_url: &str,
+        ) -> crate::billing::ProviderResult<String> {
+            unreachable!("transfer restoration does not create Checkout")
+        }
+
+        async fn create_portal(
+            &self,
+            _customer: &str,
+            _return_url: &str,
+            _configuration_id: Option<&str>,
+        ) -> crate::billing::ProviderResult<String> {
+            unreachable!("transfer restoration does not create a portal session")
+        }
+
+        async fn get_subscription(
+            &self,
+            _subscription_id: &str,
+        ) -> crate::billing::ProviderResult<crate::billing::SubscriptionObservation> {
+            unreachable!("transfer restoration uses the sponsored subscription reader")
+        }
+
+        async fn cancel_subscription(
+            &self,
+            _subscription_id: &str,
+            _idempotency_key: &str,
+            _org_id: &str,
+        ) -> crate::billing::ProviderResult<crate::billing::SubscriptionObservation> {
+            unreachable!("transfer restoration does not cancel a subscription")
+        }
+
+        async fn find_personal_source_restoration_subscription(
+            &self,
+            _operation_id: &str,
+            _transfer_id: &str,
+            _beneficiary_id: &str,
+            _customer_id: &str,
+            _payment_method_id: &str,
+            _price_id: &str,
+            _allocation_reference: &str,
+        ) -> crate::billing::ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+            if self.searches.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(self.subscription.clone()))
+            }
+        }
+
+        async fn create_personal_source_restoration_subscription(
+            &self,
+            _transfer_id: &str,
+            _beneficiary_id: &str,
+            _customer_id: &str,
+            _payment_method_id: &str,
+            _offer: BillingOffer,
+            _price_id: &str,
+            _allocation_reference: &str,
+            _operation_id: &str,
+            _idempotency_key: &str,
+        ) -> crate::billing::ProviderResult<SponsoredSubscriptionSnapshot> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Err(crate::billing::ProviderError {
+                status: None,
+                code: Some("transport_error".into()),
+                kind: ProviderErrorKind::Retryable,
+            })
+        }
+    }
 
     fn transfer() -> TransferIntent {
         TransferIntent {
@@ -2024,5 +2134,50 @@ mod tests {
         assert!(restoration_create_retry_is_safe(1_000 + 82_799, 1_000));
         assert!(!restoration_create_retry_is_safe(1_000 + 82_800, 1_000));
         assert!(restoration_create_retry_is_safe(900, 1_000));
+    }
+
+    #[tokio::test]
+    async fn restoration_timeout_is_recovered_by_metadata_lookup_without_second_create() {
+        let mut restored = snapshot("sub_restored");
+        restored.customer_id = Some("cus_original".into());
+        restored.default_payment_method_id = Some("pm_saved".into());
+        restored.status = SubscriptionStatus::Incomplete;
+        restored.items[0].provider_price_id = "price_standard_monthly".into();
+        let provider = TimeoutThenFoundProvider {
+            searches: AtomicUsize::new(0),
+            creates: AtomicUsize::new(0),
+            subscription: restored,
+        };
+        let transfer = transfer();
+        let first = resolve_personal_source_restoration_subscription(
+            &provider,
+            &transfer,
+            "cus_original",
+            "pm_saved",
+            "price_standard_monthly",
+            "alloc_restore",
+            "transfer:test:source-restoration",
+            1_000,
+            1_000,
+        )
+        .await;
+        assert!(matches!(first, Err(ExecutionError::Provider(_))));
+
+        let retried = resolve_personal_source_restoration_subscription(
+            &provider,
+            &transfer,
+            "cus_original",
+            "pm_saved",
+            "price_standard_monthly",
+            "alloc_restore",
+            "transfer:test:source-restoration",
+            1_000,
+            1_001,
+        )
+        .await
+        .expect("retry locates the subscription created before the timeout");
+        assert_eq!(retried.subscription_id, "sub_restored");
+        assert_eq!(provider.searches.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.creates.load(Ordering::SeqCst), 1);
     }
 }
