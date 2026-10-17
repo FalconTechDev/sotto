@@ -470,6 +470,22 @@ pub trait SubscriptionProvider: Send + Sync {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn find_personal_source_restoration_subscription(
+        &self,
+        _operation_id: &str,
+        _transfer_id: &str,
+        _beneficiary_id: &str,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _price_id: &str,
+        _allocation_reference: &str,
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        Err(ProviderError::unsupported(
+            "personal_source_restoration_subscription_lookup",
+        ))
+    }
+
     async fn create_checkout(
         &self,
         org_id: &str,
@@ -1066,6 +1082,68 @@ impl SubscriptionProvider for StripeBilling {
             return Err(ProviderError::malformed_response());
         }
         Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_personal_source_restoration_subscription(
+        &self,
+        operation_id: &str,
+        transfer_id: &str,
+        beneficiary_id: &str,
+        customer_id: &str,
+        payment_method_id: &str,
+        price_id: &str,
+        allocation_reference: &str,
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        if operation_id.trim().is_empty()
+            || transfer_id.trim().is_empty()
+            || beneficiary_id.trim().is_empty()
+            || customer_id.trim().is_empty()
+            || payment_method_id.trim().is_empty()
+            || price_id.trim().is_empty()
+            || allocation_reference.trim().is_empty()
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let query = format!("metadata['operation_id']:'{operation_id}'");
+        let response = stripe_client()
+            .get(format!(
+                "{}/v1/subscriptions/search",
+                self.api_origin.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.api_key)
+            .headers(stripe_headers(None)?)
+            .query(&[("query", query.as_str()), ("limit", "2")])
+            .send()
+            .await
+            .map_err(|_| ProviderError::transport())?;
+        let value = stripe_response(response).await?;
+        let rows = value["data"]
+            .as_array()
+            .filter(|rows| rows.len() <= 1)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let Some(object) = rows.first() else {
+            return Ok(None);
+        };
+        let subscription_id = object["id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let snapshot = sponsored_subscription_snapshot(object, subscription_id)?;
+        if snapshot.customer_id.as_deref() != Some(customer_id)
+            || snapshot.default_payment_method_id.as_deref() != Some(payment_method_id)
+            || snapshot.items.len() != 1
+            || snapshot.items[0].provider_price_id != price_id
+            || snapshot.items[0].quantity != 1
+            || object["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
+            || object["metadata"]["operation_id"].as_str() != Some(operation_id)
+            || object["metadata"]["sotto_allocation_reference"].as_str()
+                != Some(allocation_reference)
+            || object["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(Some(snapshot))
     }
 
     async fn create_checkout(
@@ -4376,7 +4454,6 @@ fn personal_transfer_schedule_form(
             allocation_reference.into(),
         ),
         ("metadata[sotto_offer]".into(), offer.as_str().into()),
-        ("phases[0][start_date]".into(), start_at_epoch.to_string()),
         (
             "phases[0][default_payment_method]".into(),
             payment_method_id.into(),
@@ -4420,7 +4497,8 @@ fn personal_source_restoration_form(
         ("items[0][price]".into(), price_id.into()),
         ("default_payment_method".into(), payment_method_id.into()),
         ("collection_method".into(), "charge_automatically".into()),
-        ("payment_behavior".into(), "default_incomplete".into()),
+        ("payment_behavior".into(), "allow_incomplete".into()),
+        ("off_session".into(), "true".into()),
         ("metadata[personal_user_id]".into(), beneficiary_id.into()),
         ("metadata[operation_id]".into(), operation_id.into()),
         (
@@ -9160,6 +9238,21 @@ mod tests {
             .expect("updated schedule lock")
             .clone();
         let value = match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/subscriptions/search") => serde_json::json!({
+                "object":"search_result", "data":[{
+                    "id":"sub_restored", "object":"subscription", "customer":"cus_original",
+                    "status":"incomplete", "default_payment_method":"pm_saved",
+                    "cancel_at_period_end":false, "cancel_at":null,
+                    "metadata":{
+                        "personal_user_id":"user_restore", "operation_id":"transfer:one:source-restoration",
+                        "sotto_allocation_reference":"alloc_restore", "sotto_transfer_id":"transfer:one"
+                    },
+                    "items":{"data":[{
+                        "id":"si_restored", "price":{"id":"price_standard_monthly"}, "quantity":1,
+                        "current_period_start":1700000000, "current_period_end":1702592000
+                    }]}
+                }]
+            }),
             ("GET", "/v1/subscriptions/sub_scheduled") => serde_json::json!({
                 "id":"sub_scheduled", "customer":"cus_test", "status":"active",
                 "cancel_at_period_end":false,
@@ -9840,6 +9933,36 @@ mod tests {
         assert_eq!(requests[1].0, "POST");
         assert!(requests[1].2.contains("cancel_at=1707776000"));
         assert_eq!(requests[2].0, "GET");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restoration_lookup_finds_only_the_metadata_bound_subscription() {
+        let (origin, requests, server) = cancellation_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            api_origin: origin,
+        };
+        let found = provider
+            .find_personal_source_restoration_subscription(
+                "transfer:one:source-restoration",
+                "transfer:one",
+                "user_restore",
+                "cus_original",
+                "pm_saved",
+                "price_standard_monthly",
+                "alloc_restore",
+            )
+            .await
+            .expect("search succeeds")
+            .expect("metadata returns the restored subscription");
+        assert_eq!(found.subscription_id, "sub_restored");
+        assert_eq!(found.status, SubscriptionStatus::Incomplete);
+        assert_eq!(
+            requests.lock().expect("request log lock")[0].1,
+            "/v1/subscriptions/search"
+        );
         server.abort();
     }
 
@@ -10763,8 +10886,9 @@ mod tests {
         );
         assert_eq!(
             fields.get("payment_behavior").map(String::as_str),
-            Some("default_incomplete")
+            Some("allow_incomplete")
         );
+        assert_eq!(fields.get("off_session").map(String::as_str), Some("true"));
         assert_eq!(
             fields
                 .get("metadata[sotto_transfer_id]")
@@ -10879,6 +11003,10 @@ mod tests {
                 .get("phases[0][proration_behavior]")
                 .map(String::as_str),
             Some("none")
+        );
+        assert!(
+            !fields.contains_key("phases[0][start_date]"),
+            "the top-level schedule start determines its first phase start"
         );
         assert!(!fields
             .keys()

@@ -22,6 +22,7 @@ use crate::{
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const INVOICE_WAIT_SECONDS: i64 = 300;
+const STRIPE_IDEMPOTENCY_SAFE_RETRY_SECONDS: i64 = 23 * 60 * 60;
 
 pub fn spawn(pool: PgPool, provider: Arc<dyn SubscriptionProvider>, catalogue: BillingPriceIds) {
     tokio::spawn(run(pool, provider, catalogue));
@@ -131,6 +132,10 @@ async fn advance(
     }
     if transfer.destination_schedule_id.is_none() {
         prepare_destination(pool, provider, catalogue, lease).await?;
+        // Minimise the interval where the destination is scheduled but the source is not yet
+        // fenced for the same renewal. The source is preflighted before destination writes and
+        // re-read immediately before its own provider update.
+        adjust_source(pool, provider, catalogue, lease).await?;
         return Ok(Advance::Advanced);
     }
     if transfer.source_adjustment_reference.is_none() {
@@ -175,6 +180,10 @@ async fn prepare_destination(
     catalogue: &BillingPriceIds,
     lease: &TransferLease,
 ) -> Result<(), ExecutionError> {
+    if epoch_now() >= lease.transfer.effective_from {
+        return Err(ExecutionError::Local("transfer_boundary_already_reached"));
+    }
+    preflight_source_adjustment(provider, &lease.transfer).await?;
     let mut tx = pool
         .begin()
         .await
@@ -347,6 +356,9 @@ async fn adjust_source(
     lease: &TransferLease,
 ) -> Result<(), ExecutionError> {
     let transfer = &lease.transfer;
+    if epoch_now() >= transfer.effective_from {
+        return Err(ExecutionError::Local("transfer_boundary_already_reached"));
+    }
     if transfer.source_kind == TransferPayer::Personal {
         let source_subscription = transfer
             .source_provider_subscription_id
@@ -456,6 +468,36 @@ async fn adjust_source(
     tx.commit()
         .await
         .map_err(|_| ExecutionError::Local("transfer_commit_failed"))
+}
+
+async fn preflight_source_adjustment(
+    provider: &dyn SubscriptionProvider,
+    transfer: &TransferIntent,
+) -> Result<(), ExecutionError> {
+    let subscription_id = transfer
+        .source_provider_subscription_id
+        .as_deref()
+        .ok_or(ExecutionError::Local("source_subscription_missing"))?;
+    let snapshot = provider.get_sponsored_subscription(subscription_id).await?;
+    match transfer.source_kind {
+        TransferPayer::Personal => {
+            if !personal_source_adjustment_preflight_matches(
+                &snapshot,
+                subscription_id,
+                transfer.effective_from,
+            ) {
+                return Err(ExecutionError::Local("source_period_changed"));
+            }
+        }
+        TransferPayer::Sponsor => {
+            let organization_id = transfer
+                .source_organization_id
+                .as_deref()
+                .ok_or(ExecutionError::Local("source_organisation_missing"))?;
+            validate_sponsor_boundary(&snapshot, transfer, organization_id, subscription_id)?;
+        }
+    }
+    Ok(())
 }
 
 async fn retire_transfer_source(
@@ -864,24 +906,40 @@ async fn restore_personal_source(
     )
     .await?;
 
-    let existing_account: Option<(String, Option<String>, String)> = sqlx::query_as(
-        "SELECT operation_id, stripe_subscription_id, state FROM billing_personal_accounts \
+    let existing_account: Option<(String, Option<String>, String, Option<String>)> =
+        sqlx::query_as(
+            "SELECT operation_id, stripe_subscription_id, state, stripe_customer_id \
+         FROM billing_personal_accounts \
          WHERE user_id = $1 FOR UPDATE",
-    )
-    .bind(&transfer.beneficiary_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|_| ExecutionError::Local("source_account_lookup_failed"))?;
-    if existing_account
+        )
+        .bind(&transfer.beneficiary_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("source_account_lookup_failed"))?;
+    let is_original_account = existing_account
         .as_ref()
-        .is_none_or(|(_, subscription, _)| subscription.as_deref() != Some(old_subscription_id))
-    {
+        .is_some_and(|(_, subscription, _, _)| {
+            subscription.as_deref() == Some(old_subscription_id)
+        });
+    let is_resumable_restoration = existing_account.as_ref().is_some_and(
+        |(account_operation, subscription, state, account_customer)| {
+            personal_restoration_account_matches(
+                account_operation,
+                subscription.as_deref(),
+                state,
+                account_customer.as_deref(),
+                &operation_id,
+                customer_id,
+                transfer
+                    .source_restoration_provider_subscription_id
+                    .as_deref(),
+            )
+        },
+    );
+    if !is_original_account && !is_resumable_restoration {
         return Err(ExecutionError::Local("source_account_binding_changed"));
     }
-    let existing_operation = existing_account
-        .as_ref()
-        .map(|(operation, _, _)| operation.as_str());
-    let allocation_reference = if existing_operation == Some(&operation_id) {
+    let allocation_reference = if is_resumable_restoration {
         sqlx::query_scalar::<_, String>(
             "SELECT allocation_reference FROM billing_personal_accounts WHERE user_id = $1",
         )
@@ -956,19 +1014,48 @@ async fn restore_personal_source(
         .source_restoration_provider_subscription_id
         .is_none()
     {
-        let restored = provider
-            .create_personal_source_restoration_subscription(
+        let created_at = sqlx::query_scalar::<_, i64>(
+            "SELECT EXTRACT(EPOCH FROM created_at)::BIGINT FROM billing_operations \
+             WHERE operation_id = $1",
+        )
+        .bind(&operation_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ExecutionError::Local("source_operation_lookup_failed"))?
+        .ok_or(ExecutionError::Local("source_operation_missing"))?;
+        let restored = if let Some(existing) = provider
+            .find_personal_source_restoration_subscription(
+                &operation_id,
                 &transfer.transfer_id,
                 &transfer.beneficiary_id,
                 customer_id,
                 payment_method_id,
-                transfer.offer,
                 catalogue.id_for(transfer.offer),
                 &allocation_reference,
-                &operation_id,
-                &format!("{}:source-restoration", transfer.provider_idempotency_key),
             )
-            .await?;
+            .await?
+        {
+            existing
+        } else {
+            if !restoration_create_retry_is_safe(epoch_now(), created_at) {
+                return Err(ExecutionError::Local(
+                    "source_restoration_idempotency_window_elapsed",
+                ));
+            }
+            provider
+                .create_personal_source_restoration_subscription(
+                    &transfer.transfer_id,
+                    &transfer.beneficiary_id,
+                    customer_id,
+                    payment_method_id,
+                    transfer.offer,
+                    catalogue.id_for(transfer.offer),
+                    &allocation_reference,
+                    &operation_id,
+                    &format!("{}:source-restoration", transfer.provider_idempotency_key),
+                )
+                .await?
+        };
         if restored.customer_id.as_deref() != Some(customer_id)
             || restored.default_payment_method_id.as_deref() != Some(payment_method_id)
             || !matches!(
@@ -1079,7 +1166,7 @@ async fn seed_personal_destination(
     .execute(&mut *tx)
     .await
     .map_err(|_| ExecutionError::Local("personal_transfer_operation_conflict"))?;
-    sqlx::query(
+    let seeded_account = sqlx::query(
         "INSERT INTO billing_personal_accounts \
          (user_id, operation_id, offer, stripe_customer_id, state, pending_expires_at_epoch, \
           stripe_coverage_binding_required, allocation_reference) \
@@ -1102,6 +1189,9 @@ async fn seed_personal_destination(
     .execute(&mut *tx)
     .await
     .map_err(|_| ExecutionError::Local("personal_destination_already_bound"))?;
+    if seeded_account.rows_affected() != 1 {
+        return Err(ExecutionError::Local("personal_destination_already_bound"));
+    }
     tx.commit()
         .await
         .map_err(|_| ExecutionError::Local("transfer_commit_failed"))
@@ -1595,6 +1685,28 @@ fn transfer_personal_restoration_operation_id(transfer_id: &str) -> String {
     format!("{transfer_id}:source-restoration")
 }
 
+fn personal_restoration_account_matches(
+    account_operation: &str,
+    account_subscription: Option<&str>,
+    account_state: &str,
+    account_customer: Option<&str>,
+    operation_id: &str,
+    customer_id: &str,
+    expected_subscription_id: Option<&str>,
+) -> bool {
+    account_operation == operation_id
+        && account_state == "pending"
+        && account_customer == Some(customer_id)
+        && match expected_subscription_id {
+            Some(expected) => account_subscription == Some(expected),
+            None => account_subscription.is_none(),
+        }
+}
+
+fn restoration_create_retry_is_safe(now_epoch: i64, operation_created_at_epoch: i64) -> bool {
+    now_epoch.saturating_sub(operation_created_at_epoch) < STRIPE_IDEMPOTENCY_SAFE_RETRY_SECONDS
+}
+
 fn transfer_allocation_reference(transfer_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(transfer_id.as_bytes());
@@ -1855,5 +1967,62 @@ mod tests {
             "sub_source",
             500
         ));
+    }
+
+    #[test]
+    fn personal_restoration_retries_only_the_same_pending_operation_binding() {
+        assert!(personal_restoration_account_matches(
+            "transfer:one:source-restoration",
+            None,
+            "pending",
+            Some("cus_original"),
+            "transfer:one:source-restoration",
+            "cus_original",
+            None,
+        ));
+        assert!(personal_restoration_account_matches(
+            "transfer:one:source-restoration",
+            Some("sub_restored"),
+            "pending",
+            Some("cus_original"),
+            "transfer:one:source-restoration",
+            "cus_original",
+            Some("sub_restored"),
+        ));
+        assert!(!personal_restoration_account_matches(
+            "transfer:other:source-restoration",
+            None,
+            "pending",
+            Some("cus_original"),
+            "transfer:one:source-restoration",
+            "cus_original",
+            None,
+        ));
+        assert!(!personal_restoration_account_matches(
+            "transfer:one:source-restoration",
+            None,
+            "pending",
+            Some("cus_other"),
+            "transfer:one:source-restoration",
+            "cus_original",
+            None,
+        ));
+        assert!(!personal_restoration_account_matches(
+            "transfer:one:source-restoration",
+            None,
+            "active",
+            Some("cus_original"),
+            "transfer:one:source-restoration",
+            "cus_original",
+            None,
+        ));
+    }
+
+    #[test]
+    fn restoration_replays_stable_create_only_inside_stripes_idempotency_window() {
+        assert!(restoration_create_retry_is_safe(1_000, 1_000));
+        assert!(restoration_create_retry_is_safe(1_000 + 82_799, 1_000));
+        assert!(!restoration_create_retry_is_safe(1_000 + 82_800, 1_000));
+        assert!(restoration_create_retry_is_safe(900, 1_000));
     }
 }
