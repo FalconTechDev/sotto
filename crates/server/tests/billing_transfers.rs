@@ -10,9 +10,9 @@ use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_transfer, claim_transfer_for_execution,
     claim_transfer_for_manual_recovery, complete_source_adjustment, complete_source_restoration,
     finish_execution_lease, lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
-    record_destination_prepared, release_execution_lease, request_source_restoration,
-    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
-    TransferRequest, TransferState,
+    record_destination_prepared, record_destination_schedule, record_destination_setup_completion,
+    release_execution_lease, request_source_restoration, withdraw_transfer, BeginTransfer,
+    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferState,
 };
 use sotto_server::db;
 use sotto_server::sponsored_billing::{
@@ -165,6 +165,18 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .await
     .expect("insert destination owner");
     sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, \
+          current_period_start, current_period_end) \
+         VALUES ($1, $2, $3, 'active', 1800000000, 1802592000)",
+    )
+    .bind(&org)
+    .bind(format!("cus_transfer_destination_{fixture}"))
+    .bind(format!("sub_transfer_destination_{fixture}"))
+    .execute(&pool)
+    .await
+    .expect("insert destination sponsor subscription at the source boundary");
+    sqlx::query(
         "INSERT INTO billing_operations
          (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id,
           offer, quote_version, quote_expires_at_epoch, provider_idempotency_key)
@@ -246,6 +258,34 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .execute(&pool)
     .await
     .expect("finish in-flight fixture operation");
+
+    sqlx::query(
+        "UPDATE billing_sponsored_subscriptions SET current_period_end = 1802592001 \
+         WHERE organization_id = $1",
+    )
+    .bind(&org)
+    .execute(&pool)
+    .await
+    .expect("move destination renewal away from the source boundary");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin mismatched destination renewal");
+    assert!(matches!(
+        begin_transfer(&mut tx, &request, 1_800_000_000).await,
+        Err(TransferError::DestinationTermChanged)
+    ));
+    tx.rollback()
+        .await
+        .expect("rollback mismatched destination renewal");
+    sqlx::query(
+        "UPDATE billing_sponsored_subscriptions SET current_period_end = 1802592000 \
+         WHERE organization_id = $1",
+    )
+    .bind(&org)
+    .execute(&pool)
+    .await
+    .expect("restore matching destination renewal");
 
     let mut tx = pool.begin().await.expect("begin transfer");
     let created = begin_transfer(&mut tx, &request, 1_800_000_000)
@@ -501,11 +541,35 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     .await
     .expect("founding payer stays unchanged before paid invoice");
     assert_eq!(payer_before_invoice, ("personal".into(), user.clone()));
-    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
-        .await
-        .expect("record destination payment after source scheduling");
     assert!(matches!(
-        record_destination_paid(&mut tx, &transfer.transfer_id, "pi_conflicting").await,
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_wrong_term",
+            transfer.effective_from + 1,
+            transfer.effective_from + 2_678_401,
+        )
+        .await,
+        Err(TransferError::DestinationTermChanged)
+    ));
+    record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_destination",
+        transfer.effective_from,
+        transfer.effective_from + 2_678_400,
+    )
+    .await
+    .expect("record destination payment after source scheduling");
+    assert!(matches!(
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_conflicting",
+            transfer.effective_from,
+            transfer.effective_from + 2_678_400,
+        )
+        .await,
         Err(TransferError::ResultConflict)
     ));
     complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
@@ -550,11 +614,24 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     )
     .await
     .expect("matching preparation retry remains idempotent");
-    record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
-        .await
-        .expect("matching payment retry remains idempotent");
+    record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_destination",
+        transfer.effective_from,
+        transfer.effective_from + 2_678_400,
+    )
+    .await
+    .expect("matching payment retry remains idempotent");
     assert!(matches!(
-        record_destination_paid(&mut tx, &transfer.transfer_id, "pi_other").await,
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_other",
+            transfer.effective_from,
+            transfer.effective_from + 2_678_400,
+        )
+        .await,
         Err(TransferError::ResultConflict)
     ));
     assert!(matches!(
@@ -938,6 +1015,71 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
             accept_transfer(&mut tx, &transfer_id, &beneficiary, 1_800_000_000)
                 .await
                 .expect("beneficiary accepts sponsored transfer");
+            sqlx::query(
+                "UPDATE billing_transfer_intents SET destination_customer_id = $2, \
+                     destination_setup_session_id = $3 WHERE transfer_id = $1",
+            )
+            .bind(&transfer_id)
+            .bind("cus_transfer_destination")
+            .bind("cs_transfer_setup")
+            .execute(&mut *tx)
+            .await
+            .expect("bind beneficiary setup session");
+            record_destination_setup_completion(
+                &mut tx,
+                &transfer_id,
+                "cus_transfer_destination",
+                "cs_transfer_setup",
+                "seti_transfer_setup",
+            )
+            .await
+            .expect("record verified beneficiary setup");
+            assert!(matches!(
+                record_destination_setup_completion(
+                    &mut tx,
+                    &transfer_id,
+                    "cus_transfer_destination",
+                    "cs_transfer_setup",
+                    "seti_other",
+                )
+                .await,
+                Err(TransferError::ResultConflict)
+            ));
+            record_destination_schedule(
+                &mut tx,
+                &transfer_id,
+                &transfer_id,
+                "cus_transfer_destination",
+                "sub_sched_transfer",
+                None,
+                Some("seti_transfer_setup"),
+            )
+            .await
+            .expect("record verified future personal schedule");
+            record_destination_schedule(
+                &mut tx,
+                &transfer_id,
+                &transfer_id,
+                "cus_transfer_destination",
+                "sub_sched_transfer",
+                None,
+                Some("seti_transfer_setup"),
+            )
+            .await
+            .expect("replay the same destination schedule");
+            assert!(matches!(
+                record_destination_schedule(
+                    &mut tx,
+                    &transfer_id,
+                    &transfer_id,
+                    "cus_transfer_destination",
+                    "sub_sched_other",
+                    None,
+                    Some("seti_transfer_setup"),
+                )
+                .await,
+                Err(TransferError::ResultConflict)
+            ));
             transfer_id
         }
         BeginTransfer::AlreadyExists(_) => panic!("transfer unexpectedly existed"),

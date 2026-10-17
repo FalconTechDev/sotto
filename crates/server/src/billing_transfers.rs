@@ -320,6 +320,10 @@ pub enum TransferError {
     SourceTermChanged,
     #[error("transfer destination already covers this beneficiary")]
     DestinationAlreadyCovers,
+    #[error("destination sponsor has no active subscription")]
+    DestinationSubscriptionUnavailable,
+    #[error("destination sponsor renewal does not match the source paid-through boundary")]
+    DestinationTermChanged,
     #[error("transfer is already in progress for this beneficiary")]
     AlreadyInProgress,
     #[error("transfer is not authorised")]
@@ -585,7 +589,7 @@ async fn preauthorise_transfer_draft(
     permitted.then_some(()).ok_or(TransferError::Unauthorised)
 }
 
-fn offer_at_transfer_boundary(
+pub(crate) fn offer_at_transfer_boundary(
     source_offer: &str,
     effective_from: i64,
     award: Option<&founding_allocator::FoundingAward>,
@@ -631,6 +635,13 @@ impl From<TransferError> for Error {
             TransferError::DestinationAlreadyCovers => {
                 Self::Conflict("transfer destination already covers this beneficiary".into())
             }
+            TransferError::DestinationSubscriptionUnavailable => {
+                Self::Conflict("destination sponsor must have an active subscription".into())
+            }
+            TransferError::DestinationTermChanged => Self::Conflict(
+                "destination sponsor renewal does not match the source paid-through boundary"
+                    .into(),
+            ),
             TransferError::AlreadyInProgress => {
                 Self::Conflict("a transfer is already in progress for this beneficiary".into())
             }
@@ -834,6 +845,17 @@ pub async fn lock_and_check_no_live_transfer(
     beneficiary_ids: &[&str],
     now_epoch: i64,
 ) -> Result<(), TransferError> {
+    lock_and_check_no_live_transfer_except(tx, beneficiary_ids, &[], now_epoch).await
+}
+
+/// Lock affected beneficiaries and reject every live intent except the specific transfer whose
+/// verified destination invoice is being settled in this transaction.
+pub async fn lock_and_check_no_live_transfer_except(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_ids: &[&str],
+    allowed_transfer_ids: &[String],
+    now_epoch: i64,
+) -> Result<(), TransferError> {
     founding_allocator::lock_capacity(tx).await?;
 
     let user_ids = beneficiary_ids
@@ -859,10 +881,12 @@ pub async fn lock_and_check_no_live_transfer(
          WHERE beneficiary_id = ANY($1) AND (state IN \
            ('pending','destination_prepared','destination_paid','source_adjustment_pending','source_restoration_pending','unknown') \
            OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
+           AND NOT (transfer_id = ANY($3)) \
          ORDER BY beneficiary_id, transfer_id LIMIT 1 FOR UPDATE",
     )
     .bind(&user_ids)
     .bind(now_epoch)
+    .bind(allowed_transfer_ids)
     .fetch_optional(&mut **tx)
     .await?;
     if active.is_some() {
@@ -1063,13 +1087,235 @@ pub async fn record_destination_prepared(
     load_transfer(tx, transfer_id).await
 }
 
+/// Attach a verified Setup Checkout completion to the pending personal destination. The caller
+/// verifies the signed session and retrieves the SetupIntent from Stripe before this write.
+pub async fn record_destination_setup_completion(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    customer_id: &str,
+    session_id: &str,
+    setup_intent_id: &str,
+) -> Result<TransferIntent, TransferError> {
+    if [customer_id, session_id, setup_intent_id]
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        return Err(TransferError::InvalidField("setup evidence"));
+    }
+    let current = load_transfer(tx, transfer_id).await?;
+    if current.destination_kind != TransferPayer::Personal
+        || current.destination_customer_id.as_deref() != Some(customer_id)
+        || current.destination_setup_session_id.as_deref() != Some(session_id)
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    if let Some(existing) = current.destination_setup_intent_id.as_deref() {
+        return if existing == setup_intent_id {
+            Ok(current)
+        } else {
+            Err(TransferError::ResultConflict)
+        };
+    }
+    if !matches!(
+        current.state,
+        TransferState::Pending | TransferState::DestinationPrepared
+    ) {
+        return Err(TransferError::InvalidTransition);
+    }
+    let result = sqlx::query(
+        "UPDATE billing_transfer_intents SET destination_setup_intent_id = $2, updated_at = now() \
+         WHERE transfer_id = $1 AND destination_kind = 'personal' \
+           AND destination_customer_id = $3 AND destination_setup_session_id = $4 \
+           AND destination_setup_intent_id IS NULL \
+           AND state IN ('pending','destination_prepared') RETURNING transfer_id",
+    )
+    .bind(transfer_id)
+    .bind(setup_intent_id)
+    .bind(customer_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if result.is_none() {
+        let current = load_transfer(tx, transfer_id).await?;
+        if current.destination_setup_intent_id.as_deref() != Some(setup_intent_id) {
+            return Err(TransferError::ResultConflict);
+        }
+    }
+    load_transfer(tx, transfer_id).await
+}
+
+/// Persist a provider-read-back schedule before preparing the source side. Personal schedules
+/// require the beneficiary's verified SetupIntent; sponsored schedules must bind an existing
+/// subscription and do not accept personal setup evidence.
+pub async fn record_destination_schedule(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    operation_id: &str,
+    customer_id: &str,
+    schedule_id: &str,
+    subscription_id: Option<&str>,
+    setup_intent_id: Option<&str>,
+) -> Result<TransferIntent, TransferError> {
+    if [operation_id, customer_id, schedule_id]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        || subscription_id.is_some_and(|value| value.trim().is_empty())
+        || setup_intent_id.is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(TransferError::InvalidField("destination schedule evidence"));
+    }
+    let current = load_transfer(tx, transfer_id).await?;
+    match current.destination_kind {
+        TransferPayer::Personal
+            if current.destination_customer_id.as_deref() != Some(customer_id)
+                || current.destination_setup_intent_id.as_deref() != setup_intent_id
+                || setup_intent_id.is_none() =>
+        {
+            return Err(TransferError::ResultConflict);
+        }
+        TransferPayer::Sponsor if setup_intent_id.is_some() || subscription_id.is_none() => {
+            return Err(TransferError::ResultConflict);
+        }
+        _ => {}
+    }
+    if let Some(stored) = current.destination_schedule_id.as_deref() {
+        if stored != schedule_id
+            || current.destination_operation_id.as_deref() != Some(operation_id)
+            || current.destination_customer_id.as_deref() != Some(customer_id)
+            || current.destination_provider_subscription_id.as_deref() != subscription_id
+        {
+            return Err(TransferError::ResultConflict);
+        }
+        return Ok(current);
+    }
+    if !matches!(
+        current.state,
+        TransferState::Pending | TransferState::Unknown
+    ) {
+        return Err(TransferError::InvalidTransition);
+    }
+    let updated = sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'destination_prepared', \
+             destination_operation_id = $2, destination_customer_id = $3, \
+             destination_schedule_id = $4, destination_provider_subscription_id = $5, \
+             updated_at = now() \
+         WHERE transfer_id = $1 AND state IN ('pending','unknown') \
+           AND (destination_customer_id IS NULL OR destination_customer_id = $3) \
+           AND destination_schedule_id IS NULL \
+         RETURNING transfer_id",
+    )
+    .bind(transfer_id)
+    .bind(operation_id)
+    .bind(customer_id)
+    .bind(schedule_id)
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let current = load_transfer(tx, transfer_id).await?;
+        if current.destination_schedule_id.as_deref() != Some(schedule_id)
+            || current.destination_operation_id.as_deref() != Some(operation_id)
+            || current.destination_customer_id.as_deref() != Some(customer_id)
+            || current.destination_provider_subscription_id.as_deref() != subscription_id
+        {
+            return Err(TransferError::ResultConflict);
+        }
+    }
+    load_transfer(tx, transfer_id).await
+}
+
+/// Link the first signed paid invoice for a future personal subscription to its already-recorded
+/// schedule. The webhook caller must have checked the transfer, customer and allocation metadata;
+/// the invoice evidence reader then independently verifies these claims before settlement.
+pub async fn link_personal_destination_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    beneficiary_id: &str,
+    operation_id: &str,
+    allocation_reference: &str,
+    customer_id: &str,
+    subscription_id: &str,
+) -> Result<TransferIntent, TransferError> {
+    for value in [
+        transfer_id,
+        beneficiary_id,
+        operation_id,
+        allocation_reference,
+        customer_id,
+        subscription_id,
+    ] {
+        if value.trim().is_empty() {
+            return Err(TransferError::InvalidField("destination invoice binding"));
+        }
+    }
+    let transfer = load_transfer(tx, transfer_id).await?;
+    if transfer.destination_kind != TransferPayer::Personal
+        || transfer.beneficiary_id != beneficiary_id
+        || transfer.destination_operation_id.as_deref() != Some(operation_id)
+        || transfer.destination_customer_id.as_deref() != Some(customer_id)
+        || transfer
+            .destination_provider_subscription_id
+            .as_deref()
+            .is_some_and(|stored| stored != subscription_id)
+        || !matches!(
+            transfer.state,
+            TransferState::DestinationPrepared
+                | TransferState::DestinationPaid
+                | TransferState::SourceAdjustmentPending
+                | TransferState::Completed
+        )
+    {
+        return Err(TransferError::ResultConflict);
+    }
+    let account = sqlx::query(
+        "UPDATE billing_personal_accounts SET stripe_subscription_id = $4, updated_at = now() \
+         WHERE user_id = $1 AND operation_id = $2 AND allocation_reference = $3 \
+           AND stripe_customer_id = $5 AND (stripe_subscription_id IS NULL OR stripe_subscription_id = $4) \
+         RETURNING user_id",
+    )
+    .bind(beneficiary_id)
+    .bind(operation_id)
+    .bind(allocation_reference)
+    .bind(subscription_id)
+    .bind(customer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if account.is_none() {
+        return Err(TransferError::ResultConflict);
+    }
+    let updated = sqlx::query(
+        "UPDATE billing_transfer_intents SET destination_provider_subscription_id = $2, updated_at = now() \
+         WHERE transfer_id = $1 AND destination_kind = 'personal' \
+           AND (destination_provider_subscription_id IS NULL OR destination_provider_subscription_id = $2) \
+         RETURNING transfer_id",
+    )
+    .bind(transfer_id)
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        return Err(TransferError::ResultConflict);
+    }
+    load_transfer(tx, transfer_id).await
+}
+
 pub async fn record_destination_paid(
     tx: &mut Transaction<'_, Postgres>,
     transfer_id: &str,
     payment_reference: &str,
+    invoice_period_start: i64,
+    invoice_period_end: i64,
 ) -> Result<TransferIntent, TransferError> {
     if payment_reference.trim().is_empty() {
         return Err(TransferError::InvalidField("payment_reference"));
+    }
+    if invoice_period_start <= 0 || invoice_period_end <= invoice_period_start {
+        return Err(TransferError::InvalidField("invoice period"));
+    }
+    founding_allocator::lock_capacity(tx).await?;
+    let current = load_transfer(tx, transfer_id).await?;
+    if current.effective_from != invoice_period_start {
+        return Err(TransferError::DestinationTermChanged);
     }
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET \
@@ -1223,6 +1469,40 @@ pub async fn complete_source_adjustment(
     .bind(source_adjustment_reference)
     .execute(&mut **tx)
     .await?;
+    load_transfer(tx, transfer_id).await
+}
+
+/// Store the provider schedule identity before recording the source adjustment as complete.
+/// Retries may confirm the same schedule but cannot silently substitute another one.
+pub async fn record_source_schedule(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    schedule_id: &str,
+) -> Result<TransferIntent, TransferError> {
+    if schedule_id.trim().is_empty() {
+        return Err(TransferError::InvalidField("source_schedule_id"));
+    }
+    let updated = sqlx::query(
+        "UPDATE billing_transfer_intents SET source_schedule_id = $2, updated_at = now() \
+         WHERE transfer_id = $1 AND state = 'source_adjustment_pending' \
+           AND (source_schedule_id IS NULL OR source_schedule_id = $2) \
+         RETURNING transfer_id",
+    )
+    .bind(transfer_id)
+    .bind(schedule_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let current = load_transfer(tx, transfer_id).await?;
+        if !matches!(
+            current.state,
+            TransferState::SourceAdjustmentPending | TransferState::Completed
+        ) || current.source_schedule_id.as_deref() != Some(schedule_id)
+        {
+            return Err(TransferError::ResultConflict);
+        }
+        return Ok(current);
+    }
     load_transfer(tx, transfer_id).await
 }
 
@@ -1509,6 +1789,32 @@ pub async fn finish_execution_lease(
     Ok(rows == 1)
 }
 
+/// Yield a lease while a valid provider transition is waiting for an external event, such as the
+/// destination's first paid invoice. The transfer state and its recovery evidence remain intact.
+pub async fn defer_execution_lease(
+    pool: &PgPool,
+    transfer_id: &str,
+    lease_token: &str,
+    delay_seconds: i64,
+) -> Result<bool, TransferError> {
+    if transfer_id.trim().is_empty() || lease_token.trim().is_empty() || delay_seconds <= 0 {
+        return Err(TransferError::InvalidField("execution lease deferral"));
+    }
+    let rows = sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_lease_token = NULL, \
+             execution_lease_until = NULL, \
+             execution_next_attempt_at = now() + ($3 * interval '1 second'), updated_at = now() \
+         WHERE transfer_id = $1 AND execution_lease_token = $2",
+    )
+    .bind(transfer_id)
+    .bind(lease_token)
+    .bind(delay_seconds)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows == 1)
+}
+
 pub async fn load_for_actor(
     pool: &PgPool,
     transfer_id: &str,
@@ -1690,7 +1996,7 @@ async fn ensure_destination_free(
                 .destination_organization_id
                 .as_deref()
                 .ok_or(TransferError::CorruptState)?;
-            sqlx::query_scalar::<_, bool>(
+            let covered = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM billing_sponsored_seats \
                  WHERE organization_id = $1 AND beneficiary_id = $2 \
                    AND state IN ('pending','active','scheduled_removal'))",
@@ -1698,7 +2004,27 @@ async fn ensure_destination_free(
             .bind(organization_id)
             .bind(&request.beneficiary_id)
             .fetch_one(&mut **tx)
+            .await?;
+            if covered {
+                return Err(TransferError::DestinationAlreadyCovers);
+            }
+            let destination_boundary: Option<i64> = sqlx::query_scalar(
+                "SELECT current_period_end FROM billing_sponsored_subscriptions \
+                 WHERE organization_id = $1 AND status = 'active' \
+                   AND provider_subscription_id IS NOT NULL AND current_period_end IS NOT NULL \
+                 FOR UPDATE",
+            )
+            .bind(organization_id)
+            .fetch_optional(&mut **tx)
             .await?
+            .flatten();
+            let Some(destination_boundary) = destination_boundary else {
+                return Err(TransferError::DestinationSubscriptionUnavailable);
+            };
+            if destination_boundary != request.effective_from {
+                return Err(TransferError::DestinationTermChanged);
+            }
+            false
         }
     };
     (!covered)
@@ -1753,7 +2079,9 @@ async fn load_transfer_snapshot(
     transfer_from_row(&row)
 }
 
-fn transfer_from_row(row: &sqlx::postgres::PgRow) -> Result<TransferIntent, TransferError> {
+pub(crate) fn transfer_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<TransferIntent, TransferError> {
     Ok(TransferIntent {
         transfer_id: row.try_get("transfer_id")?,
         actor_user_id: row.try_get("actor_user_id")?,
