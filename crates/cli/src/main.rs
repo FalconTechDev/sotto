@@ -472,7 +472,7 @@ fn run() -> Result<()> {
     {
         let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
         let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
-        let count = manifest.tasks.len();
+        let count = manifest.tasks().len();
         let noun = if count == 1 { "task" } else { "tasks" };
         println!("valid: {count} {noun}");
         return Ok(());

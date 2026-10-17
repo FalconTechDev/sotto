@@ -24,28 +24,68 @@ const MAX_DESCRIPTION_LENGTH: usize = 256;
 const MAX_ENVIRONMENT_NAME_LENGTH: usize = 128;
 
 /// A validated manifest stored at the Sotto project root.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskManifest {
-    pub version: u32,
-    #[serde(rename = "task")]
-    pub tasks: Vec<TaskDeclaration>,
+    version: u32,
+    tasks: Vec<TaskDeclaration>,
 }
 
 /// One fixed executable and argument vector that a developer may later approve.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TaskDeclaration {
-    pub name: String,
-    pub description: String,
-    pub executable: String,
+    name: String,
+    description: String,
+    executable: String,
+    args: Vec<String>,
+    environments: Vec<String>,
+    working_directory: Option<String>,
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTaskManifest {
+    version: u32,
+    #[serde(rename = "task")]
+    tasks: Vec<RawTaskDeclaration>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTaskDeclaration {
+    name: String,
+    description: String,
+    executable: String,
     #[serde(default)]
-    pub args: Vec<String>,
-    pub environments: Vec<String>,
+    args: Vec<String>,
+    environments: Vec<String>,
     #[serde(default)]
-    pub working_directory: Option<String>,
+    working_directory: Option<String>,
     #[serde(default)]
-    pub timeout_seconds: Option<u64>,
+    timeout_seconds: Option<u64>,
+}
+
+impl From<RawTaskManifest> for TaskManifest {
+    fn from(raw: RawTaskManifest) -> Self {
+        Self {
+            version: raw.version,
+            tasks: raw.tasks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<RawTaskDeclaration> for TaskDeclaration {
+    fn from(raw: RawTaskDeclaration) -> Self {
+        Self {
+            name: raw.name,
+            description: raw.description,
+            executable: raw.executable,
+            args: raw.args,
+            environments: raw.environments,
+            working_directory: raw.working_directory,
+            timeout_seconds: raw.timeout_seconds,
+        }
+    }
 }
 
 impl TaskManifest {
@@ -54,6 +94,14 @@ impl TaskManifest {
         let (_, project_root) = Config::discover(start)?;
         let manifest = Self::load_from(&project_root)?;
         Ok((project_root, manifest))
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn tasks(&self) -> &[TaskDeclaration] {
+        &self.tasks
     }
 
     /// Load and validate `sotto.tasks.toml` from a known Sotto project root.
@@ -67,8 +115,7 @@ impl TaskManifest {
             _ => Error::Io(format!("reading {}: {error}", path.display())),
         })?;
 
-        let manifest: Self = toml::from_str(&text)
-            .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+        let manifest = parse_manifest(&path, &text)?;
         manifest.validate().map_err(|error| match error {
             Error::Config(message) => Error::Config(format!("{}: {message}", path.display())),
             other => other,
@@ -78,8 +125,7 @@ impl TaskManifest {
 
     /// Parse and validate TOML, including the file path in configuration errors.
     pub fn parse(path: &Path, text: &str) -> Result<Self> {
-        let manifest: Self = toml::from_str(text)
-            .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+        let manifest = parse_manifest(path, text)?;
         manifest.validate().map_err(|error| match error {
             Error::Config(message) => Error::Config(format!("{}: {message}", path.display())),
             other => other,
@@ -132,6 +178,28 @@ impl TaskManifest {
 }
 
 impl TaskDeclaration {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+    pub fn executable(&self) -> &str {
+        &self.executable
+    }
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+    pub fn environments(&self) -> &[String] {
+        &self.environments
+    }
+    pub fn timeout_seconds(&self) -> Option<u64> {
+        self.timeout_seconds
+    }
+    pub fn working_directory_declaration(&self) -> Option<&str> {
+        self.working_directory.as_deref()
+    }
+
     /// Resolve a declared executable path against the project root, or mark a bare name for
     /// lookup on `PATH` when the task is eventually launched.
     pub fn executable_target(&self, project_root: &Path) -> ExecutableTarget {
@@ -164,6 +232,30 @@ impl TaskDeclaration {
             None => project_root.to_path_buf(),
         }
     }
+}
+
+fn parse_manifest(path: &Path, text: &str) -> Result<TaskManifest> {
+    let raw: RawTaskManifest = toml::from_str(text).map_err(|error| {
+        let offset = error.span().map_or(0, |span| span.start.min(text.len()));
+        let mut boundary = offset;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        let prefix = &text[..boundary];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count()
+            + 1;
+        Error::Config(format!(
+            "{}:{line}:{column}: invalid task TOML syntax or value",
+            path.display()
+        ))
+    })?;
+    Ok(raw.into())
 }
 
 #[derive(Serialize)]
@@ -238,15 +330,11 @@ fn validate_task(task: &TaskDeclaration, index: usize) -> Result<()> {
     }
     let mut environments = HashSet::with_capacity(task.environments.len());
     for environment in &task.environments {
-        if environment.trim().is_empty()
-            || environment.trim() != environment
-            || environment.chars().count() > MAX_ENVIRONMENT_NAME_LENGTH
-            || environment.chars().any(char::is_control)
-        {
+        if !valid_environment_name(environment) {
             return Err(task_error(
                 index,
                 "environments",
-                "each environment name must be trimmed, non-empty, at most 128 characters and contain no control characters",
+                "each environment name must be 1-128 lowercase ASCII letters, digits, hyphens or underscores, starting and ending with a letter or digit",
             ));
         }
         if !environments.insert(environment.as_str()) {
@@ -268,6 +356,17 @@ fn validate_task(task: &TaskDeclaration, index: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_ENVIRONMENT_NAME_LENGTH
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && (bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
+        })
 }
 
 fn validate_text_field(value: &str, index: usize, field: &str, allow_empty: bool) -> Result<()> {
@@ -346,6 +445,31 @@ environments = ["dev"]
             ),
         ] {
             assert!(TaskManifest::parse(Path::new("tasks.toml"), &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_environment_names_outside_the_declared_ascii_grammar() {
+        for environment in ["prod/eu", "prod eu", "..", "Upper", "-prod", "prod_"] {
+            let invalid = VALID.replace("[\"dev\"]", &format!("[\"{environment}\"]"));
+            assert!(
+                TaskManifest::parse(Path::new("tasks.toml"), &invalid).is_err(),
+                "accepted invalid environment name {environment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_errors_report_location_without_echoing_source_text() {
+        for sensitive in [
+            "version = 1\n\n[[task]]\nname = \"test\"\ndescription = \"do_not_echo_this_secret\n",
+            "version = \"do_not_echo_this_secret\"\n",
+        ] {
+            let error = TaskManifest::parse(Path::new("tasks.toml"), sensitive).unwrap_err();
+            let message = error.to_string();
+
+            assert!(message.contains("tasks.toml:"), "{message}");
+            assert!(!message.contains("do_not_echo_this_secret"), "{message}");
         }
     }
 
