@@ -410,37 +410,38 @@ fn quote_id(request: &TransferRequest) -> String {
         expires.as_str(),
         effective.as_str(),
     ];
-    let mut encoded = Vec::new();
-    for field in fields {
-        encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
-        encoded.extend_from_slice(field.as_bytes());
-    }
-    let digest = Sha256::digest(encoded);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    transfer_quote_fingerprint(&fields)
 }
 
 fn quote_id_from_intent(intent: &TransferIntent) -> String {
     let version = intent.quote_version.to_string();
     let expires = intent.quote_expires_at_epoch.to_string();
     let effective = intent.effective_from.to_string();
-    let fields = [
+    let mut fields = vec![
         "sotto-transfer-quote-v1",
         intent.actor_user_id.as_str(),
         intent.counterparty_user_id.as_str(),
         intent.beneficiary_id.as_str(),
         intent.source_kind.as_str(),
         intent.source_organization_id.as_deref().unwrap_or(""),
-        intent
-            .source_provider_subscription_id
-            .as_deref()
-            .unwrap_or(""),
+    ];
+    // Intents created before source binding used the original fingerprint without this field.
+    // Preserve that quote only for idempotent reads of historical, now non-executable rows.
+    if let Some(subscription_id) = intent.source_provider_subscription_id.as_deref() {
+        fields.push(subscription_id);
+    }
+    fields.extend([
         intent.destination_kind.as_str(),
         intent.destination_organization_id.as_deref().unwrap_or(""),
         intent.offer.as_str(),
         version.as_str(),
         expires.as_str(),
         effective.as_str(),
-    ];
+    ]);
+    transfer_quote_fingerprint(&fields)
+}
+
+fn transfer_quote_fingerprint(fields: &[&str]) -> String {
     let mut encoded = Vec::new();
     for field in fields {
         encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
@@ -485,9 +486,12 @@ fn current_epoch() -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote_id, validate_idempotency_key, validate_quote_id};
+    use super::{
+        quote_id, quote_id_from_intent, transfer_quote_fingerprint, validate_idempotency_key,
+        validate_quote_id,
+    };
     use crate::billing_catalogue::BillingOffer;
-    use crate::billing_transfers::{TransferPayer, TransferRequest};
+    use crate::billing_transfers::{TransferIntent, TransferPayer, TransferRequest, TransferState};
 
     fn request() -> TransferRequest {
         TransferRequest {
@@ -548,5 +552,66 @@ mod tests {
         assert!(validate_idempotency_key("web-req-1").is_ok());
         assert!(validate_idempotency_key("\n").is_err());
         assert!(validate_idempotency_key(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn historical_intents_keep_their_original_quote_fingerprint() {
+        let intent = TransferIntent {
+            transfer_id: "transfer:legacy".into(),
+            actor_user_id: "actor".into(),
+            counterparty_user_id: "counterparty".into(),
+            beneficiary_id: "beneficiary".into(),
+            source_kind: TransferPayer::Personal,
+            source_organization_id: None,
+            destination_kind: TransferPayer::Sponsor,
+            destination_organization_id: Some("org".into()),
+            offer: BillingOffer::StandardMonthly,
+            quote_version: 1,
+            quote_expires_at_epoch: 2_000,
+            request_hash: "request-hash".into(),
+            idempotency_key: "request".into(),
+            provider_idempotency_key: "provider-key".into(),
+            effective_from: 3_000,
+            effective_until: None,
+            destination_operation_id: None,
+            source_operation_id: None,
+            destination_provider_subscription_id: None,
+            source_provider_subscription_id: None,
+            destination_payment_reference: None,
+            source_adjustment_reference: None,
+            founding_award_id: None,
+            execution_lease_token: None,
+            execution_lease_until_epoch: None,
+            execution_attempt_count: 0,
+            destination_customer_id: None,
+            destination_schedule_id: None,
+            source_schedule_id: None,
+            destination_setup_session_id: None,
+            destination_setup_intent_id: None,
+            last_execution_error_code: None,
+            state: TransferState::Failed,
+            result_code: Some("source_binding_unavailable".into()),
+        };
+        let version = intent.quote_version.to_string();
+        let expires = intent.quote_expires_at_epoch.to_string();
+        let effective = intent.effective_from.to_string();
+        let legacy_fields = [
+            "sotto-transfer-quote-v1",
+            "actor",
+            "counterparty",
+            "beneficiary",
+            "personal",
+            "",
+            "sponsor",
+            "org",
+            "standard_monthly",
+            version.as_str(),
+            expires.as_str(),
+            effective.as_str(),
+        ];
+        assert_eq!(
+            quote_id_from_intent(&intent),
+            transfer_quote_fingerprint(&legacy_fields)
+        );
     }
 }

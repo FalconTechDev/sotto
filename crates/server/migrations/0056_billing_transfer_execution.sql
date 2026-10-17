@@ -24,7 +24,17 @@ ALTER TABLE billing_transfer_intents
         execution_lease_token IS NULL OR btrim(execution_lease_token) <> ''
     );
 
+-- Older transfer intents predate source subscription binding. They have never had provider work
+-- attached (the transfer API was ships-dark), so do not let an unbound invitation become
+-- executable after the provider worker is introduced. Keep the rows for history and idempotent
+-- replies, but release their beneficiary slot with an explicit reason.
+UPDATE billing_transfer_intents
+SET state = 'failed', result_code = 'source_binding_unavailable', updated_at = now()
+WHERE source_provider_subscription_id IS NULL
+  AND state IN ('awaiting_consent', 'pending', 'destination_prepared', 'destination_paid',
+                'source_adjustment_pending', 'unknown');
+
 CREATE INDEX billing_transfer_execution_due_idx
-    ON billing_transfer_intents (updated_at, created_at)
+    ON billing_transfer_intents (execution_next_attempt_at, created_at, transfer_id)
     WHERE state IN ('pending', 'destination_prepared', 'destination_paid',
                     'source_adjustment_pending', 'unknown');

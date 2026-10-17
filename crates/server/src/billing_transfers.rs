@@ -1066,6 +1066,7 @@ pub async fn record_destination_paid(
          state = CASE WHEN state = 'source_adjustment_pending' THEN state ELSE 'destination_paid' END, \
          destination_payment_reference = $2, updated_at = now() \
          WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending') \
+           AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
          RETURNING transfer_id",
     )
     .bind(transfer_id)
@@ -1245,11 +1246,8 @@ pub async fn mark_failed(
 /// Claim one accepted transfer for provider reconciliation. The query takes a bounded number
 /// of rows (one here), skips work owned by another live lease, and returns expired leases to
 /// the same stable provider operation keys after a process restart.
-pub async fn claim_due(
-    pool: &PgPool,
-    now_epoch: i64,
-) -> Result<Option<TransferLease>, TransferError> {
-    claim_due_matching(pool, now_epoch, None).await
+pub async fn claim_due(pool: &PgPool) -> Result<Option<TransferLease>, TransferError> {
+    claim_due_matching(pool, None).await
 }
 
 /// Claim a known transfer after an operator or callback has requested immediate reconciliation.
@@ -1257,45 +1255,41 @@ pub async fn claim_due(
 pub async fn claim_transfer_for_execution(
     pool: &PgPool,
     transfer_id: &str,
-    now_epoch: i64,
 ) -> Result<Option<TransferLease>, TransferError> {
     if transfer_id.trim().is_empty() {
         return Err(TransferError::InvalidField("transfer_id"));
     }
-    claim_due_matching(pool, now_epoch, Some(transfer_id)).await
+    claim_due_matching(pool, Some(transfer_id)).await
 }
 
 async fn claim_due_matching(
     pool: &PgPool,
-    now_epoch: i64,
     only_transfer_id: Option<&str>,
 ) -> Result<Option<TransferLease>, TransferError> {
     let lease_token = Uuid::new_v4().to_string();
-    let lease_until_epoch = now_epoch.saturating_add(TRANSFER_EXECUTION_LEASE_SECONDS);
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "WITH candidate AS (\
-             SELECT transfer_id FROM billing_transfer_intents \
-             WHERE state IN ('pending','destination_prepared','destination_paid', \
+             SELECT transfer.transfer_id FROM billing_transfer_intents AS transfer \
+             WHERE transfer.state IN ('pending','destination_prepared','destination_paid', \
                              'source_adjustment_pending','unknown') \
-               AND execution_next_attempt_at <= to_timestamp($1) \
-               AND (execution_lease_until IS NULL OR execution_lease_until <= to_timestamp($1)) \
-               AND ($4::TEXT IS NULL OR transfer_id = $4) \
-             ORDER BY execution_next_attempt_at, created_at, transfer_id \
-             LIMIT 1 FOR UPDATE SKIP LOCKED \
+               AND transfer.execution_next_attempt_at <= now() \
+               AND (transfer.execution_lease_until IS NULL OR transfer.execution_lease_until <= now()) \
+               AND ($3::TEXT IS NULL OR transfer.transfer_id = $3) \
+             ORDER BY transfer.execution_next_attempt_at, transfer.created_at, transfer.transfer_id \
+             LIMIT 1 FOR UPDATE OF transfer SKIP LOCKED \
          ) \
          UPDATE billing_transfer_intents AS transfer SET \
              execution_lease_token = $2, \
-             execution_lease_until = to_timestamp($3), \
+             execution_lease_until = now() + ($1 * interval '1 second'), \
              execution_attempt_count = transfer.execution_attempt_count + 1, \
-             updated_at = to_timestamp($1) \
+             updated_at = now() \
          FROM candidate WHERE transfer.transfer_id = candidate.transfer_id \
          RETURNING transfer.*, EXTRACT(EPOCH FROM transfer.execution_lease_until)::BIGINT \
              AS execution_lease_until_epoch",
     )
-    .bind(now_epoch)
+    .bind(TRANSFER_EXECUTION_LEASE_SECONDS)
     .bind(&lease_token)
-    .bind(lease_until_epoch)
     .bind(only_transfer_id)
     .fetch_optional(&mut *tx)
     .await?;
@@ -1304,7 +1298,7 @@ async fn claim_due_matching(
             Ok::<TransferLease, TransferError>(TransferLease {
                 transfer: transfer_from_row(&row)?,
                 lease_token,
-                lease_until_epoch,
+                lease_until_epoch: row.try_get("execution_lease_until_epoch")?,
             })
         })
         .transpose()?;
@@ -1318,7 +1312,6 @@ pub async fn release_execution_lease(
     pool: &PgPool,
     transfer_id: &str,
     lease_token: &str,
-    now_epoch: i64,
     failure: TransferExecutionFailure,
 ) -> Result<bool, TransferError> {
     if transfer_id.trim().is_empty() || lease_token.trim().is_empty() {
@@ -1339,20 +1332,19 @@ pub async fn release_execution_lease(
     };
     let row = sqlx::query(
         "UPDATE billing_transfer_intents SET \
-             state = CASE WHEN $4 THEN 'unknown' ELSE state END, \
-             last_execution_error_code = $5, \
-             result_code = CASE WHEN $4 THEN $5 ELSE result_code END, \
+             state = CASE WHEN $3 THEN 'unknown' ELSE state END, \
+             last_execution_error_code = $4, \
+             result_code = CASE WHEN $3 THEN $4 ELSE result_code END, \
              execution_lease_token = NULL, execution_lease_until = NULL, \
-             execution_next_attempt_at = to_timestamp($6), updated_at = to_timestamp($2) \
-         WHERE transfer_id = $1 AND execution_lease_token = $3 \
+             execution_next_attempt_at = now() + ($5 * interval '1 second'), updated_at = now() \
+         WHERE transfer_id = $1 AND execution_lease_token = $2 \
          RETURNING transfer_id",
     )
     .bind(transfer_id)
-    .bind(now_epoch)
     .bind(lease_token)
     .bind(failure.needs_unknown_state())
     .bind(failure.as_str())
-    .bind(now_epoch.saturating_add(transfer_retry_delay_seconds(failure, attempts)))
+    .bind(transfer_retry_delay_seconds(failure, attempts))
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;

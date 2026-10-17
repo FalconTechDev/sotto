@@ -256,34 +256,37 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     };
     tx.commit().await.expect("commit transfer");
 
-    let lease = claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_000)
+    let lease = claim_transfer_for_execution(&pool, &transfer.transfer_id)
         .await
         .expect("claim accepted transfer")
         .expect("accepted transfer is due");
     assert_eq!(lease.transfer.transfer_id, transfer.transfer_id);
     assert_eq!(lease.transfer.execution_attempt_count, 1);
-    assert!(
-        claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_001)
-            .await
-            .expect("live lease prevents a second claim")
-            .is_none()
-    );
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("live lease prevents a second claim")
+        .is_none());
     assert!(release_execution_lease(
         &pool,
         &transfer.transfer_id,
         &lease.lease_token,
-        1_800_000_000,
         TransferExecutionFailure::RetryableProvider,
     )
     .await
     .expect("release retryable lease"));
-    assert!(
-        claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_029)
-            .await
-            .expect("backoff prevents an early retry")
-            .is_none()
-    );
-    let retry = claim_transfer_for_execution(&pool, &transfer.transfer_id, 1_800_000_030)
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("backoff prevents an early retry")
+        .is_none());
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_next_attempt_at = now() - interval '1 second' \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("make retry due using the database clock");
+    let retry = claim_transfer_for_execution(&pool, &transfer.transfer_id)
         .await
         .expect("claim after retry delay")
         .expect("transfer becomes due after its delay");
@@ -293,13 +296,26 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         retry.transfer.provider_idempotency_key, transfer.provider_idempotency_key,
         "a retry keeps the same provider operation identity"
     );
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_lease_until = now() - interval '1 second' \
+         WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("expire the worker lease using the database clock");
+    let reclaimed = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("expired lease is reclaimable")
+        .expect("the transfer can be recovered");
+    assert_ne!(retry.lease_token, reclaimed.lease_token);
     assert!(
-        !finish_execution_lease(&pool, &transfer.transfer_id, &lease.lease_token)
+        !finish_execution_lease(&pool, &transfer.transfer_id, &retry.lease_token)
             .await
             .expect("stale worker cannot clear the new lease")
     );
     assert!(
-        finish_execution_lease(&pool, &transfer.transfer_id, &retry.lease_token)
+        finish_execution_lease(&pool, &transfer.transfer_id, &reclaimed.lease_token)
             .await
             .expect("current worker clears its own lease")
     );
@@ -455,6 +471,10 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     record_destination_paid(&mut tx, &transfer.transfer_id, "pi_destination")
         .await
         .expect("record destination payment after source scheduling");
+    assert!(matches!(
+        record_destination_paid(&mut tx, &transfer.transfer_id, "pi_conflicting").await,
+        Err(TransferError::ResultConflict)
+    ));
     complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
         .await
         .expect("complete local handover after both provider facts are verified");
