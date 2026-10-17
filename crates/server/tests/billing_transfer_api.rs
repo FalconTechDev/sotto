@@ -631,6 +631,19 @@ async fn same_person_transfer_requires_authority_for_both_payers() {
 
     let paid_through = now_epoch() + 86_400;
     sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status, current_period_end) \
+         VALUES ($1, $2, $3, 'active', $4)",
+    )
+    .bind(&owned_org)
+    .bind(format!("cus_transfer_api_{fixture}_owned_destination"))
+    .bind(format!("sub_transfer_api_{fixture}_owned_destination"))
+    .bind(paid_through)
+    .execute(&pool)
+    .await
+    .expect("insert active owned destination sponsor subscription");
+
+    sqlx::query(
         "INSERT INTO billing_operations \
          (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
           offer, quote_version, quote_expires_at_epoch, provider_idempotency_key) \
