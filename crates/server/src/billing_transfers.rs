@@ -1243,8 +1243,9 @@ pub async fn record_destination_schedule(
 }
 
 /// Link the first signed paid invoice for a future personal subscription to its already-recorded
-/// schedule. The webhook caller must have checked the transfer, customer and allocation metadata;
-/// the invoice evidence reader then independently verifies these claims before settlement.
+/// schedule. The caller has already read and checked the invoice and payment with Stripe; this
+/// store rechecks the transfer, customer, offer and exact renewal boundary before writing.
+#[allow(clippy::too_many_arguments)]
 pub async fn link_personal_destination_subscription(
     tx: &mut Transaction<'_, Postgres>,
     transfer_id: &str,
@@ -1253,6 +1254,8 @@ pub async fn link_personal_destination_subscription(
     allocation_reference: &str,
     customer_id: &str,
     subscription_id: &str,
+    offer: &str,
+    invoice_period_start: i64,
 ) -> Result<TransferIntent, TransferError> {
     for value in [
         transfer_id,
@@ -1271,6 +1274,8 @@ pub async fn link_personal_destination_subscription(
         || transfer.beneficiary_id != beneficiary_id
         || transfer.destination_operation_id.as_deref() != Some(operation_id)
         || transfer.destination_customer_id.as_deref() != Some(customer_id)
+        || transfer.offer.as_str() != offer
+        || transfer.effective_from != invoice_period_start
         || transfer
             .destination_provider_subscription_id
             .as_deref()
@@ -1288,7 +1293,8 @@ pub async fn link_personal_destination_subscription(
     let account = sqlx::query(
         "UPDATE billing_personal_accounts SET stripe_subscription_id = $4, updated_at = now() \
          WHERE user_id = $1 AND operation_id = $2 AND allocation_reference = $3 \
-           AND stripe_customer_id = $5 AND (stripe_subscription_id IS NULL OR stripe_subscription_id = $4) \
+           AND stripe_customer_id = $5 AND offer = $6 \
+           AND (stripe_subscription_id IS NULL OR stripe_subscription_id = $4) \
          RETURNING user_id",
     )
     .bind(beneficiary_id)
@@ -1296,6 +1302,7 @@ pub async fn link_personal_destination_subscription(
     .bind(allocation_reference)
     .bind(subscription_id)
     .bind(customer_id)
+    .bind(offer)
     .fetch_optional(&mut **tx)
     .await?;
     if account.is_none() {

@@ -4922,9 +4922,6 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         } else {
             false
         };
-    if event.kind == "invoice.paid" && !processed_duplicate {
-        prelink_personal_transfer_invoice(&state.pool, &event.data.object).await?;
-    }
     // Disabling setup stops new Checkout sessions, not settlement of sessions already created.
     // Recovery must continue when either transfer intake or the setup route is switched off.
     let transfer_setup = if event.kind == "checkout.session.completed"
@@ -5004,6 +5001,14 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     } else {
         (None, None)
     };
+    // A transfer destination subscription may not yet be linked to the personal account. Do not
+    // persist that association from webhook metadata alone: wait until the invoice and its
+    // payment have been read back from Stripe and their period, price and binding all agree.
+    if let Some(coverage) = personal_coverage.as_ref() {
+        if let Some(transfer_id) = coverage.transfer_id.as_deref() {
+            link_prepared_personal_transfer_invoice(&state.pool, coverage, transfer_id).await?;
+        }
+    }
     let personal_renewal_failure = if event.kind == "invoice.payment_failed"
         && billing.personal_coverage_ingest_enabled()
         && !accepted_failure_duplicate
@@ -5253,47 +5258,30 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     Ok(())
 }
 
-async fn prelink_personal_transfer_invoice(
+async fn link_prepared_personal_transfer_invoice(
     pool: &PgPool,
-    invoice: &serde_json::Value,
+    coverage: &PreparedPersonalInvoiceCoverage,
+    transfer_id: &str,
 ) -> Result<()> {
-    let Some(transfer_id) = invoice_metadata_claim(invoice, "sotto_transfer_id") else {
-        return Ok(());
-    };
-    let user_id = invoice_metadata_claim(invoice, "personal_user_id")
-        .ok_or_else(|| Error::Config("transfer invoice has no beneficiary binding".into()))?;
-    let operation_id = invoice_metadata_claim(invoice, "operation_id")
-        .ok_or_else(|| Error::Config("transfer invoice has no operation binding".into()))?;
-    let allocation_reference = invoice_allocation_reference_claim(invoice)
-        .ok_or_else(|| Error::Config("transfer invoice has no allocation binding".into()))?;
-    let customer_id = invoice
-        .get("customer")
-        .and_then(stripe_reference)
-        .ok_or_else(|| Error::Config("transfer invoice has no customer binding".into()))?;
-    let subscription_id = invoice_subscription_id_claim(invoice)
-        .ok_or_else(|| Error::Config("transfer invoice has no subscription binding".into()))?;
-    if operation_id != format!("{transfer_id}:destination") {
-        return Err(Error::Conflict(
-            "transfer invoice operation does not match".into(),
-        ));
-    }
     let mut tx = pool.begin().await?;
     founding_allocator::lock_capacity(&mut tx)
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-        .bind(user_id)
+        .bind(&coverage.allocation.beneficiary_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(Error::NotFound("billing beneficiary not found".into()))?;
     billing_transfers::link_personal_destination_subscription(
         &mut tx,
         transfer_id,
-        user_id,
-        operation_id,
-        &allocation_reference,
-        &customer_id,
-        &subscription_id,
+        &coverage.allocation.beneficiary_id,
+        &coverage.operation_id,
+        &coverage.allocation.external_allocation_reference,
+        &coverage.allocation.provider_customer_id,
+        &coverage.allocation.subscription_id,
+        &coverage.offer,
+        coverage.period_start,
     )
     .await
     .map_err(Error::from)?;
@@ -5842,6 +5830,7 @@ struct PreparedPersonalInvoiceCoverage {
     event: crate::cloud_provider::VerifiedProviderEvent,
     allocation: VerifiedAllocation,
     operation_id: String,
+    transfer_id: Option<String>,
     offer: String,
     payment_reference: String,
     period_start: i64,
@@ -6535,11 +6524,46 @@ async fn prepare_personal_invoice_coverage(
             "personal invoice checkout is not yet linked".into(),
         ));
     };
-    let Some(subscription_id) = row.try_get::<Option<String>, _>("stripe_subscription_id")? else {
-        return Err(Error::Internal(
-            "personal invoice checkout is not yet linked".into(),
+    let invoice_subscription_id = subscription_claim
+        .as_deref()
+        .ok_or_else(|| Error::Config("personal invoice has no subscription binding".into()))?;
+    let claimed_transfer_id = invoice_metadata_claim(invoice, "sotto_transfer_id");
+    let stored_subscription_id: Option<String> = row.try_get("stripe_subscription_id")?;
+    let transfer_link_id = if stored_subscription_id.as_deref() == Some(invoice_subscription_id) {
+        None
+    } else if stored_subscription_id.is_none() {
+        let Some(transfer_id) = claimed_transfer_id else {
+            return Err(Error::Internal(
+                "personal invoice checkout is not yet linked".into(),
+            ));
+        };
+        let transfer_matches: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM billing_transfer_intents \
+             WHERE transfer_id = $1 AND beneficiary_id = $2 AND destination_kind = 'personal' \
+               AND destination_operation_id = $3 AND destination_customer_id = $4 \
+               AND destination_provider_subscription_id = $5 \
+               AND state IN ('destination_prepared','destination_paid', \
+                             'source_adjustment_pending','completed','unknown'))",
+        )
+        .bind(transfer_id)
+        .bind(&user_id)
+        .bind(&operation_id)
+        .bind(&customer_id)
+        .bind(invoice_subscription_id)
+        .fetch_one(pool)
+        .await?;
+        if !transfer_matches || operation_id != format!("{transfer_id}:destination") {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "invoice_binding_mismatch",
+            ));
+        }
+        Some(transfer_id.to_string())
+    } else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_binding_mismatch",
         ));
     };
+    let subscription_id = invoice_subscription_id.to_string();
     if stored_reference != allocation_reference
         || invoice_metadata_claim(invoice, "personal_user_id").is_some_and(|claim| claim != user_id)
         || invoice_metadata_claim(invoice, "operation_id")
@@ -6831,6 +6855,7 @@ async fn prepare_personal_invoice_coverage(
             event: evidence.event,
             allocation,
             operation_id,
+            transfer_id: transfer_link_id,
             offer,
             payment_reference: evidence.payment_intent_id,
             period_start: evidence.period_start,
