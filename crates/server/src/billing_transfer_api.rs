@@ -790,6 +790,7 @@ mod tests {
             destination_provider_subscription_id: None,
             source_provider_subscription_id: None,
             destination_payment_reference: None,
+            destination_period_end: None,
             source_adjustment_reference: None,
             source_restoration_reference: None,
             source_restoration_operation_id: None,

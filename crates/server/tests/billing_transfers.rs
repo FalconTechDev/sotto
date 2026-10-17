@@ -574,6 +574,17 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         .await,
         Err(TransferError::ResultConflict)
     ));
+    assert!(matches!(
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_destination",
+            transfer.effective_from,
+            transfer.effective_from + 2_678_401,
+        )
+        .await,
+        Err(TransferError::ResultConflict)
+    ));
     complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source")
         .await
         .expect("complete local handover after both provider facts are verified");
@@ -632,6 +643,17 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
             "pi_other",
             transfer.effective_from,
             transfer.effective_from + 2_678_400,
+        )
+        .await,
+        Err(TransferError::ResultConflict)
+    ));
+    assert!(matches!(
+        record_destination_paid(
+            &mut tx,
+            &transfer.transfer_id,
+            "pi_destination",
+            transfer.effective_from,
+            transfer.effective_from + 2_678_401,
         )
         .await,
         Err(TransferError::ResultConflict)

@@ -645,6 +645,33 @@ fn personal_source_end_matches(
         && snapshot.current_period_end == Some(boundary_epoch)
 }
 
+fn personal_source_adjustment_preflight_matches(
+    snapshot: &crate::billing::SponsoredSubscriptionSnapshot,
+    expected_subscription_id: &str,
+    boundary_epoch: i64,
+) -> bool {
+    if snapshot.subscription_id != expected_subscription_id
+        || snapshot.current_period_end != Some(boundary_epoch)
+    {
+        return false;
+    }
+    match snapshot.status {
+        SubscriptionStatus::Canceled | SubscriptionStatus::Active => snapshot
+            .cancel_at
+            .is_none_or(|cancel_at| cancel_at == boundary_epoch),
+        _ => false,
+    }
+}
+
+fn personal_source_adjustment_is_applied(
+    snapshot: &crate::billing::SponsoredSubscriptionSnapshot,
+    boundary_epoch: i64,
+) -> bool {
+    snapshot.status == SubscriptionStatus::Canceled
+        || snapshot.cancel_at_period_end
+        || snapshot.cancel_at == Some(boundary_epoch)
+}
+
 fn sponsored_phase_matches_snapshot(
     expected: &crate::billing::SponsoredSubscriptionPhase,
     actual: &crate::billing::SponsoredSubscriptionSnapshot,

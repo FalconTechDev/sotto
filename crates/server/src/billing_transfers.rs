@@ -244,6 +244,7 @@ pub struct TransferIntent {
     pub destination_provider_subscription_id: Option<String>,
     pub source_provider_subscription_id: Option<String>,
     pub destination_payment_reference: Option<String>,
+    pub destination_period_end: Option<i64>,
     pub source_adjustment_reference: Option<String>,
     pub source_restoration_reference: Option<String>,
     pub source_restoration_operation_id: Option<String>,
@@ -1342,16 +1343,24 @@ pub async fn record_destination_paid(
     if current.effective_from != invoice_period_start {
         return Err(TransferError::DestinationTermChanged);
     }
+    if current
+        .destination_period_end
+        .is_some_and(|recorded_end| recorded_end != invoice_period_end)
+    {
+        return Err(TransferError::ResultConflict);
+    }
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET \
          state = CASE WHEN state = 'source_adjustment_pending' THEN state ELSE 'destination_paid' END, \
-         destination_payment_reference = $2, updated_at = now() \
+         destination_payment_reference = $2, destination_period_end = $3, updated_at = now() \
          WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending') \
            AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
+           AND (destination_period_end IS NULL OR destination_period_end = $3) \
          RETURNING transfer_id",
     )
     .bind(transfer_id)
     .bind(payment_reference)
+    .bind(invoice_period_end)
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_none() {
@@ -1362,6 +1371,7 @@ pub async fn record_destination_paid(
                 | TransferState::SourceAdjustmentPending
                 | TransferState::Completed
         ) && current.destination_payment_reference.as_deref() == Some(payment_reference)
+            && current.destination_period_end == Some(invoice_period_end)
         {
             return Ok(current);
         }
@@ -1422,6 +1432,10 @@ pub async fn complete_source_adjustment(
     }
     if transfer.state != TransferState::SourceAdjustmentPending {
         return Err(TransferError::InvalidTransition);
+    }
+    if transfer.destination_payment_reference.is_some() && transfer.destination_period_end.is_none()
+    {
+        return Err(TransferError::CorruptState);
     }
     if transfer
         .source_adjustment_reference
@@ -2253,6 +2267,7 @@ pub(crate) fn transfer_from_row(
             .try_get("destination_provider_subscription_id")?,
         source_provider_subscription_id: row.try_get("source_provider_subscription_id")?,
         destination_payment_reference: row.try_get("destination_payment_reference")?,
+        destination_period_end: row.try_get("destination_period_end")?,
         source_adjustment_reference: row.try_get("source_adjustment_reference")?,
         source_restoration_reference: row.try_get("source_restoration_reference")?,
         source_restoration_operation_id: row.try_get("source_restoration_operation_id")?,
