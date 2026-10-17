@@ -27,7 +27,7 @@ segredos em texto puro nem chaves utilizáveis.
 O fluxo de ponta a ponta funciona: criptografe localmente, sincronize texto cifrado, descriptografe em outro dispositivo ou no
 navegador e compartilhe um único segredo com um link de uso único. Equipes também funcionam de ponta a ponta: organizações
 com papéis, concessões de ambiente por membro, rotação de chaves ao remover um membro, tokens de máquina para CI
-e recuperação de conta por perda de chaves.
+e a redefinição da conta em caso de perda do Emergency Kit.
 
 | Componente | Disponível agora |
 | --- | --- |
@@ -139,11 +139,12 @@ jobs:
           SOTTO_TOKEN: ${{ secrets.SOTTO_TOKEN }}
 ```
 
-A referência da action e `sotto-version` são independentes. O exemplo fixa, pelo SHA completo do commit, a implementação v1.1
-incorporada porque ainda não foi publicada uma release numerada da action. Mantenha
-`sotto-version` como uma versão exata `vX.Y.Z`. Defina a variável de repositório opcional `SOTTO_SERVER`
-para um servidor auto-hospedado. Consulte a [documentação da action](https://github.com/getsotto/sotto-action#readme)
-para exemplos de matriz, Windows e workflows reutilizáveis.
+A referência da action e `sotto-version` são independentes. Mantenha `sotto-version` como uma
+versão exata `vX.Y.Z`. Defina a variável de repositório `SOTTO_SERVER` com a URL do seu servidor,
+inclusive `https://getsotto.co.uk` para o Sotto Cloud: com `SOTTO_TOKEN` definido, `sotto run` e
+`sotto export` nunca recorrem a um servidor padrão, então o token só vai para um servidor que você
+indicou. Consulte a [documentação da action](https://github.com/getsotto/sotto-action#readme) para
+exemplos de matriz, Windows e workflows reutilizáveis.
 
 ## Início rápido
 
@@ -225,23 +226,26 @@ sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no p
 
 `sotto org plan <org-id>` lê a visão atual de direitos do servidor configurado para essa
 organização. É preciso estar autenticado (`sotto login`); o cofre local não precisa estar
-desbloqueado. Ele mostra o nível atribuído, o nível efetivo (cujos limites se aplicam agora), um
-fim de trial opcional e ou limites de membros e projetos da organização ou
+desbloqueado. Ele mostra o nível atribuído, o nível efetivo (cujos limites se aplicam agora), o
+fim do trial quando a organização tem um, e ou limites de membros e projetos da organização ou
 `limits: none (Team)`.
 
-Saída ilustrativa no estilo Free:
+Saída ilustrativa no Sotto Cloud para uma organização gratuita cujo trial terminou:
 
 ```text
 tier:      free
 effective: free
+trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Saída ilustrativa Team:
+Um servidor auto-hospedado não aplica limites de plano, então sempre informa `team` como nível
+efetivo, sejam quais forem o nível e o fim de trial que a organização tenha armazenados:
 
 ```text
-tier:      team
+tier:      free
 effective: team
+trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
@@ -319,7 +323,7 @@ O formato JSON é útil para scripts. Sua estrutura de nível superior é:
   "billing_url": "https://getsotto.co.uk/cloud",
   "server_info": {
     "deployment_mode": "cloud",
-    "entitlement_model": "person"
+    "entitlement_model": "organisation_tiers_v1"
   },
   "eligibility": {
     "model": "person_eligibility_v1",
@@ -479,7 +483,7 @@ O `rust-toolchain.toml` incluído pede ao Rustup para instalar automaticamente o
 
 ## Desenvolvimento
 
-Clone o repositório e compile e teste o workspace completo:
+Clone o repositório e compile e teste o workspace:
 
 ```sh
 git clone https://github.com/getsotto/sotto.git
@@ -487,6 +491,17 @@ cd sotto
 
 cargo build --workspace
 cargo test --workspace
+```
+
+`cargo test --workspace` não precisa de banco de dados, então ignora os testes de integração do
+servidor e o teste de ponta a ponta da CLI sem falhar. Para executá-los, suba o Postgres local e
+ative-os com `SOTTO_RUN_DB_TESTS=1`; eles recusam um `DATABASE_URL` que aponte para qualquer lugar
+que não seja esta máquina:
+
+```sh
+docker compose up -d
+DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto SOTTO_RUN_DB_TESTS=1 \
+  cargo test -p sotto-server -p sotto-cli
 ```
 
 Use a CLI localmente (sem servidor):

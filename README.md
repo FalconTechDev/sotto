@@ -25,7 +25,7 @@ receiving plaintext secrets or usable keys.
 The end-to-end flow works: encrypt locally, sync ciphertext, decrypt on another device or in the
 browser, and share a single secret via a one-time link. Teams work end to end too: organisations
 with roles, per-member environment grants, key rotation on member removal, machine tokens for CI,
-and lost-key account recovery.
+and an account reset for a lost Emergency Kit.
 
 | Component | Available now |
 | --- | --- |
@@ -138,9 +138,11 @@ jobs:
 ```
 
 The action ref and `sotto-version` are independent. Keep `sotto-version` as an exact `vX.Y.Z`
-release. Set the optional `SOTTO_SERVER` repository variable
-for a self-hosted server. See the [action documentation](https://github.com/getsotto/sotto-action#readme)
-for matrix, Windows, and reusable-workflow examples.
+release. Set the `SOTTO_SERVER` repository variable to your server's URL, including
+`https://getsotto.co.uk` for Sotto Cloud: with `SOTTO_TOKEN` set, `sotto run` and `sotto export`
+never fall back to a default server, so the token only goes to a server you named. See the
+[action documentation](https://github.com/getsotto/sotto-action#readme) for matrix, Windows, and
+reusable-workflow examples.
 
 ## Quick start
 
@@ -220,22 +222,26 @@ sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no p
 
 `sotto org plan <org-id>` reads the configured server's current entitlement view for that
 organisation. You must be logged in (`sotto login`); the local vault does not need to be unlocked.
-It prints the assigned tier, the effective tier (the tier whose limits apply now), an optional
-trial end, and either member and organisation-project limits or `limits: none (Team)`.
+It prints the assigned tier, the effective tier (the tier whose limits apply now), the trial end
+when the organisation has one, and either member and organisation-project limits or
+`limits: none (Team)`.
 
-Illustrative Free-style output:
+Illustrative output on Sotto Cloud for a free organisation whose trial has ended:
 
 ```text
 tier:      free
 effective: free
+trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Illustrative Team output:
+A self-hosted server applies no plan limits, so it always reports the effective tier as `team`,
+whatever tier and trial end the organisation has stored:
 
 ```text
-tier:      team
+tier:      free
 effective: team
+trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
@@ -310,7 +316,7 @@ The JSON form is useful for scripts. Its top-level shape is:
   "billing_url": "https://getsotto.co.uk/cloud",
   "server_info": {
     "deployment_mode": "cloud",
-    "entitlement_model": "person"
+    "entitlement_model": "organisation_tiers_v1"
   },
   "eligibility": {
     "model": "person_eligibility_v1",
@@ -453,7 +459,7 @@ Web client (WASM) ┘                         │
 
 The workspace contains four crates:
 
-- `crates/core` - shared cryptographic types and, the complete crypto implementation.
+- `crates/core` - shared cryptographic types and the complete crypto implementation.
 - `crates/cli` - the `sotto` command-line interface and primary native client.
 - `crates/server` - the Axum-based synchronisation API.
 - `crates/wasm` - `wasm-bindgen` bindings that expose the core to web clients.
@@ -469,7 +475,7 @@ target automatically.
 
 ## Developing
 
-Clone the repository, then build and test the complete workspace:
+Clone the repository, then build and test the workspace:
 
 ```sh
 git clone https://github.com/getsotto/sotto.git
@@ -477,6 +483,16 @@ cd sotto
 
 cargo build --workspace
 cargo test --workspace
+```
+
+`cargo test --workspace` needs no database, so it skips the server's integration tests and the
+CLI's end-to-end test without failing. To run them, start the local Postgres and opt in with
+`SOTTO_RUN_DB_TESTS=1`; they refuse a `DATABASE_URL` that points anywhere but this machine:
+
+```sh
+docker compose up -d
+DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto SOTTO_RUN_DB_TESTS=1 \
+  cargo test -p sotto-server -p sotto-cli
 ```
 
 Use the CLI locally (no server required):

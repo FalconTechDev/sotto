@@ -27,7 +27,7 @@ oder verwendbare Schlüssel zu erhalten.
 Der Ende-zu-Ende-Ablauf funktioniert: lokal verschlüsseln, Chiffrat synchronisieren, auf einem anderen Gerät oder im
 Browser entschlüsseln und ein einzelnes Secret über einen Einmal-Link teilen. Auch für Teams funktioniert der gesamte Ablauf:
 Organisationen mit Rollen, Umgebungs-Grants pro Mitglied, Schlüsselrotation beim Entfernen von Mitgliedern,
-Maschinen-Token für CI und Kontowiederherstellung bei Schlüsselverlust.
+Maschinen-Token für CI und das Zurücksetzen des Kontos bei verlorenem Emergency Kit.
 
 | Komponente | Jetzt verfügbar |
 | --- | --- |
@@ -139,11 +139,12 @@ jobs:
           SOTTO_TOKEN: ${{ secrets.SOTTO_TOKEN }}
 ```
 
-Die Action-Referenz und `sotto-version` sind unabhängig. Das Beispiel pinnt die zusammengeführte v1.1-Implementierung
-per vollständigen Commit-SHA, weil noch kein nummeriertes Action-Release veröffentlicht wurde. Belasse
-`sotto-version` bei einem exakten `vX.Y.Z`-Release. Setze die optionale Repository-Variable `SOTTO_SERVER`
-für einen selbst gehosteten Server. Siehe die [Action-Dokumentation](https://github.com/getsotto/sotto-action#readme)
-für Matrix-, Windows- und Reusable-Workflow-Beispiele.
+Die Action-Referenz und `sotto-version` sind unabhängig. Belasse `sotto-version` bei einem exakten
+`vX.Y.Z`-Release. Setze die Repository-Variable `SOTTO_SERVER` auf die URL deines Servers, auch bei
+Sotto Cloud (`https://getsotto.co.uk`): Ist `SOTTO_TOKEN` gesetzt, greifen `sotto run` und
+`sotto export` nie auf einen Standardserver zurück, sodass das Token nur an einen Server geht, den du
+benannt hast. Siehe die [Action-Dokumentation](https://github.com/getsotto/sotto-action#readme) für
+Matrix-, Windows- und Reusable-Workflow-Beispiele.
 
 ## Schnellstart
 
@@ -225,23 +226,26 @@ sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no p
 
 `sotto org plan <org-id>` liest die aktuelle Berechtigungsansicht des konfigurierten Servers für
 diese Organisation. Du musst angemeldet sein (`sotto login`); der lokale Tresor muss nicht
-entsperrt sein. Es zeigt die zugewiesene Stufe, die wirksame Stufe (deren Limits jetzt gelten), ein
-optionales Trial-Ende sowie entweder Mitglieder- und Organisationsprojekt-Limits oder
-`limits: none (Team)`.
+entsperrt sein. Es zeigt die zugewiesene Stufe, die wirksame Stufe (deren Limits jetzt gelten), das
+Trial-Ende, sofern die Organisation eines hat, sowie entweder Mitglieder- und
+Organisationsprojekt-Limits oder `limits: none (Team)`.
 
-Illustrative Free-Ausgabe:
+Illustrative Ausgabe in Sotto Cloud für eine kostenlose Organisation nach Ende ihres Trials:
 
 ```text
 tier:      free
 effective: free
+trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Illustrative Team-Ausgabe:
+Ein selbst gehosteter Server wendet keine Plan-Limits an und meldet daher immer `team` als wirksame
+Stufe, unabhängig davon, welche Stufe und welches Trial-Ende für die Organisation gespeichert sind:
 
 ```text
-tier:      team
+tier:      free
 effective: team
+trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
@@ -319,7 +323,7 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
   "billing_url": "https://getsotto.co.uk/cloud",
   "server_info": {
     "deployment_mode": "cloud",
-    "entitlement_model": "person"
+    "entitlement_model": "organisation_tiers_v1"
   },
   "eligibility": {
     "model": "person_eligibility_v1",
@@ -484,7 +488,7 @@ Die eingecheckte `rust-toolchain.toml` lässt Rustup die benötigten Komponenten
 
 ## Entwicklung
 
-Klone das Repository, baue und teste dann den gesamten Workspace:
+Klone das Repository, baue und teste dann den Workspace:
 
 ```sh
 git clone https://github.com/getsotto/sotto.git
@@ -492,6 +496,17 @@ cd sotto
 
 cargo build --workspace
 cargo test --workspace
+```
+
+`cargo test --workspace` braucht keine Datenbank und überspringt daher die Integrationstests des
+Servers und den Ende-zu-Ende-Test der CLI, ohne fehlzuschlagen. Um sie auszuführen, starte das
+lokale Postgres und aktiviere sie mit `SOTTO_RUN_DB_TESTS=1`; sie verweigern eine `DATABASE_URL`,
+die auf etwas anderes als diesen Rechner zeigt:
+
+```sh
+docker compose up -d
+DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto SOTTO_RUN_DB_TESTS=1 \
+  cargo test -p sotto-server -p sotto-cli
 ```
 
 Nutze die CLI lokal (kein Server erforderlich):
