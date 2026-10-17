@@ -251,6 +251,8 @@ pub enum BeginTransfer {
 
 #[derive(Debug, Error)]
 pub enum TransferError {
+    #[error("transfer not found")]
+    MissingTransfer,
     #[error("transfer has invalid {0}")]
     InvalidField(&'static str),
     #[error("transfer quote has expired")]
@@ -431,6 +433,7 @@ fn offer_at_transfer_boundary(
 impl From<TransferError> for Error {
     fn from(error: TransferError) -> Self {
         match error {
+            TransferError::MissingTransfer => Self::NotFound("transfer not found".into()),
             TransferError::InvalidField(field) => {
                 Self::BadRequest(format!("invalid transfer {field}"))
             }
@@ -1248,8 +1251,9 @@ async fn load_transfer(
     let row =
         sqlx::query("SELECT * FROM billing_transfer_intents WHERE transfer_id = $1 FOR UPDATE")
             .bind(transfer_id)
-            .fetch_one(&mut **tx)
-            .await?;
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(TransferError::MissingTransfer)?;
     transfer_from_row(&row)
 }
 
@@ -1259,8 +1263,9 @@ async fn load_transfer_snapshot(
 ) -> Result<TransferIntent, TransferError> {
     let row = sqlx::query("SELECT * FROM billing_transfer_intents WHERE transfer_id = $1")
         .bind(transfer_id)
-        .fetch_one(&mut **tx)
-        .await?;
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(TransferError::MissingTransfer)?;
     transfer_from_row(&row)
 }
 

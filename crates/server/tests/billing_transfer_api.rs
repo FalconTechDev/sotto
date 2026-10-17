@@ -318,6 +318,19 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{stranger_accept_body}");
 
+    for action in ["accept", "withdraw"] {
+        let missing_id = format!("transfer:missing-{fixture}");
+        let (status, body) = request(
+            &app,
+            "POST",
+            &format!("/billing/transfers/{missing_id}/{action}"),
+            &beneficiary_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
     let (status, accepted_body) = request(
         &app,
         "POST",
@@ -512,5 +525,126 @@ async fn sponsored_source_quotes_cover_personal_and_sponsor_destinations() {
     .await
     .expect("count transfer intents");
     assert_eq!(transfer_count, 0, "quoting must not create an invitation");
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn same_person_transfer_requires_authority_for_both_payers() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().to_string();
+    let beneficiary = format!("transfer-api-test-{fixture}-beneficiary");
+    let other_owner = format!("transfer-api-test-{fixture}-other-owner");
+    let owned_org = format!("transfer-api-test-{fixture}-owned-org");
+    let foreign_org = format!("transfer-api-test-{fixture}-foreign-org");
+    let operation = format!("transfer-api-test-{fixture}-operation");
+    cleanup(&pool, &fixture).await;
+    insert_user(&pool, &beneficiary).await;
+    insert_user(&pool, &other_owner).await;
+
+    for (org_id, owner) in [(&owned_org, &beneficiary), (&foreign_org, &other_owner)] {
+        sqlx::query(
+            "INSERT INTO organizations (id, enc_name, created_by) \
+             VALUES ($1, decode('6f7267', 'hex'), $2)",
+        )
+        .bind(org_id)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("insert organisation");
+        sqlx::query(
+            "INSERT INTO organization_memberships (org_id, user_id, role) \
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(org_id)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("insert organisation owner");
+    }
+
+    let paid_through = now_epoch() + 86_400;
+    sqlx::query(
+        "INSERT INTO billing_operations \
+         (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
+          offer, quote_version, quote_expires_at_epoch, provider_idempotency_key) \
+         VALUES ($1, $1, $1, $2, $2, $2, 'standard_monthly', 1, $3, $1)",
+    )
+    .bind(&operation)
+    .bind(&beneficiary)
+    .bind(paid_through)
+    .execute(&pool)
+    .await
+    .expect("insert source billing operation");
+    sqlx::query(
+        "INSERT INTO billing_personal_accounts \
+         (user_id, operation_id, offer, stripe_subscription_id, state, pending_expires_at_epoch, \
+          paid_through_epoch, paid_through_date) \
+         VALUES ($1, $2, 'standard_monthly', $3, 'active', $4, $4, to_timestamp($4)::date)",
+    )
+    .bind(&beneficiary)
+    .bind(&operation)
+    .bind(format!("sub_transfer_api_{fixture}"))
+    .bind(paid_through)
+    .execute(&pool)
+    .await
+    .expect("insert active personal source");
+
+    let token = session::issue(&pool, &beneficiary)
+        .await
+        .expect("issue beneficiary session");
+    let app = app(pool.clone(), true);
+    let quote_body = |destination_org: &str| {
+        serde_json::json!({
+            "beneficiary_id": beneficiary,
+            "counterparty_user_id": beneficiary,
+            "destination_kind": "sponsor",
+            "destination_organization_id": destination_org,
+        })
+    };
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/billing/transfers/quote",
+        &token,
+        Some(quote_body(&foreign_org).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/billing/transfers/quote",
+        &token,
+        Some(quote_body(&owned_org).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let quote: serde_json::Value = serde_json::from_str(&body).expect("quote JSON");
+    let begin = serde_json::json!({
+        "beneficiary_id": beneficiary,
+        "counterparty_user_id": beneficiary,
+        "destination_kind": "sponsor",
+        "destination_organization_id": owned_org,
+        "quote_id": quote["quote_id"],
+        "quote_version": quote["quote_version"],
+        "quote_expires_at_epoch": quote["quote_expires_at_epoch"],
+        "idempotency_key": format!("transfer-api-test-{fixture}-self-transfer"),
+    });
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/billing/transfers",
+        &token,
+        Some(begin.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).expect("transfer JSON");
+    assert_eq!(created["state"], "pending");
+
     cleanup(&pool, &fixture).await;
 }

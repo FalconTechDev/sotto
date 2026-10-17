@@ -2,6 +2,8 @@
 //!
 //! The API exposes only server-derived local billing terms. Provider execution is not mounted
 //! here; even an accepted intent remains inert until a separate recovery-capable worker ships.
+//! A distinct counterparty must accept an invitation. One person may start a transfer directly
+//! only when the server verifies that they have authority for both payer sides.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
