@@ -1827,6 +1827,8 @@ async fn claim_due_matching(
              SELECT transfer.transfer_id FROM billing_transfer_intents AS transfer \
              WHERE transfer.state IN ('pending','destination_prepared','destination_paid', \
                              'source_adjustment_pending','source_restoration_pending','unknown') \
+               AND ($4 OR transfer.destination_kind <> 'personal' \
+                    OR transfer.destination_setup_intent_id IS NOT NULL) \
                AND (transfer.execution_next_attempt_at <= now() \
                     OR ($4 AND transfer.execution_manual_review_required)) \
                AND (transfer.execution_lease_until IS NULL OR transfer.execution_lease_until <= now()) \

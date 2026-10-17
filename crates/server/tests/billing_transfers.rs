@@ -1075,6 +1075,22 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
             accept_transfer(&mut tx, &transfer_id, &beneficiary, 1_800_000_000)
                 .await
                 .expect("beneficiary accepts sponsored transfer");
+            tx.commit()
+                .await
+                .expect("commit transfer while Setup Checkout is incomplete");
+            assert!(claim_transfer_for_execution(&pool, &transfer_id)
+                .await
+                .expect("worker leaves setup waiting for the beneficiary")
+                .is_none());
+            let attempts: i32 = sqlx::query_scalar(
+                "SELECT execution_attempt_count FROM billing_transfer_intents WHERE transfer_id = $1",
+            )
+            .bind(&transfer_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read setup waiting attempts");
+            assert_eq!(attempts, 0, "waiting for setup must not consume retries");
+            let mut tx = pool.begin().await.expect("resume setup completion");
             sqlx::query(
                 "UPDATE billing_transfer_intents SET destination_customer_id = $2, \
                      destination_setup_session_id = $3 WHERE transfer_id = $1",
@@ -1144,6 +1160,7 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         }
         BeginTransfer::AlreadyExists(_) => panic!("transfer unexpectedly existed"),
     };
+    let mut tx = pool.begin().await.expect("begin transfer cleanup");
     mark_failed(&mut tx, &transfer_id, "test_abort")
         .await
         .expect("abort uncommitted provider step");
