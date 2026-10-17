@@ -957,18 +957,13 @@ fn approve_task(name: &str, environment: &str) -> Result<()> {
     }
 
     println!("Review this task before approving it:");
+    let resolved_executable = task.resolve_executable(&project_root)?;
+
     println!("Project identity: {:?}", config.project_id);
     println!("Project root: {:?}", project_root);
     println!("Task: {:?}", task.name());
     println!("Description: {}", task.description());
-    match task.executable_target(&project_root) {
-        sotto_cli::agent_tasks::ExecutableTarget::SearchPath(name) => {
-            println!("Executable target: PATH lookup for {name:?}");
-        }
-        sotto_cli::agent_tasks::ExecutableTarget::Path(path) => {
-            println!("Executable target: {path:?}");
-        }
-    }
+    println!("Resolved executable: {resolved_executable:?}");
     if task.args().is_empty() {
         println!("Arguments: (none)");
     } else {
@@ -1004,7 +999,11 @@ fn approve_task(name: &str, environment: &str) -> Result<()> {
         return Ok(());
     }
 
-    let fingerprint = manifest.fingerprint_for(name)?;
+    let declaration_fingerprint = manifest.fingerprint_for(name)?;
+    let fingerprint = sotto_cli::agent_approvals::approval_fingerprint(
+        &declaration_fingerprint,
+        &resolved_executable,
+    )?;
     let approvals = open_task_approval_store(&project_root)?;
     approvals.approve(
         &config.project_id,

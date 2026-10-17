@@ -318,7 +318,8 @@ mod interactive_approval_tests {
         assert!(stdout.contains("Project identity:"), "{stdout}");
         assert!(stdout.contains("Project root:"), "{stdout}");
         assert!(stdout.contains("Description: Run tests"), "{stdout}");
-        assert!(stdout.contains("PATH lookup for \"cargo\""), "{stdout}");
+        assert!(stdout.contains("Resolved executable: "), "{stdout}");
+        assert!(stdout.contains("cargo"), "{stdout}");
         assert!(stdout.contains("Argument 0: \"test\""), "{stdout}");
         assert!(
             stdout.contains("Argument 1: \"--no-fail-fast\""),

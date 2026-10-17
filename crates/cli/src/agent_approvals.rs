@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
@@ -17,6 +18,23 @@ const SCHEMA_VERSION: i64 = 1;
 
 /// Encode the canonical project root without losing non-UTF-8 filesystem bytes.
 pub fn project_root_key(path: &Path) -> String {
+    filesystem_path_key(path)
+}
+
+/// Bind a declaration fingerprint to the exact executable resolved during approval.
+pub fn approval_fingerprint(declaration_fingerprint: &str, executable: &Path) -> Result<String> {
+    if !valid_fingerprint(declaration_fingerprint) {
+        return Err(Error::Input("invalid task declaration fingerprint".into()));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"sotto-task-approval-v1\0");
+    digest.update(declaration_fingerprint.as_bytes());
+    digest.update(b"\0");
+    digest.update(filesystem_path_key(executable).as_bytes());
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn filesystem_path_key(path: &Path) -> String {
     #[cfg(unix)]
     let bytes = {
         use std::os::unix::ffi::OsStrExt;
@@ -327,6 +345,16 @@ mod tests {
                 .is_approved(key.0, key.1, key.2, key.3, key.4)
                 .unwrap());
         }
+    }
+
+    #[test]
+    fn approval_fingerprint_changes_when_the_resolved_executable_changes() {
+        let declaration = "a".repeat(64);
+        let first = approval_fingerprint(&declaration, Path::new("/usr/bin/tool-v1")).unwrap();
+        let second = approval_fingerprint(&declaration, Path::new("/opt/tools/tool-v1")).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64);
     }
 
     #[test]
