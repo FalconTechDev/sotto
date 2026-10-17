@@ -22,9 +22,14 @@ LOADER.exec_module(CHECKER)
 SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 RSA = {"name": "rsa", "version": "0.9.10", "source": SOURCE}
 SPIN = {"name": "spin", "version": "0.9.8", "source": SOURCE}
-ZBUS_NAMES = {"name": "zbus_names", "version": "3.0.0", "source": SOURCE}
-ZVARIANT = {"name": "zvariant", "version": "4.2.0", "source": SOURCE}
-ZVARIANT_DERIVE = {"name": "zvariant_derive", "version": "4.2.0", "source": SOURCE}
+UNMAINTAINED = [
+    {"name": "zbus_names", "version": "3.0.0", "source": SOURCE,
+     "advisory": "RUSTSEC-2026-0371"},
+    {"name": "zvariant", "version": "4.2.0", "source": SOURCE,
+     "advisory": "RUSTSEC-2026-0370"},
+    {"name": "zvariant_derive", "version": "4.2.0", "source": SOURCE,
+     "advisory": "RUSTSEC-2026-0372"},
+]
 
 
 def report():
@@ -42,12 +47,10 @@ def report():
         "warnings": {
             "yanked": [{"kind": "yanked", "package": SPIN, "advisory": None}],
             "unmaintained": [
-                {"kind": "unmaintained", "package": ZBUS_NAMES,
-                 "advisory": {"id": "RUSTSEC-2026-0371"}},
-                {"kind": "unmaintained", "package": ZVARIANT,
-                 "advisory": {"id": "RUSTSEC-2026-0370"}},
-                {"kind": "unmaintained", "package": ZVARIANT_DERIVE,
-                 "advisory": {"id": "RUSTSEC-2026-0372"}},
+                {"kind": "unmaintained",
+                 "package": {key: value for key, value in package.items() if key != "advisory"},
+                 "advisory": {"id": package["advisory"]}}
+                for package in UNMAINTAINED
             ],
         },
     }
@@ -64,8 +67,10 @@ class PolicyTest(unittest.TestCase):
         self.lockfile = self.root / "Cargo.lock"
         self.lockfile.write_text('version = 4\n' + ''.join(
             f'[[package]]\nname = "{p["name"]}"\nversion = "{p["version"]}"\n'
-            f'source = "{SOURCE}"\n' for p in
-            (RSA, SPIN, ZBUS_NAMES, ZVARIANT, ZVARIANT_DERIVE)
+            f'source = "{SOURCE}"\n' for p in (RSA, SPIN, *[
+                {key: value for key, value in package.items() if key != "advisory"}
+                for package in UNMAINTAINED
+            ])
         ))
         self.audit_report = report()
         self.audit_status = 1
@@ -76,12 +81,12 @@ class PolicyTest(unittest.TestCase):
         self.terminal_findings = (
             "Crate:     rsa\nVersion:   0.9.10\nID:        RUSTSEC-2023-0071\n\n"
             "Crate:     spin\nVersion:   0.9.8\nWarning:   yanked\n\n"
-            "Crate:     zbus_names\nVersion:   3.0.0\nID:        RUSTSEC-2026-0371\n"
-            "Warning:   unmaintained\n\n"
-            "Crate:     zvariant\nVersion:   4.2.0\nID:        RUSTSEC-2026-0370\n"
-            "Warning:   unmaintained\n\n"
-            "Crate:     zvariant_derive\nVersion:   4.2.0\nID:        RUSTSEC-2026-0372\n"
-            "Warning:   unmaintained\n"
+            "Crate:     zbus_names\nVersion:   3.0.0\nWarning:   unmaintained\n"
+            "ID:        RUSTSEC-2026-0371\n\n"
+            "Crate:     zvariant\nVersion:   4.2.0\nWarning:   unmaintained\n"
+            "ID:        RUSTSEC-2026-0370\n\n"
+            "Crate:     zvariant_derive\nVersion:   4.2.0\nWarning:   unmaintained\n"
+            "ID:        RUSTSEC-2026-0372\n"
         )
         self.tree_output = "app v1.0.0\n\nanother-workspace-root v1.0.0\n"
         self.tree_status = 0

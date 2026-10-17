@@ -23,8 +23,8 @@ uuid.workspace = true
 sotto-core.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
-# Linux uses the synchronous D-Bus Secret Service backend with vendored libdbus, so neither builds
-# nor end-user machines need a system libdbus-1 package. The CLI calls keyring synchronously.
+# Linux uses the maintained synchronous Secret Service backend. Vendoring libdbus avoids requiring
+# a system `libdbus-1-dev` package on Linux builders and end-user machines.
 keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "windows-native",

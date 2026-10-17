@@ -28,10 +28,9 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 kind = "unmaintained"
 finding = "RUSTSEC-2026-0371"
-reason = """The optional async Secret Service backend retains this package in Cargo.lock. \
-Sotto selects keyring's synchronous, vendored D-Bus backend because its calls block and the CLI \
-does not run an async runtime. The audit policy verifies this backend is absent from every \
-workspace dependency graph."""
+reason = """Dormant dependency of keyring's unused async-secret-service feature. Sotto enables the \
+synchronous Secret Service backend with vendored libdbus instead. The all-target default-feature \
+and workspace-feature graphs confirm this crate is unreachable."""
 
 [[allowed_dormant]]
 package = "zvariant"
@@ -39,10 +38,9 @@ version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 kind = "unmaintained"
 finding = "RUSTSEC-2026-0370"
-reason = """The optional async Secret Service backend retains this package in Cargo.lock. \
-Sotto selects keyring's synchronous, vendored D-Bus backend because its calls block and the CLI \
-does not run an async runtime. The audit policy verifies this backend is absent from every \
-workspace dependency graph."""
+reason = """Dormant dependency of keyring's unused async-secret-service feature. Sotto enables the \
+synchronous Secret Service backend with vendored libdbus instead. The all-target default-feature \
+and workspace-feature graphs confirm this crate is unreachable."""
 
 [[allowed_dormant]]
 package = "zvariant_derive"
@@ -50,7 +48,6 @@ version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 kind = "unmaintained"
 finding = "RUSTSEC-2026-0372"
-reason = """The optional async Secret Service backend retains this package in Cargo.lock. \
-Sotto selects keyring's synchronous, vendored D-Bus backend because its calls block and the CLI \
-does not run an async runtime. The audit policy verifies this backend is absent from every \
-workspace dependency graph."""
+reason = """Dormant dependency of keyring's unused async-secret-service feature. Sotto enables the \
+synchronous Secret Service backend with vendored libdbus instead. The all-target default-feature \
+and workspace-feature graphs confirm this crate is unreachable."""
