@@ -390,7 +390,7 @@ mod interactive_approval_tests {
     #[test]
     fn approval_data_cannot_be_written_inside_the_project_checkout() {
         let (_temp, project, _data) = project_fixture();
-        let data = project.join(".sotto-data");
+        let data = project.join(".sotto-data/nested");
         let denied = run_on_pty(
             Command::new(env!("CARGO_BIN_EXE_sotto"))
                 .args(["task", "approve", "test", "--env", "dev"])
@@ -406,6 +406,39 @@ mod interactive_approval_tests {
             "{}",
             String::from_utf8_lossy(&denied.stderr)
         );
-        assert!(!data.join("task-approvals/approvals.db").exists());
+        assert!(
+            !project.join(".sotto-data").exists(),
+            "containment rejection must happen before creating any project-local state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_data_containment_resolves_existing_symlink_ancestors_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, project, _data) = project_fixture();
+        let project_alias = temp.path().join("project-alias");
+        symlink(&project, &project_alias).unwrap();
+        let data = temp
+            .path()
+            .join("missing/../project-alias/.sotto-data/nested");
+        let denied = run_on_pty(
+            Command::new(env!("CARGO_BIN_EXE_sotto"))
+                .args(["task", "approve", "test", "--env", "dev"])
+                .current_dir(&project)
+                .env("SOTTO_DATA_DIR", &data)
+                .env_remove("CI")
+                .env("TERM", "xterm-256color"),
+            b"y\n",
+        );
+
+        assert!(!denied.status.success());
+        assert!(
+            String::from_utf8_lossy(&denied.stderr).contains("outside the project checkout"),
+            "{}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        assert!(!project.join(".sotto-data").exists());
     }
 }

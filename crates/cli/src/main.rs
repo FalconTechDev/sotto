@@ -1017,6 +1017,11 @@ fn approve_task(name: &str, environment: &str) -> Result<()> {
 }
 
 fn list_task_approvals(environment: Option<&str>) -> Result<()> {
+    if environment.is_some_and(str::is_empty) {
+        return Err(Error::Input(
+            "task approval environment filter must not be empty".into(),
+        ));
+    }
     let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
     let (config, project_root) = Config::discover(&cwd)?;
     let project_root = std::fs::canonicalize(&project_root)
@@ -1057,17 +1062,88 @@ fn open_task_approval_store(
     project_root: &Path,
 ) -> Result<sotto_cli::agent_approvals::ApprovalStore> {
     let data_dir = sotto_cli::paths::data_dir()?;
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|error| Error::Io(format!("creating {}: {error}", data_dir.display())))?;
     let data_dir = std::fs::canonicalize(&data_dir)
         .map_err(|error| Error::Io(format!("resolving approval data directory: {error}")))?;
-    if data_dir.starts_with(project_root) {
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
+    sotto_cli::agent_approvals::ApprovalStore::open(&data_dir)
+}
+
+fn ensure_approval_data_dir_outside_project(data_dir: &Path, project_root: &Path) -> Result<()> {
+    let resolved = resolve_path_with_missing_tail(data_dir)?;
+    if resolved.starts_with(project_root) {
         return Err(Error::Input(
             "task approvals must be stored outside the project checkout; change SOTTO_DATA_DIR"
                 .into(),
         ));
     }
-    sotto_cli::agent_approvals::ApprovalStore::open(&data_dir)
+    Ok(())
+}
+
+/// Resolve existing path components (including symlinks) without creating a missing tail.
+fn resolve_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| Error::Io(format!("resolving current directory: {error}")))?
+            .join(path)
+    };
+
+    let mut resolved = PathBuf::new();
+    let mut has_missing_component = false;
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            std::path::Component::RootDir => resolved.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+                if has_missing_component {
+                    match std::fs::canonicalize(&resolved) {
+                        Ok(canonical) => {
+                            resolved = canonical;
+                            has_missing_component = false;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(Error::Io(format!(
+                                "resolving approval data directory {}: {error}",
+                                resolved.display()
+                            )))
+                        }
+                    }
+                }
+            }
+            std::path::Component::Normal(name) if has_missing_component => resolved.push(name),
+            std::path::Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                        has_missing_component = true;
+                    }
+                    Err(error) => {
+                        return Err(Error::Io(format!(
+                            "resolving approval data directory {}: {error}",
+                            candidate.display()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(error) => Err(Error::Io(format!(
+            "resolving approval data directory {}: {error}",
+            resolved.display()
+        ))),
+    }
 }
 
 fn init(

@@ -416,11 +416,14 @@ fn validate_task(task: &TaskDeclaration, index: usize) -> Result<()> {
     }
     let mut environments = HashSet::with_capacity(task.environments.len());
     for environment in &task.environments {
-        if environment.len() > MAX_TEXT_LENGTH || environment.contains('\0') {
+        if environment.is_empty()
+            || environment.len() > MAX_TEXT_LENGTH
+            || environment.contains('\0')
+        {
             return Err(task_error(
                 index,
                 "environments",
-                "each environment name must be at most 4096 bytes and contain no NUL character",
+                "each environment name must be non-empty, at most 4096 bytes and contain no NUL character",
             ));
         }
         if !environments.insert(environment.as_str()) {
@@ -515,6 +518,7 @@ environments = ["dev"]
         for invalid in [
             VALID.replace("name = \"test\"", "name = \"Bad Name\""),
             VALID.replace("environments = [\"dev\"]", "environments = []"),
+            VALID.replace("environments = [\"dev\"]", "environments = [\"\"]"),
             VALID.replace(
                 "environments = [\"dev\"]",
                 "environments = [\"dev\"]\ntimeout_seconds = 0",

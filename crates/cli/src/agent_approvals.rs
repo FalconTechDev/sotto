@@ -116,13 +116,9 @@ impl ApprovalStore {
         environment: &str,
         fingerprint: &str,
     ) -> Result<()> {
-        if project_id.is_empty()
-            || project_root.is_empty()
-            || task_name.is_empty()
-            || environment.is_empty()
-            || !valid_fingerprint(fingerprint)
-        {
-            return Err(Error::Input("invalid task approval identity".into()));
+        validate_scope(project_id, project_root, task_name, environment)?;
+        if !valid_fingerprint(fingerprint) {
+            return Err(Error::Input("invalid task approval fingerprint".into()));
         }
         self.connection.execute(
             "INSERT INTO approvals (project_id, project_root, task_name, environment, fingerprint)
@@ -148,6 +144,10 @@ impl ApprovalStore {
         environment: &str,
         fingerprint: &str,
     ) -> Result<bool> {
+        validate_scope(project_id, project_root, task_name, environment)?;
+        if !valid_fingerprint(fingerprint) {
+            return Err(Error::Input("invalid task approval fingerprint".into()));
+        }
         let stored: Option<String> = self
             .connection
             .query_row(
@@ -161,6 +161,11 @@ impl ApprovalStore {
     }
 
     pub fn list(&self, project_id: &str, project_root: &str) -> Result<Vec<Approval>> {
+        if project_id.is_empty() || project_root.is_empty() {
+            return Err(Error::Input(
+                "invalid task approval project identity".into(),
+            ));
+        }
         let mut statement = self.connection.prepare(
             "SELECT task_name, environment, fingerprint FROM approvals
              WHERE project_id = ?1 AND project_root = ?2
@@ -191,6 +196,7 @@ impl ApprovalStore {
         task_name: &str,
         environment: &str,
     ) -> Result<bool> {
+        validate_scope(project_id, project_root, task_name, environment)?;
         let deleted = self.connection.execute(
             "DELETE FROM approvals
              WHERE project_id = ?1 AND project_root = ?2 AND task_name = ?3 AND environment = ?4",
@@ -198,6 +204,22 @@ impl ApprovalStore {
         )?;
         Ok(deleted != 0)
     }
+}
+
+fn validate_scope(
+    project_id: &str,
+    project_root: &str,
+    task_name: &str,
+    environment: &str,
+) -> Result<()> {
+    if project_id.is_empty()
+        || project_root.is_empty()
+        || task_name.is_empty()
+        || environment.is_empty()
+    {
+        return Err(Error::Input("invalid task approval identity".into()));
+    }
+    Ok(())
 }
 
 fn valid_fingerprint(fingerprint: &str) -> bool {
@@ -345,6 +367,23 @@ mod tests {
                 .is_approved(key.0, key.1, key.2, key.3, key.4)
                 .unwrap());
         }
+    }
+
+    #[test]
+    fn empty_environment_is_rejected_by_every_mutating_or_matching_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let approvals = ApprovalStore::open(temp.path()).unwrap();
+        let fingerprint = "a".repeat(64);
+
+        assert!(approvals
+            .approve("project-a", "/repo/a", "test", "", &fingerprint)
+            .is_err());
+        assert!(approvals
+            .is_approved("project-a", "/repo/a", "test", "", &fingerprint)
+            .is_err());
+        assert!(approvals
+            .revoke("project-a", "/repo/a", "test", "")
+            .is_err());
     }
 
     #[test]
