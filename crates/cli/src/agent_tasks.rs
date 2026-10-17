@@ -21,7 +21,6 @@ const MAX_ARGUMENTS: usize = 128;
 const MAX_TEXT_LENGTH: usize = 4096;
 const MAX_TASK_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 256;
-const MAX_ENVIRONMENT_NAME_LENGTH: usize = 128;
 
 /// A validated manifest stored at the Sotto project root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -330,11 +329,11 @@ fn validate_task(task: &TaskDeclaration, index: usize) -> Result<()> {
     }
     let mut environments = HashSet::with_capacity(task.environments.len());
     for environment in &task.environments {
-        if !valid_environment_name(environment) {
+        if environment.len() > MAX_TEXT_LENGTH || environment.contains('\0') {
             return Err(task_error(
                 index,
                 "environments",
-                "each environment name must be 1-128 lowercase ASCII letters, digits, hyphens or underscores, starting and ending with a letter or digit",
+                "each environment name must be at most 4096 bytes and contain no NUL character",
             ));
         }
         if !environments.insert(environment.as_str()) {
@@ -358,27 +357,17 @@ fn validate_task(task: &TaskDeclaration, index: usize) -> Result<()> {
     Ok(())
 }
 
-fn valid_environment_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= MAX_ENVIRONMENT_NAME_LENGTH
-        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-        && (bytes[bytes.len() - 1].is_ascii_lowercase() || bytes[bytes.len() - 1].is_ascii_digit())
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
-        })
-}
-
 fn validate_text_field(value: &str, index: usize, field: &str, allow_empty: bool) -> Result<()> {
     if (!allow_empty && value.trim().is_empty())
         || value.len() > MAX_TEXT_LENGTH
         || value.contains('\0')
     {
-        return Err(task_error(
-            index,
-            field,
-            "must be non-empty when required, at most 4096 bytes and contain no NUL character",
-        ));
+        let requirement = if allow_empty {
+            "must be at most 4096 bytes and contain no NUL character"
+        } else {
+            "must be non-empty, at most 4096 bytes and contain no NUL character"
+        };
+        return Err(task_error(index, field, requirement));
     }
     Ok(())
 }
@@ -449,13 +438,11 @@ environments = ["dev"]
     }
 
     #[test]
-    fn rejects_environment_names_outside_the_declared_ascii_grammar() {
-        for environment in ["prod/eu", "prod eu", "..", "Upper", "-prod", "prod_"] {
-            let invalid = VALID.replace("[\"dev\"]", &format!("[\"{environment}\"]"));
-            assert!(
-                TaskManifest::parse(Path::new("tasks.toml"), &invalid).is_err(),
-                "accepted invalid environment name {environment:?}"
-            );
+    fn preserves_existing_environment_names_without_imposing_a_new_grammar() {
+        for environment in ["prod/eu", "Production US", "..", "Upper", "-prod", "prod_"] {
+            let declaration = VALID.replace("[\"dev\"]", &format!("[\"{environment}\"]"));
+            let manifest = TaskManifest::parse(Path::new("tasks.toml"), &declaration).unwrap();
+            assert_eq!(manifest.tasks()[0].environments(), [environment]);
         }
     }
 
