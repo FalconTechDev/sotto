@@ -348,9 +348,6 @@ async fn adjust_source(
 ) -> Result<(), ExecutionError> {
     let transfer = &lease.transfer;
     if transfer.source_kind == TransferPayer::Personal {
-        if epoch_now() >= transfer.effective_from {
-            return Err(ExecutionError::Local("source_boundary_already_reached"));
-        }
         let source_subscription = transfer
             .source_provider_subscription_id
             .as_deref()
@@ -358,13 +355,17 @@ async fn adjust_source(
         let source = provider
             .get_sponsored_subscription(source_subscription)
             .await?;
-        if source.subscription_id != source_subscription
-            || source.current_period_end != Some(transfer.effective_from)
-            || source.status != SubscriptionStatus::Active
-            || source.cancel_at_period_end
-            || source.cancel_at.is_some()
-        {
+        if !personal_source_adjustment_preflight_matches(
+            &source,
+            source_subscription,
+            transfer.effective_from,
+        ) {
             return Err(ExecutionError::Local("source_period_changed"));
+        }
+        if epoch_now() >= transfer.effective_from
+            && !personal_source_adjustment_is_applied(&source, transfer.effective_from)
+        {
+            return Err(ExecutionError::Local("source_boundary_already_reached"));
         }
     }
     let mut tx = pool
@@ -1661,6 +1662,7 @@ mod tests {
             destination_provider_subscription_id: Some("sub_destination".into()),
             source_provider_subscription_id: Some("sub_source".into()),
             destination_payment_reference: None,
+            destination_period_end: None,
             source_adjustment_reference: None,
             source_restoration_reference: None,
             source_restoration_operation_id: None,
@@ -1802,5 +1804,56 @@ mod tests {
         assert!(!personal_source_end_matches(&current, 501));
         current.status = SubscriptionStatus::Active;
         assert!(!personal_source_end_matches(&current, 500));
+    }
+
+    #[test]
+    fn personal_source_adjustment_retry_accepts_the_recorded_boundary_cancellation() {
+        let mut current = snapshot("sub_source");
+        assert!(personal_source_adjustment_preflight_matches(
+            &current,
+            "sub_source",
+            500
+        ));
+        assert!(!personal_source_adjustment_is_applied(&current, 500));
+
+        current.cancel_at_period_end = true;
+        assert!(personal_source_adjustment_is_applied(&current, 500));
+        assert!(personal_source_adjustment_preflight_matches(
+            &current,
+            "sub_source",
+            500
+        ));
+        current.cancel_at_period_end = false;
+        current.cancel_at = Some(500);
+        assert!(personal_source_adjustment_is_applied(&current, 500));
+        assert!(personal_source_adjustment_preflight_matches(
+            &current,
+            "sub_source",
+            500
+        ));
+
+        current.status = SubscriptionStatus::Canceled;
+        assert!(personal_source_adjustment_is_applied(&current, 500));
+        assert!(personal_source_adjustment_preflight_matches(
+            &current,
+            "sub_source",
+            500
+        ));
+        assert!(!personal_source_adjustment_preflight_matches(
+            &current,
+            "sub_source",
+            501
+        ));
+        assert!(!personal_source_adjustment_preflight_matches(
+            &current,
+            "other_subscription",
+            500
+        ));
+        current.cancel_at = Some(499);
+        assert!(!personal_source_adjustment_preflight_matches(
+            &current,
+            "sub_source",
+            500
+        ));
     }
 }
