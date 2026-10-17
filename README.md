@@ -163,19 +163,30 @@ sotto share DATABASE_URL     # choose view and lifetime limits in an interactive
 sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-In an interactive terminal, each omitted share limit opens its own menu. The view menu offers
-1, 2, 3, 5 or 10 views and a custom value; the lifetime menu offers no expiry, 1 hour, 1 day,
-7 days, 30 days or a custom number of seconds. Custom values must be 1-100 views or
-1-2592000 seconds. Supplying `DATABASE_URL` skips secret selection only: `--views` skips the view
-menu and `--expire` skips the lifetime menu independently. Press Esc or Ctrl-C in any selection
-menu to cancel without creating a share.
+Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
+Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
+clipboard managers, suspension, or a terminated helper may retain a history copy.
 
-Non-interactive use requires an explicit secret name. When either limit flag is omitted there,
-its existing default applies: one view and no expiry. To bypass all three selection menus in an
-interactive terminal, supply the name and both limits, for example
-`sotto share DATABASE_URL --views 3 --expire 3600`. Unlock and passphrase prompts may still apply.
+`sotto login` uses the hosted instance at [getsotto.co.uk](https://getsotto.co.uk) unless you point
+it elsewhere with `--server <url>` (see [Deploying](deploy/README.md) to run your own). Either way
+the server only ever stores ciphertext - the web vault at the same address decrypts in your
+browser, with keys that never leave your devices.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
+
+## Using Sotto
+
+### Another device
+
+```sh
+sotto login                  # same account as the first machine
+sotto setup                  # unpack the Emergency Kit onto this device
+sotto pull                   # download the ciphertext you already pushed
+```
+
+You need the Emergency Kit printed by `sotto init`; without it, a new device cannot decrypt the vault.
+
+### Environments
 
 Use `--env` to select an environment for one command without changing the project's default:
 
@@ -198,18 +209,24 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 Without `--confirm`, copying is a dry-run. A confirmed copy adds and updates secrets but
 leaves keys that exist only in the destination untouched.
 
-Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
+### Share a secret
+
+In an interactive terminal, each omitted share limit opens its own menu. The view menu offers
+1, 2, 3, 5 or 10 views and a custom value; the lifetime menu offers no expiry, 1 hour, 1 day,
+7 days, 30 days or a custom number of seconds. Custom values must be 1-100 views or
+1-2592000 seconds. Supplying `DATABASE_URL` skips secret selection only: `--views` skips the view
+menu and `--expire` skips the lifetime menu independently. Press Esc or Ctrl-C in any selection
+menu to cancel without creating a share.
+
+Non-interactive use requires an explicit secret name. When either limit flag is omitted there,
+its existing default applies: one view and no expiry. To bypass all three selection menus in an
+interactive terminal, supply the name and both limits, for example
+`sotto share DATABASE_URL --views 3 --expire 3600`. Unlock and passphrase prompts may still apply.
+
 Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
 These flags control the clipboard only; `--no-copy` does not skip the share limit menus.
-Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
-clipboard managers, suspension, or a terminated helper may retain a history copy.
 
-`sotto login` uses the hosted instance at [getsotto.co.uk](https://getsotto.co.uk) unless you point
-it elsewhere with `--server <url>` (see [Deploying](deploy/README.md) to run your own). Either way
-the server only ever stores ciphertext - the web vault at the same address decrypts in your
-browser, with keys that never leave your devices.
-
-Working with a team:
+### Work with a team
 
 ```sh
 sotto org create acme                      # prints the org id
@@ -219,6 +236,8 @@ sotto org plan <org-id>                    # tier, trial, and limits for this or
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+#### Organisation plan
 
 `sotto org plan <org-id>` reads the configured server's current entitlement view for that
 organisation. You must be logged in (`sotto login`); the local vault does not need to be unlocked.
@@ -247,7 +266,7 @@ limits:    none (Team)
 
 These examples are illustrative; real organisations may show different tiers, trials, and limits.
 
-### Organisation audit log
+#### Organisation audit log
 
 Organisation owners and admins can inspect recent team activity with:
 
@@ -265,6 +284,8 @@ pagination or a complete historical archive.
 On Sotto Cloud, the organisation needs effective Team entitlement, including an active Team trial.
 Self-hosted deployments skip this plan gate, but the caller still needs the owner/admin role. If no
 events are available, the command prints no rows and exits successfully.
+
+### Machine tokens and CI
 
 Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-days` with anything
 from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
@@ -295,51 +316,6 @@ Revocation immediately stops that token from authenticating to the API; it does 
 environment key. For an organisation environment, see the existing `sotto rotate` guidance
 when key rotation is needed. Neither revocation nor rotation can erase plaintext that was already
 copied.
-
-### Cloud status
-
-To inspect the configured server and your account's Cloud eligibility, first log in:
-
-```sh
-sotto login
-sotto cloud status
-sotto cloud status --json
-```
-
-The command needs an active login but does not unlock the local vault or open a browser. It reports the configured `server`, the server's `server_info`, the account `eligibility`, and a `billing_url` only when the returned state says billing is available. The human-readable output also shows `actions`, `next_actions`, and any optional `paid_through_epoch`, `recovery_until_epoch`, or `export_until_epoch` values. A missing `server_info` or `eligibility` means that an older server does not expose that endpoint; it is not proof that access is allowed or denied.
-
-The JSON form is useful for scripts. Its top-level shape is:
-
-```json
-{
-  "server": "https://getsotto.co.uk",
-  "billing_url": "https://getsotto.co.uk/cloud",
-  "server_info": {
-    "deployment_mode": "cloud",
-    "entitlement_model": "organisation_tiers_v1"
-  },
-  "eligibility": {
-    "model": "person_eligibility_v1",
-    "state": "paid",
-    "deployment_mode": "cloud",
-    "account_initialized": true,
-    "billing_available": true,
-    "paid_through_epoch": 1798761600,
-    "recovery_until_epoch": null,
-    "export_until_epoch": null,
-    "actions": {
-      "setup": false,
-      "billing": false,
-      "export": false,
-      "revoke": true
-    },
-    "next_actions": ["revoke"],
-    "payer": "personal"
-  }
-}
-```
-
-The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
 
 ### Interactive dashboard
 
@@ -395,6 +371,51 @@ Without a `sotto.toml` or local identity:
 
 An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
 
+### Cloud status
+
+To inspect the configured server and your account's Cloud eligibility, first log in:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+The command needs an active login but does not unlock the local vault or open a browser. It reports the configured `server`, the server's `server_info`, the account `eligibility`, and a `billing_url` only when the returned state says billing is available. The human-readable output also shows `actions`, `next_actions`, and any optional `paid_through_epoch`, `recovery_until_epoch`, or `export_until_epoch` values. A missing `server_info` or `eligibility` means that an older server does not expose that endpoint; it is not proof that access is allowed or denied.
+
+The JSON form is useful for scripts. Its top-level shape is:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "organisation_tiers_v1"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
+
 ### Output themes
 
 The CLI ships five built-in themes: `nord` (the default), `sordino`, `terminal`, `monochrome`,
@@ -436,15 +457,14 @@ border = "#331144"
 Saved as `synth.toml`, that file adds a `synth` theme. Apply it with `sotto theme set synth`,
 or for one command with `sotto --theme synth <command>`.
 
-### Another device
+## Self-hosting
 
-```sh
-sotto login                  # same account as the first machine
-sotto setup                  # unpack the Emergency Kit onto this device
-sotto pull                   # download the ciphertext you already pushed
-```
-
-You need the Emergency Kit printed by `sotto init`; without it, a new device cannot decrypt the vault.
+One command brings up a complete hosted instance - Postgres, the server, and Caddy with automatic
+HTTPS - from [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); the runbook is
+[`deploy/README.md`](deploy/README.md). The pieces also work standalone: serve the web app and API
+from **one origin** (so the session cookie and CSP stay same-origin) - the included
+[`Caddyfile`](Caddyfile) serves `web/dist` and reverse-proxies the API, with security headers;
+[`Dockerfile`](Dockerfile) builds the server image (migrations run on boot).
 
 ## Architecture
 
@@ -533,15 +553,6 @@ npm ci
 npm run dev      # dev server (proxies the API to localhost:8080)
 npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
 ```
-
-### Deploying
-
-One command brings up a complete hosted instance - Postgres, the server, and Caddy with automatic
-HTTPS - from [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); the runbook is
-[`deploy/README.md`](deploy/README.md). The pieces also work standalone: serve the web app and API
-from **one origin** (so the session cookie and CSP stay same-origin) - the included
-[`Caddyfile`](Caddyfile) serves `web/dist` and reverse-proxies the API, with security headers;
-[`Dockerfile`](Dockerfile) builds the server image (migrations run on boot).
 
 ## Development checks
 

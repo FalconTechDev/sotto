@@ -165,21 +165,30 @@ sotto share DATABASE_URL     # choose view and lifetime limits in an interactive
 sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-In einem interaktiven Terminal öffnet jede ausgelassene Freigabegrenze ein eigenes Menü. Das
-Aufrufmenü bietet 1, 2, 3, 5 oder 10 Aufrufe sowie einen benutzerdefinierten Wert; das
-Gültigkeitsmenü bietet kein Ablaufdatum, 1 Stunde, 1 Tag, 7 Tage, 30 Tage oder eine
-benutzerdefinierte Anzahl von Sekunden. Benutzerdefinierte Werte müssen 1 bis 100 Aufrufe oder 1
-bis 2592000 Sekunden umfassen. Die Angabe von `DATABASE_URL` überspringt nur die Secret-Auswahl:
-`--views` überspringt das Aufrufmenü und `--expire` unabhängig davon das Gültigkeitsmenü. Drücke
-Esc oder Strg-C in einem Auswahlmenü, um abzubrechen, ohne eine Freigabe zu erstellen.
+Der Export schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`.
+Das Löschen der Zwischenablage erfolgt nach bestem Bemühen: Das Ersetzen des Inhalts schützt den neuen Wert,
+während Zwischenablage-Manager, Ruhezustand oder ein beendeter Hilfsprozess eine Kopie behalten können.
 
-Die nicht interaktive Verwendung erfordert einen ausdrücklichen Secret-Namen. Wird eine Grenze
-ausgelassen, gilt deren Standardwert: ein Aufruf und kein Ablaufdatum. Um alle drei Auswahlmenüs
-in einem interaktiven Terminal zu überspringen, gib den Namen und beide Grenzen an, zum Beispiel
-`sotto share DATABASE_URL --views 3 --expire 3600`. Aufforderungen zum Entsperren und zur Eingabe
-einer Passphrase können weiterhin erscheinen.
+`sotto login` verwendet die gehostete Instanz unter [getsotto.co.uk](https://getsotto.co.uk), sofern du die CLI nicht mit
+`--server <url>` auf einen anderen Server richtest (siehe [Bereitstellung](deploy/README.md) für den eigenen Betrieb). In jedem Fall
+speichert der Server nur Chiffrat: Der Web-Tresor unter derselben Adresse entschlüsselt in deinem
+Browser, mit Schlüsseln, die deine Geräte nie verlassen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+
+## Sotto verwenden
+
+### Ein weiteres Gerät
+
+```sh
+sotto login                  # same account as the first machine
+sotto setup                  # unpack the Emergency Kit onto this device
+sotto pull                   # download the ciphertext you already pushed
+```
+
+Du brauchst das von `sotto init` ausgegebene Emergency Kit. Ohne es kann ein neues Gerät den Tresor nicht entschlüsseln.
+
+### Umgebungen
 
 Mit `--env` wählst du eine Umgebung für einen einzelnen Befehl aus, ohne die Standardumgebung des Projekts zu ändern:
 
@@ -202,18 +211,26 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 Ohne `--confirm` ist die Kopie ein Probelauf. Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie,
 lässt aber Schlüssel unverändert, die nur in der Zielumgebung vorhanden sind.
 
-Der Export schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`.
+### Ein Secret teilen
+
+In einem interaktiven Terminal öffnet jede ausgelassene Freigabegrenze ein eigenes Menü. Das
+Aufrufmenü bietet 1, 2, 3, 5 oder 10 Aufrufe sowie einen benutzerdefinierten Wert; das
+Gültigkeitsmenü bietet kein Ablaufdatum, 1 Stunde, 1 Tag, 7 Tage, 30 Tage oder eine
+benutzerdefinierte Anzahl von Sekunden. Benutzerdefinierte Werte müssen 1 bis 100 Aufrufe oder 1
+bis 2592000 Sekunden umfassen. Die Angabe von `DATABASE_URL` überspringt nur die Secret-Auswahl:
+`--views` überspringt das Aufrufmenü und `--expire` unabhängig davon das Gültigkeitsmenü. Drücke
+Esc oder Strg-C in einem Auswahlmenü, um abzubrechen, ohne eine Freigabe zu erstellen.
+
+Die nicht interaktive Verwendung erfordert einen ausdrücklichen Secret-Namen. Wird eine Grenze
+ausgelassen, gilt deren Standardwert: ein Aufruf und kein Ablaufdatum. Um alle drei Auswahlmenüs
+in einem interaktiven Terminal zu überspringen, gib den Namen und beide Grenzen an, zum Beispiel
+`sotto share DATABASE_URL --views 3 --expire 3600`. Aufforderungen zum Entsperren und zur Eingabe
+einer Passphrase können weiterhin erscheinen.
+
 Verwende `sotto share --no-copy`, um das interaktive Kopieren zu deaktivieren, oder `--copy`, um es ausdrücklich anzufordern.
 Diese Optionen steuern nur die Zwischenablage; `--no-copy` überspringt die Freigabegrenzen-Menüs nicht.
-Das Löschen der Zwischenablage erfolgt nach bestem Bemühen: Das Ersetzen des Inhalts schützt den neuen Wert,
-während Zwischenablage-Manager, Ruhezustand oder ein beendeter Hilfsprozess eine Kopie behalten können.
 
-`sotto login` verwendet die gehostete Instanz unter [getsotto.co.uk](https://getsotto.co.uk), sofern du die CLI nicht mit
-`--server <url>` auf einen anderen Server richtest (siehe [Bereitstellung](deploy/README.md) für den eigenen Betrieb). In jedem Fall
-speichert der Server nur Chiffrat: Der Web-Tresor unter derselben Adresse entschlüsselt in deinem
-Browser, mit Schlüsseln, die deine Geräte nie verlassen.
-
-Arbeit im Team:
+### Im Team arbeiten
 
 ```sh
 sotto org create acme                      # prints the org id
@@ -223,6 +240,8 @@ sotto org plan <org-id>                    # tier, trial, and limits for this or
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+#### Plan der Organisation
 
 `sotto org plan <org-id>` liest die aktuelle Berechtigungsansicht des konfigurierten Servers für
 diese Organisation. Du musst angemeldet sein (`sotto login`); der lokale Tresor muss nicht
@@ -252,7 +271,7 @@ limits:    none (Team)
 Diese Beispiele sind illustrativ; echte Organisationen können andere Stufen, Trials und Limits
 zeigen.
 
-### Organisations-Auditprotokoll
+#### Organisations-Auditprotokoll
 
 Organisationsinhaber und Administratoren können die aktuelle Teamaktivität anzeigen:
 
@@ -272,6 +291,8 @@ In Sotto Cloud benötigt die Organisation eine wirksame Team-Berechtigung, einsc
 aktiven Team-Testzeitraums. Selbst gehostete Deployments überspringen diese Planprüfung, aber der
 Aufrufer braucht weiterhin die Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden
 sind, gibt der Befehl keine Zeilen aus und wird erfolgreich beendet.
+
+### Maschinen-Token und CI
 
 Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--expires-in-days`
 mit einem Wert von 1 bis 365 angibst; `sotto token ls` zeigt, wann jedes abläuft. Zwei Wochen
@@ -302,51 +323,6 @@ aktualisiere das CI-Secret und prüfe, ob die CI es verwendet, und widerrufe dan
 der API authentifiziert, rotiert aber nicht den Umgebungsschlüssel. Für eine
 Organisationsumgebung beachte bei Bedarf die vorhandenen Hinweise zu `sotto rotate`. Weder
 Widerruf noch Rotation können bereits kopierten Klartext löschen.
-
-### Cloud-Status
-
-Um den konfigurierten Server und die Cloud-Berechtigung deines Kontos zu prüfen, melde dich zuerst an:
-
-```sh
-sotto login
-sotto cloud status
-sotto cloud status --json
-```
-
-Der Befehl benötigt eine aktive Anmeldung, entsperrt aber weder den lokalen Tresor noch öffnet er einen Browser. Er zeigt den konfigurierten `server`, die `server_info` des Servers, die `eligibility` des Kontos und nur dann eine `billing_url`, wenn der zurückgegebene Status verfügbare Abrechnung meldet. Die lesbare Ausgabe zeigt außerdem `actions`, `next_actions` und optionale Werte für `paid_through_epoch`, `recovery_until_epoch` oder `export_until_epoch`. Fehlt `server_info` oder `eligibility`, stellt ein älterer Server diesen Endpoint nicht bereit; daraus folgt nicht, dass der Zugriff erlaubt oder verweigert ist.
-
-Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht so aus:
-
-```json
-{
-  "server": "https://getsotto.co.uk",
-  "billing_url": "https://getsotto.co.uk/cloud",
-  "server_info": {
-    "deployment_mode": "cloud",
-    "entitlement_model": "organisation_tiers_v1"
-  },
-  "eligibility": {
-    "model": "person_eligibility_v1",
-    "state": "paid",
-    "deployment_mode": "cloud",
-    "account_initialized": true,
-    "billing_available": true,
-    "paid_through_epoch": 1798761600,
-    "recovery_until_epoch": null,
-    "export_until_epoch": null,
-    "actions": {
-      "setup": false,
-      "billing": false,
-      "export": false,
-      "revoke": true
-    },
-    "next_actions": ["revoke"],
-    "payer": "personal"
-  }
-}
-```
-
-Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
 ### Interaktives Dashboard
 
@@ -406,6 +382,51 @@ Ohne `sotto.toml` und ohne lokale Identität:
 
 Fehlt `sotto.toml`, ist kein Projekt ausgewählt. Eine fehlerhafte oder unlesbare Datei führt zu einem Fehler.
 
+### Cloud-Status
+
+Um den konfigurierten Server und die Cloud-Berechtigung deines Kontos zu prüfen, melde dich zuerst an:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+Der Befehl benötigt eine aktive Anmeldung, entsperrt aber weder den lokalen Tresor noch öffnet er einen Browser. Er zeigt den konfigurierten `server`, die `server_info` des Servers, die `eligibility` des Kontos und nur dann eine `billing_url`, wenn der zurückgegebene Status verfügbare Abrechnung meldet. Die lesbare Ausgabe zeigt außerdem `actions`, `next_actions` und optionale Werte für `paid_through_epoch`, `recovery_until_epoch` oder `export_until_epoch`. Fehlt `server_info` oder `eligibility`, stellt ein älterer Server diesen Endpoint nicht bereit; daraus folgt nicht, dass der Zugriff erlaubt oder verweigert ist.
+
+Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht so aus:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "organisation_tiers_v1"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
+
 ### Ausgabe-Themes
 
 Die CLI enthält fünf integrierte Themes: `nord` (die Standardeinstellung), `sordino`,
@@ -450,15 +471,14 @@ Als `synth.toml` gespeichert, fügt diese Datei ein Theme `synth` hinzu. Mit
 `sotto theme set synth` wendest du es an, oder für einen einzelnen Befehl mit
 `sotto --theme synth <command>`.
 
-### Ein weiteres Gerät
+## Selbst hosten
 
-```sh
-sotto login                  # same account as the first machine
-sotto setup                  # unpack the Emergency Kit onto this device
-sotto pull                   # download the ciphertext you already pushed
-```
-
-Du brauchst das von `sotto init` ausgegebene Emergency Kit. Ohne es kann ein neues Gerät den Tresor nicht entschlüsseln.
+Ein Befehl bringt eine komplette gehostete Instanz hoch: Postgres, Server und Caddy mit automatischem HTTPS,
+aus [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); die Anleitung steht in
+[`deploy/README.md`](deploy/README.md). Die Teile funktionieren auch eigenständig: Betreibe Web-App und API unter
+**einem Origin** (damit Sitzungs-Cookie und CSP same-origin bleiben); die mitgelieferte
+[`Caddyfile`](Caddyfile) liefert `web/dist` aus und leitet die API per Reverse-Proxy weiter, mit Sicherheits-Headern;
+das [`Dockerfile`](Dockerfile) baut das Server-Image (Migrationen laufen beim Start).
 
 ## Architektur
 
@@ -547,15 +567,6 @@ npm ci
 npm run dev      # dev server (proxies the API to localhost:8080)
 npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
 ```
-
-### Bereitstellung
-
-Ein Befehl bringt eine komplette gehostete Instanz hoch: Postgres, Server und Caddy mit automatischem HTTPS,
-aus [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); die Anleitung steht in
-[`deploy/README.md`](deploy/README.md). Die Teile funktionieren auch eigenständig: Betreibe Web-App und API unter
-**einem Origin** (damit Sitzungs-Cookie und CSP same-origin bleiben); die mitgelieferte
-[`Caddyfile`](Caddyfile) liefert `web/dist` aus und leitet die API per Reverse-Proxy weiter, mit Sicherheits-Headern;
-das [`Dockerfile`](Dockerfile) baut das Server-Image (Migrationen laufen beim Start).
 
 ## Entwicklungsprüfungen
 

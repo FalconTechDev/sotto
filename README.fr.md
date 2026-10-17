@@ -168,21 +168,30 @@ sotto share DATABASE_URL     # choose view and lifetime limits in an interactive
 sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-Dans un terminal interactif, chaque limite omise ouvre son propre menu. Le menu des consultations
-propose 1, 2, 3, 5 ou 10 consultations ainsi qu'une valeur personnalisée ; le menu de durée propose
-aucune expiration, 1 heure, 1 jour, 7 jours, 30 jours ou un nombre de secondes personnalisé. Les
-valeurs personnalisées doivent être comprises entre 1 et 100 consultations ou entre 1 et 2592000
-secondes. Fournir `DATABASE_URL` ignore uniquement la sélection du secret : `--views` ignore le
-menu des consultations et `--expire` ignore indépendamment le menu de durée. Appuyez sur Échap ou
-Ctrl-C dans un menu de sélection pour annuler sans créer de partage.
+L'export écrit en clair ; il nécessite donc `--reveal` dans un terminal, comme `sotto get`.
+L'effacement du presse-papiers est une mesure de meilleur effort : remplacer son contenu protège la nouvelle valeur,
+mais les gestionnaires de presse-papiers, la suspension ou l'arrêt du processus auxiliaire peuvent conserver une copie.
 
-L'utilisation non interactive exige un nom de secret explicite. Lorsqu'une limite est omise, sa
-valeur par défaut s'applique : une consultation et aucune expiration. Pour ignorer les trois menus
-de sélection dans un terminal interactif, fournissez le nom et les deux limites, par exemple
-`sotto share DATABASE_URL --views 3 --expire 3600`. Les invites de déverrouillage et de phrase
-secrète peuvent toujours s'appliquer.
+`sotto login` utilise l'instance hébergée sur [getsotto.co.uk](https://getsotto.co.uk) sauf si vous le faites pointer
+ailleurs avec `--server <url>` (voir [Déploiement](deploy/README.md) pour héberger le vôtre). Dans tous les cas,
+le serveur ne stocke que du texte chiffré : le coffre web à la même adresse déchiffre dans votre
+navigateur, avec des clés qui ne quittent jamais vos appareils.
 
 Pour parcourir les secrets de façon interactive, consultez le [guide du tableau de bord](#tableau-de-bord-interactif).
+
+## Utiliser Sotto
+
+### Un autre appareil
+
+```sh
+sotto login                  # same account as the first machine
+sotto setup                  # unpack the Emergency Kit onto this device
+sotto pull                   # download the ciphertext you already pushed
+```
+
+Vous avez besoin de l'Emergency Kit imprimé par `sotto init` ; sans lui, un nouvel appareil ne peut pas déchiffrer le coffre.
+
+### Environnements
 
 Utilisez `--env` pour sélectionner un environnement pour une seule commande sans modifier celui par défaut du projet :
 
@@ -205,18 +214,26 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 Sans `--confirm`, la copie est une simulation. Une copie confirmée ajoute et met à jour les secrets,
 mais laisse intactes les clés présentes uniquement dans la destination.
 
-L'export écrit en clair ; il nécessite donc `--reveal` dans un terminal, comme `sotto get`.
+### Partager un secret
+
+Dans un terminal interactif, chaque limite omise ouvre son propre menu. Le menu des consultations
+propose 1, 2, 3, 5 ou 10 consultations ainsi qu'une valeur personnalisée ; le menu de durée propose
+aucune expiration, 1 heure, 1 jour, 7 jours, 30 jours ou un nombre de secondes personnalisé. Les
+valeurs personnalisées doivent être comprises entre 1 et 100 consultations ou entre 1 et 2592000
+secondes. Fournir `DATABASE_URL` ignore uniquement la sélection du secret : `--views` ignore le
+menu des consultations et `--expire` ignore indépendamment le menu de durée. Appuyez sur Échap ou
+Ctrl-C dans un menu de sélection pour annuler sans créer de partage.
+
+L'utilisation non interactive exige un nom de secret explicite. Lorsqu'une limite est omise, sa
+valeur par défaut s'applique : une consultation et aucune expiration. Pour ignorer les trois menus
+de sélection dans un terminal interactif, fournissez le nom et les deux limites, par exemple
+`sotto share DATABASE_URL --views 3 --expire 3600`. Les invites de déverrouillage et de phrase
+secrète peuvent toujours s'appliquer.
+
 Utilisez `sotto share --no-copy` pour désactiver la copie interactive, ou `--copy` pour la demander explicitement.
 Ces options contrôlent uniquement le presse-papiers ; `--no-copy` n'ignore pas les menus de limites du partage.
-L'effacement du presse-papiers est une mesure de meilleur effort : remplacer son contenu protège la nouvelle valeur,
-mais les gestionnaires de presse-papiers, la suspension ou l'arrêt du processus auxiliaire peuvent conserver une copie.
 
-`sotto login` utilise l'instance hébergée sur [getsotto.co.uk](https://getsotto.co.uk) sauf si vous le faites pointer
-ailleurs avec `--server <url>` (voir [Déploiement](deploy/README.md) pour héberger le vôtre). Dans tous les cas,
-le serveur ne stocke que du texte chiffré : le coffre web à la même adresse déchiffre dans votre
-navigateur, avec des clés qui ne quittent jamais vos appareils.
-
-Travail en équipe :
+### Travailler en équipe
 
 ```sh
 sotto org create acme                      # prints the org id
@@ -226,6 +243,8 @@ sotto org plan <org-id>                    # tier, trial, and limits for this or
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+#### Forfait de l'organisation
 
 `sotto org plan <org-id>` lit la vue d'entitlements actuelle du serveur configuré pour cette
 organisation. Vous devez être connecté (`sotto login`) ; le coffre local n'a pas besoin d'être
@@ -255,7 +274,7 @@ limits:    none (Team)
 Ces exemples sont illustratifs ; les organisations réelles peuvent afficher des niveaux, essais et
 limites différents.
 
-### Journal d’audit de l’organisation
+#### Journal d’audit de l’organisation
 
 Les propriétaires et administrateurs d’une organisation peuvent consulter l’activité récente de
 l’équipe avec :
@@ -276,6 +295,8 @@ Sur Sotto Cloud, l’organisation doit disposer du niveau Team effectif, y compr
 Team actif. Les déploiements auto-hébergés ignorent ce contrôle de forfait, mais l’appelant doit
 toujours avoir le rôle de propriétaire ou d’administrateur. S’il n’y a aucun événement, la commande
 n’affiche aucune ligne et se termine avec succès.
+
+### Tokens machine et CI
 
 Les tokens machine expirent. Un nouveau token dure 90 jours, sauf si vous passez
 `--expires-in-days` avec une valeur de 1 à 365 ; `sotto token ls` indique quand chacun expire.
@@ -307,51 +328,6 @@ Pour remplacer un token CI, identifiez l'ancien ID dans la liste, créez un remp
 auprès de l'API, mais ne renouvelle pas la clé d'environnement. Pour un environnement
 d'organisation, suivez les instructions existantes de `sotto rotate` si la rotation de la clé
 est nécessaire. Ni la révocation ni la rotation ne peuvent effacer du texte brut déjà copié.
-
-### État Cloud
-
-Pour consulter le serveur configuré et l'éligibilité Cloud de votre compte, connectez-vous d'abord :
-
-```sh
-sotto login
-sotto cloud status
-sotto cloud status --json
-```
-
-La commande nécessite une session active, mais ne déverrouille pas le coffre local et n'ouvre pas de navigateur. Elle affiche le `server` configuré, le `server_info` du serveur, l'`eligibility` du compte et un `billing_url` uniquement lorsque l'état renvoyé indique que la facturation est disponible. La sortie lisible affiche également `actions`, `next_actions` et les valeurs facultatives `paid_through_epoch`, `recovery_until_epoch` ou `export_until_epoch`. L'absence de `server_info` ou d'`eligibility` signifie qu'un serveur ancien n'expose pas cet endpoint ; elle ne prouve pas que l'accès est autorisé ou refusé.
-
-Le format JSON est pratique pour les scripts. Sa structure de premier niveau est :
-
-```json
-{
-  "server": "https://getsotto.co.uk",
-  "billing_url": "https://getsotto.co.uk/cloud",
-  "server_info": {
-    "deployment_mode": "cloud",
-    "entitlement_model": "organisation_tiers_v1"
-  },
-  "eligibility": {
-    "model": "person_eligibility_v1",
-    "state": "paid",
-    "deployment_mode": "cloud",
-    "account_initialized": true,
-    "billing_available": true,
-    "paid_through_epoch": 1798761600,
-    "recovery_until_epoch": null,
-    "export_until_epoch": null,
-    "actions": {
-      "setup": false,
-      "billing": false,
-      "export": false,
-      "revoke": true
-    },
-    "next_actions": ["revoke"],
-    "payer": "personal"
-  }
-}
-```
-
-L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
 
 ### Tableau de bord interactif
 
@@ -409,6 +385,51 @@ Sans `sotto.toml` ni identité locale :
 
 L'absence de `sotto.toml` signifie qu'aucun projet n'est sélectionné. Un fichier invalide ou illisible provoque une erreur.
 
+### État Cloud
+
+Pour consulter le serveur configuré et l'éligibilité Cloud de votre compte, connectez-vous d'abord :
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+La commande nécessite une session active, mais ne déverrouille pas le coffre local et n'ouvre pas de navigateur. Elle affiche le `server` configuré, le `server_info` du serveur, l'`eligibility` du compte et un `billing_url` uniquement lorsque l'état renvoyé indique que la facturation est disponible. La sortie lisible affiche également `actions`, `next_actions` et les valeurs facultatives `paid_through_epoch`, `recovery_until_epoch` ou `export_until_epoch`. L'absence de `server_info` ou d'`eligibility` signifie qu'un serveur ancien n'expose pas cet endpoint ; elle ne prouve pas que l'accès est autorisé ou refusé.
+
+Le format JSON est pratique pour les scripts. Sa structure de premier niveau est :
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "organisation_tiers_v1"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
+
 ### Thèmes de sortie
 
 La CLI fournit cinq thèmes intégrés : `nord` (par défaut), `sordino`, `terminal`, `monochrome`
@@ -452,15 +473,14 @@ border = "#331144"
 Enregistré sous `synth.toml`, ce fichier ajoute un thème `synth`. Appliquez-le avec
 `sotto theme set synth`, ou pour une seule commande avec `sotto --theme synth <command>`.
 
-### Un autre appareil
+## Auto-hébergement
 
-```sh
-sotto login                  # same account as the first machine
-sotto setup                  # unpack the Emergency Kit onto this device
-sotto pull                   # download the ciphertext you already pushed
-```
-
-Vous avez besoin de l'Emergency Kit imprimé par `sotto init` ; sans lui, un nouvel appareil ne peut pas déchiffrer le coffre.
+Une seule commande démarre une instance hébergée complète : Postgres, le serveur et Caddy avec HTTPS
+automatique, depuis [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml) ; le guide est dans
+[`deploy/README.md`](deploy/README.md). Les éléments fonctionnent aussi séparément : servez l'application web et l'API
+depuis **une même origine** (pour que le cookie de session et la CSP restent sur la même origine) ; le
+[`Caddyfile`](Caddyfile) inclus sert `web/dist` et relaie l'API en proxy inverse, avec des en-têtes de sécurité ;
+le [`Dockerfile`](Dockerfile) construit l'image du serveur (les migrations s'exécutent au démarrage).
 
 ## Architecture
 
@@ -550,15 +570,6 @@ npm ci
 npm run dev      # dev server (proxies the API to localhost:8080)
 npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
 ```
-
-### Déploiement
-
-Une seule commande démarre une instance hébergée complète : Postgres, le serveur et Caddy avec HTTPS
-automatique, depuis [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml) ; le guide est dans
-[`deploy/README.md`](deploy/README.md). Les éléments fonctionnent aussi séparément : servez l'application web et l'API
-depuis **une même origine** (pour que le cookie de session et la CSP restent sur la même origine) ; le
-[`Caddyfile`](Caddyfile) inclus sert `web/dist` et relaie l'API en proxy inverse, avec des en-têtes de sécurité ;
-le [`Dockerfile`](Dockerfile) construit l'image du serveur (les migrations s'exécutent au démarrage).
 
 ## Vérifications de développement
 
