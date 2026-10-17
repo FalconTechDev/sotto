@@ -22,19 +22,33 @@ Sotto se basa en una única implementación criptográfica en Rust compartida po
 del navegador mediante WebAssembly. El servidor almacena y sincroniza datos cifrados sin recibir nunca
 secretos en texto plano ni claves utilizables.
 
+## Formas de usar Sotto
+
+Sotto es un único producto de código abierto que puedes usar de tres formas. Elijas la que elijas,
+el servidor solo almacena texto cifrado.
+
+| Modo | Qué obtienes |
+| --- | --- |
+| Local | La CLI y una bóveda cifrada en tu propia máquina. Sin cuenta y sin servidor. |
+| Autoalojado | El mismo servidor Apache-2.0 en infraestructura que tú operas. No aplica límites de plan ni comprobaciones del servicio alojado; consulta [Autoalojamiento](#autoalojamiento). |
+| Sotto Cloud | El servidor que Sotto opera en [getsotto.co.uk](https://getsotto.co.uk), para cuando prefieres no gestionar uno. `sotto login` lo usa por defecto. Los planes y límites están en la [página de precios](https://getsotto.co.uk/#pricing), y el estado del servicio, en [status.getsotto.co.uk](https://status.getsotto.co.uk). |
+
+Puedes empezar en local y añadir un servidor más adelante: después de `sotto login`, `sotto push`
+sube el entorno activo tal como está.
+
 ## Estado actual
 
 El flujo de extremo a extremo funciona: cifra en local, sincroniza texto cifrado, descifra en otro dispositivo o en el
 navegador, y comparte un único secreto con un enlace de un solo uso. Los equipos también funcionan de extremo a extremo: organizaciones
-con roles, concesiones de entorno por miembro, rotación de claves al eliminar a un miembro, tokens de máquina para CI
-y el restablecimiento de la cuenta si se pierde el Emergency Kit.
+con roles, concesiones de entorno por miembro, rotación de claves al eliminar a un miembro, tokens de máquina para CI,
+un registro de auditoría de la organización y el restablecimiento de la cuenta si se pierde el Emergency Kit.
 
 | Componente | Disponible ahora |
 | --- | --- |
-| Núcleo criptográfico | KDF, AEAD XChaCha20-Poly1305 + AAD, encapsulado de claves, concesiones mediante sealed box X25519, la jerarquía de bóvedas de entorno, reencapsulado de claves de datos (rotación), criptografía de enlaces para compartir y codificación de claves, con vectores de referencia nativo↔WASM |
-| CLI | `init`, gestión local de secretos, inyección con `run`, sincronización `login`/`push`/`pull`, `setup` para dispositivos nuevos, `share`; equipos: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, `token create/ls/revoke` de máquina (con modo `SOTTO_TOKEN` para CI), `reset` por pérdida del kit de emergencia |
-| Servidor | Inicio de sesión OAuth + sesiones, sincronización de cuentas + instantáneas (escrituras versionadas, ETag), organizaciones + membresías + roles, concesiones de claves de bóveda por miembro, rotación transaccional de claves, tokens de máquina, restablecimiento de cuentas y enlaces para compartir - solo texto cifrado |
-| Web | Inicio de sesión (sesión con cookie), desbloqueo en el navegador + descifrado de la bóveda con tu propia concesión, creación y recepción de enlaces de un solo uso, y un panel de equipo: organizaciones, miembros, invitación por correo y compartición de un entorno con un miembro |
+| Núcleo criptográfico | KDF, AEAD XChaCha20-Poly1305 + AAD, encapsulado de claves, concesiones mediante sealed box X25519, la jerarquía de bóvedas de entorno, reencapsulado de claves de datos (rotación), criptografía de enlaces para compartir y codificación de claves, con vectores de referencia nativo↔WASM, fuzzing de los códecs y pruebas Kani del análisis de cabeceras de sobre y de símbolos de clave |
+| CLI | Secretos locales (`init`, `set`, `get`, `ls`, `rm`, `import`, `export`, `run`), entornos (`env ls/use/diff/copy`), un panel interactivo, sincronización `login`/`push`/`pull`, `setup` para dispositivos nuevos, `history` y `rollback`, enlaces de un solo uso (`share`, `shares ls/revoke`); equipos: `org create/ls/invite/members/remove/plan/audit`, `grant`, `clone`, `rotate`, `token create/ls/revoke` de máquina con caducidad (con modo `SOTTO_TOKEN` para CI); `status`, `cloud status`, `reset` por pérdida del kit de emergencia, temas y completado del shell |
+| Servidor | Inicio de sesión OAuth + sesiones, sincronización de cuentas + instantáneas (escrituras versionadas, ETag), organizaciones + membresías + roles, concesiones de claves de bóveda por miembro, rotación transaccional de claves, tokens de máquina con caducidad, historial de secretos, un registro de auditoría de la organización, eliminación opcional de organizaciones con un periodo de recuperación, restablecimiento de cuentas y enlaces de un solo uso - solo texto cifrado. Una implementación de Sotto Cloud también aplica límites de plan y puede facturar mediante Stripe |
+| Web | Una página de inicio y guías; la bóveda en `/app`, que se desbloquea en el navegador para explorar, buscar, mostrar y copiar secretos, crear enlaces de un solo uso, compartir un entorno con un miembro y rotar la clave de un entorno; un panel de equipo con organizaciones, miembros, invitaciones por correo, el plan, el registro de auditoría y la eliminación de organizaciones; la página de recepción de enlaces de un solo uso; y una página de cuenta de Sotto Cloud en `/cloud` |
 
 ## Instalación
 
@@ -54,6 +68,11 @@ está instalado, antes de instalar (`~/.local/bin` en macOS/Linux, `%LOCALAPPDAT
 Windows). ¿Prefieres revisar antes? Descarga un archivo comprimido desde la
 [página de versiones](https://github.com/getsotto/sotto/releases) y verifícalo manualmente según
 [SECURITY.md](SECURITY.md), o compila desde el código fuente (consulta [Desarrollo](#desarrollo)).
+
+Los instaladores, la fórmula de Homebrew y la acción de GitHub instalan versiones publicadas,
+mientras que este README sigue la rama `main`, que puede ir por delante de la última versión. Por
+eso es posible que un comando descrito aquí aún no exista en la versión que tienes instalada;
+`sotto --help` muestra los comandos que admite tu versión.
 
 ### Homebrew (versión preliminar)
 
@@ -158,22 +177,31 @@ macOS, Linux y Windows.
 sotto init                   # create your identity + first project - SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
-sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
-sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
-sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 ```
 
-Exportar escribe texto plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`.
-El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el contenido se protege el nuevo valor,
-mientras que los gestores del portapapeles, la suspensión o la terminación del proceso auxiliar pueden conservar una copia.
+`sotto init` crea los entornos `dev`, `staging` y `prod` y selecciona `dev`. Exportar escribe texto
+plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`; `--format` también admite
+`shell` y `json`. El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el
+contenido se protege el nuevo valor, mientras que los gestores del portapapeles, la suspensión o la
+terminación del proceso auxiliar pueden conservar una copia.
 
-`sotto login` usa la instancia alojada en [getsotto.co.uk](https://getsotto.co.uk) salvo que apuntes
-a otro lugar con `--server <url>` (consulta [Despliegue](deploy/README.md) para alojar el tuyo). En cualquier caso
-el servidor solo almacena texto cifrado: la bóveda web en la misma dirección descifra en tu
-navegador, con claves que nunca salen de tus dispositivos.
+Hasta aquí todo se queda en tu máquina. Para sincronizar otro dispositivo, trabajar en equipo o usar
+CI, inicia sesión en un servidor:
+
+```sh
+sotto login                  # Sotto Cloud by default; --server <url> for your own server
+sotto push                   # upload the active environment's ciphertext
+sotto share DATABASE_URL     # a one-time link whose key never reaches the server
+```
+
+`sotto login` abre un navegador para iniciar sesión con GitHub. Usa Sotto Cloud en
+[getsotto.co.uk](https://getsotto.co.uk) salvo que indiques `--server <url>` (consulta
+[Autoalojamiento](#autoalojamiento) para alojar el tuyo), y los comandos posteriores reutilizan el
+servidor que elegiste. En cualquier caso el servidor solo almacena texto cifrado: la bóveda web en
+`/app` del mismo servidor descifra en tu navegador, con claves que nunca salen de tus dispositivos.
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
 
@@ -472,12 +500,22 @@ Guardado como `synth.toml`, ese archivo añade un tema `synth`. Aplícalo con
 
 ## Autoalojamiento
 
-Un solo comando levanta una instancia alojada completa: Postgres, el servidor y Caddy con HTTPS
+Un solo comando levanta un despliegue completo: Postgres, el servidor y Caddy con HTTPS
 automático, desde [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); el manual está en
 [`deploy/README.md`](deploy/README.md). Las piezas también funcionan por separado: sirve la app web y la API
 desde **un mismo origen** (para que la cookie de sesión y la CSP sigan siendo del mismo origen); el
 [`Caddyfile`](Caddyfile) incluido sirve `web/dist` y actúa como proxy inverso de la API, con cabeceras de seguridad;
 el [`Dockerfile`](Dockerfile) construye la imagen del servidor (las migraciones se ejecutan al arrancar).
+
+`SOTTO_DEPLOYMENT_MODE` vale `self_hosted` por defecto. En ese modo el servidor no aplica límites
+de plan ni otras restricciones del servicio alojado, y no necesita una cuenta de Stripe. El modo
+`cloud` es para el servicio que opera Sotto; lee el manual antes de activarlo.
+
+Apunta la CLI a tu servidor una vez; los comandos posteriores lo reutilizan:
+
+```sh
+sotto login --server https://sotto.example.com
+```
 
 ## Arquitectura
 

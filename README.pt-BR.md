@@ -22,19 +22,33 @@ O Sotto se baseia em uma única implementação criptográfica em Rust compartil
 do navegador via WebAssembly. O servidor armazena e sincroniza dados criptografados sem nunca receber
 segredos em texto puro nem chaves utilizáveis.
 
+## Formas de usar o Sotto
+
+O Sotto é um único produto de código aberto que você pode usar de três formas. Seja qual for a sua
+escolha, o servidor só armazena texto cifrado.
+
+| Modo | O que você recebe |
+| --- | --- |
+| Local | A CLI e um cofre criptografado na sua própria máquina. Sem conta e sem servidor. |
+| Auto-hospedado | O mesmo servidor Apache-2.0 em uma infraestrutura que você opera. Ele não aplica limites de plano nem verificações do serviço hospedado; consulte [Auto-hospedagem](#auto-hospedagem). |
+| Sotto Cloud | O servidor que o Sotto opera em [getsotto.co.uk](https://getsotto.co.uk), para quando você prefere não manter um. `sotto login` usa esse servidor por padrão. Os planos e limites estão na [página de preços](https://getsotto.co.uk/#pricing), e o status do serviço em [status.getsotto.co.uk](https://status.getsotto.co.uk). |
+
+Você pode começar localmente e adicionar um servidor depois: após `sotto login`, `sotto push` envia o
+ambiente ativo do jeito que está.
+
 ## Status atual
 
 O fluxo de ponta a ponta funciona: criptografe localmente, sincronize texto cifrado, descriptografe em outro dispositivo ou no
 navegador e compartilhe um único segredo com um link de uso único. Equipes também funcionam de ponta a ponta: organizações
-com papéis, concessões de ambiente por membro, rotação de chaves ao remover um membro, tokens de máquina para CI
-e a redefinição da conta em caso de perda do Emergency Kit.
+com papéis, concessões de ambiente por membro, rotação de chaves ao remover um membro, tokens de máquina para CI,
+um log de auditoria da organização e a redefinição da conta em caso de perda do Emergency Kit.
 
 | Componente | Disponível agora |
 | --- | --- |
-| Núcleo criptográfico | KDF, AEAD XChaCha20-Poly1305 + AAD, encapsulamento de chaves, concessões via sealed box X25519, a hierarquia de cofres de ambiente, reencapsulamento de chaves de dados (rotação), criptografia de links de compartilhamento e codificação de chaves, com vetores de referência nativo↔WASM |
-| CLI | `init`, gerenciamento local de segredos, injeção com `run`, sincronização `login`/`push`/`pull`, `setup` para novos dispositivos, `share`; equipes: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, `token create/ls/revoke` de máquina (com modo `SOTTO_TOKEN` para CI), `reset` para kit de emergência perdido |
-| Servidor | Login OAuth + sessões, sincronização de conta + snapshots (escritas versionadas, ETag), organizações + membros + papéis, concessões de chaves de cofre por membro, rotação transacional de chaves, tokens de máquina, redefinição de conta e links de compartilhamento - apenas texto cifrado |
-| Web | Login (sessão com cookie), desbloqueio no navegador + descriptografia do cofre com sua própria concessão, criação e recebimento de links de uso único, e um painel de equipe: organizações, membros, convite por e-mail, compartilhamento de um ambiente com um membro |
+| Núcleo criptográfico | KDF, AEAD XChaCha20-Poly1305 + AAD, encapsulamento de chaves, concessões via sealed box X25519, a hierarquia de cofres de ambiente, reencapsulamento de chaves de dados (rotação), criptografia de links de compartilhamento e codificação de chaves, com vetores de referência nativo↔WASM, fuzzing dos codecs e provas Kani para a análise de cabeçalhos de envelope e de símbolos de chave |
+| CLI | Segredos locais (`init`, `set`, `get`, `ls`, `rm`, `import`, `export`, `run`), ambientes (`env ls/use/diff/copy`), um painel interativo, sincronização `login`/`push`/`pull`, `setup` para novos dispositivos, `history` e `rollback`, links de uso único (`share`, `shares ls/revoke`); equipes: `org create/ls/invite/members/remove/plan/audit`, `grant`, `clone`, `rotate`, `token create/ls/revoke` de máquina com expiração (com modo `SOTTO_TOKEN` para CI); `status`, `cloud status`, `reset` para kit de emergência perdido, temas e autocompletar do shell |
+| Servidor | Login OAuth + sessões, sincronização de conta + snapshots (escritas versionadas, ETag), organizações + membros + papéis, concessões de chaves de cofre por membro, rotação transacional de chaves, tokens de máquina com expiração, histórico de segredos, um log de auditoria da organização, exclusão opcional de organizações com um período de recuperação, redefinição de conta e links de uso único - apenas texto cifrado. Uma implantação do Sotto Cloud também aplica limites de plano e pode cobrar via Stripe |
+| Web | Uma página inicial e guias; o cofre em `/app`, que é desbloqueado no navegador para navegar, buscar, mostrar e copiar segredos, criar links de uso único, compartilhar um ambiente com um membro e rotacionar a chave de um ambiente; um painel de equipe com organizações, membros, convites por e-mail, o plano, o log de auditoria e a exclusão de organizações; a página de recebimento de links de uso único; e uma página de conta do Sotto Cloud em `/cloud` |
 
 ## Instalação
 
@@ -54,6 +68,11 @@ está instalado, antes de instalar (`~/.local/bin` no macOS/Linux, `%LOCALAPPDAT
 Windows). Prefere conferir antes? Baixe um arquivo compactado na
 [página de releases](https://github.com/getsotto/sotto/releases) e verifique manualmente conforme
 [SECURITY.md](SECURITY.md), ou compile do código-fonte (consulte [Desenvolvimento](#desenvolvimento)).
+
+Os instaladores, a fórmula do Homebrew e a action do GitHub instalam releases publicadas,
+enquanto este README acompanha a branch `main`, que pode estar à frente da release mais recente. Por
+isso, um comando descrito aqui pode ainda não existir na versão que você instalou. `sotto --help`
+lista os comandos que a sua versão suporta.
 
 ### Homebrew (prévia)
 
@@ -157,22 +176,31 @@ macOS, Linux e Windows.
 sotto init                   # create your identity + first project - SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
-sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
-sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
-sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 ```
 
-A exportação escreve texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get`.
-A limpeza da área de transferência é uma medida de melhor esforço: substituir o conteúdo protege o novo valor,
-enquanto gerenciadores da área de transferência, suspensão ou encerramento do processo auxiliar podem manter uma cópia.
+`sotto init` cria os ambientes `dev`, `staging` e `prod` e seleciona `dev`. A exportação escreve
+texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get`; `--format` também
+aceita `shell` e `json`. A limpeza da área de transferência é uma medida de melhor esforço:
+substituir o conteúdo protege o novo valor, enquanto gerenciadores da área de transferência,
+suspensão ou encerramento do processo auxiliar podem manter uma cópia.
 
-`sotto login` usa a instância hospedada em [getsotto.co.uk](https://getsotto.co.uk), a menos que você aponte
-para outro lugar com `--server <url>` (consulte [Deploy](deploy/README.md) para hospedar o seu). De todo modo
-o servidor só armazena texto cifrado: o cofre web no mesmo endereço descriptografa no seu
-navegador, com chaves que nunca saem dos seus dispositivos.
+Até aqui, tudo fica na sua máquina. Para sincronizar outro dispositivo, trabalhar em equipe ou usar
+CI, faça login em um servidor:
+
+```sh
+sotto login                  # Sotto Cloud by default; --server <url> for your own server
+sotto push                   # upload the active environment's ciphertext
+sotto share DATABASE_URL     # a one-time link whose key never reaches the server
+```
+
+`sotto login` abre um navegador para entrar com o GitHub. Ele usa o Sotto Cloud em
+[getsotto.co.uk](https://getsotto.co.uk), a menos que você passe `--server <url>` (consulte
+[Auto-hospedagem](#auto-hospedagem) para hospedar o seu), e os comandos seguintes reutilizam o
+servidor escolhido. De todo modo, o servidor só armazena texto cifrado: o cofre web em `/app` no
+mesmo servidor descriptografa no seu navegador, com chaves que nunca saem dos seus dispositivos.
 
 Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
 
@@ -468,12 +496,22 @@ Salvo como `synth.toml`, esse arquivo adiciona um tema `synth`. Aplique-o com
 
 ## Auto-hospedagem
 
-Um comando sobe uma instância hospedada completa: Postgres, servidor e Caddy com HTTPS automático, a partir de
+Um comando sobe uma implantação completa: Postgres, servidor e Caddy com HTTPS automático, a partir de
 [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); o passo a passo está em
 [`deploy/README.md`](deploy/README.md). As partes também funcionam separadas: sirva o app web e a API na
 **mesma origem** (para que o cookie de sessão e a CSP permaneçam na mesma origem); o [`Caddyfile`](Caddyfile)
 incluído serve `web/dist` e faz proxy reverso da API, com cabeçalhos de segurança; o [`Dockerfile`](Dockerfile)
 monta a imagem do servidor (as migrations rodam na inicialização).
+
+`SOTTO_DEPLOYMENT_MODE` vale `self_hosted` por padrão. Nesse modo, o servidor não aplica limites
+de plano nem outras restrições do serviço hospedado, e não precisa de uma conta Stripe. O modo
+`cloud` é para o serviço que o Sotto opera; leia o passo a passo antes de defini-lo.
+
+Aponte a CLI para o seu servidor uma vez; os comandos seguintes o reutilizam:
+
+```sh
+sotto login --server https://sotto.example.com
+```
 
 ## Arquitetura
 

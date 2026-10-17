@@ -22,19 +22,33 @@ Sotto basiert auf einer einzigen Rust-Kryptoimplementierung, die sich die native
 WebAssembly teilen. Der Server speichert und synchronisiert verschlüsselte Daten, ohne jemals Klartext-Secrets
 oder verwendbare Schlüssel zu erhalten.
 
+## Möglichkeiten, Sotto zu betreiben
+
+Sotto ist ein einziges Open-Source-Produkt, das du auf drei Arten betreiben kannst. Egal, wofür du
+dich entscheidest: Der Server speichert immer nur Chiffrat.
+
+| Modus | Was du bekommst |
+| --- | --- |
+| Lokal | Die CLI und ein verschlüsselter Tresor auf deinem eigenen Rechner. Kein Konto und kein Server. |
+| Selbst gehostet | Derselbe Apache-2.0-Server auf Infrastruktur, die du betreibst. Er wendet keine Plan-Limits und keine Prüfungen des gehosteten Dienstes an; siehe [Selbst hosten](#selbst-hosten). |
+| Sotto Cloud | Der Server, den Sotto unter [getsotto.co.uk](https://getsotto.co.uk) betreibt, wenn du lieber keinen eigenen betreibst. `sotto login` verwendet ihn standardmäßig. Pläne und Limits stehen auf der [Preisseite](https://getsotto.co.uk/#pricing), den Dienststatus findest du unter [status.getsotto.co.uk](https://status.getsotto.co.uk). |
+
+Du kannst lokal anfangen und später einen Server hinzufügen: Nach `sotto login` lädt `sotto push`
+die aktive Umgebung so hoch, wie sie ist.
+
 ## Aktueller Stand
 
 Der Ende-zu-Ende-Ablauf funktioniert: lokal verschlüsseln, Chiffrat synchronisieren, auf einem anderen Gerät oder im
 Browser entschlüsseln und ein einzelnes Secret über einen Einmal-Link teilen. Auch für Teams funktioniert der gesamte Ablauf:
 Organisationen mit Rollen, Umgebungs-Grants pro Mitglied, Schlüsselrotation beim Entfernen von Mitgliedern,
-Maschinen-Token für CI und das Zurücksetzen des Kontos bei verlorenem Emergency Kit.
+Maschinen-Token für CI, ein Organisations-Auditprotokoll und das Zurücksetzen des Kontos bei verlorenem Emergency Kit.
 
 | Komponente | Jetzt verfügbar |
 | --- | --- |
-| Krypto-Kern | KDF, XChaCha20-Poly1305 AEAD + AAD, Key-Wrapping, X25519-Sealed-Box-Grants, die Tresor-Hierarchie der Umgebungen, Rewrap von Datenschlüsseln (Rotation), Share-Link-Krypto und Schlüsselkodierung, mit gemeinsamen Referenzvektoren für native und WASM-Builds |
-| CLI | `init`, lokale Secret-Verwaltung, Injektion per `run`, Synchronisierung mit `login`/`push`/`pull`, `setup` für neue Geräte, `share`; Teams: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, Maschinen-`token create/ls/revoke` (mit `SOTTO_TOKEN`-Modus für CI), `reset` bei verlorenem Notfall-Kit |
-| Server | OAuth-Anmeldung + Sitzungen, Konto- und Snapshot-Synchronisierung (versionierte Schreibvorgänge, ETag), Organisationen + Mitgliedschaften + Rollen, Tresorschlüssel-Grants pro Mitglied, transaktionale Schlüsselrotation, Maschinen-Token, Konto-Zurücksetzung und Share-Links - nur Chiffrat |
-| Web | Anmeldung (Cookie-Sitzung), Entsperren im Browser + Tresorentschlüsselung mit dem eigenen Grant, Erstellen und Empfangen von Einmal-Links und ein Team-Panel: Organisationen, Mitglieder, Einladung per E-Mail, Teilen einer Umgebung mit einem Mitglied |
+| Krypto-Kern | KDF, XChaCha20-Poly1305 AEAD + AAD, Key-Wrapping, X25519-Sealed-Box-Grants, die Tresor-Hierarchie der Umgebungen, Rewrap von Datenschlüsseln (Rotation), Share-Link-Krypto und Schlüsselkodierung, mit gemeinsamen Referenzvektoren für native und WASM-Builds, Codec-Fuzzing und Kani-Beweisen für das Parsen von Umschlag-Headern und Schlüsselsymbolen |
+| CLI | Lokale Secrets (`init`, `set`, `get`, `ls`, `rm`, `import`, `export`, `run`), Umgebungen (`env ls/use/diff/copy`), ein interaktives Dashboard, Synchronisierung mit `login`/`push`/`pull`, `setup` für neue Geräte, `history` und `rollback`, Einmal-Links (`share`, `shares ls/revoke`); Teams: `org create/ls/invite/members/remove/plan/audit`, `grant`, `clone`, `rotate`, ablaufende Maschinen-`token create/ls/revoke` (mit `SOTTO_TOKEN`-Modus für CI); `status`, `cloud status`, `reset` bei verlorenem Notfall-Kit, Themes und Shell-Vervollständigungen |
+| Server | OAuth-Anmeldung + Sitzungen, Konto- und Snapshot-Synchronisierung (versionierte Schreibvorgänge, ETag), Organisationen + Mitgliedschaften + Rollen, Tresorschlüssel-Grants pro Mitglied, transaktionale Schlüsselrotation, ablaufende Maschinen-Token, Secret-Verlauf, ein Organisations-Auditprotokoll, optionale Organisationslöschung mit Wiederherstellungsfrist, Konto-Zurücksetzung und Einmal-Links - nur Chiffrat. Ein Sotto-Cloud-Deployment setzt außerdem Plan-Limits durch und kann über Stripe abrechnen |
+| Web | Eine Landingpage und Anleitungen; der Tresor unter `/app`, der sich im Browser entsperren lässt, um Secrets zu durchsuchen, anzuzeigen und zu kopieren, Einmal-Links zu erstellen, eine Umgebung mit einem Mitglied zu teilen und den Schlüssel einer Umgebung zu rotieren; ein Team-Panel mit Organisationen, Mitgliedern, Einladungen per E-Mail, dem Plan, dem Auditprotokoll und der Organisationslöschung; die Empfangsseite für Einmal-Links; und eine Sotto-Cloud-Kontoseite unter `/cloud` |
 
 ## Installation
 
@@ -54,6 +68,11 @@ Sigstore-Signatur, bevor er installiert (`~/.local/bin` unter macOS/Linux, `%LOC
 Windows). Lieber erst ansehen? Lade ein Archiv von der
 [Release-Seite](https://github.com/getsotto/sotto/releases) herunter und verifiziere es manuell gemäß
 [SECURITY.md](SECURITY.md), oder baue aus den Quellen (siehe [Entwicklung](#entwicklung)).
+
+Die Installer, die Homebrew-Formel und die GitHub-Action installieren veröffentlichte Releases,
+diese README folgt dagegen dem Branch `main`, der dem neuesten Release voraus sein kann. Ein hier
+beschriebener Befehl existiert in deiner installierten Version daher möglicherweise noch nicht.
+`sotto --help` listet die Befehle auf, die deine Version unterstützt.
 
 ### Homebrew (Vorschau)
 
@@ -157,22 +176,31 @@ macOS, Linux und Windows ab.
 sotto init                   # create your identity + first project - SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
-sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
-sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
-sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 ```
 
-Der Export schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`.
-Das Löschen der Zwischenablage erfolgt nach bestem Bemühen: Das Ersetzen des Inhalts schützt den neuen Wert,
-während Zwischenablage-Manager, Ruhezustand oder ein beendeter Hilfsprozess eine Kopie behalten können.
+`sotto init` legt die Umgebungen `dev`, `staging` und `prod` an und wählt `dev` aus. Der Export
+schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`; `--format`
+akzeptiert außerdem `shell` und `json`. Das Löschen der Zwischenablage erfolgt nach bestem Bemühen:
+Das Ersetzen des Inhalts schützt den neuen Wert, während Zwischenablage-Manager, Ruhezustand oder
+ein beendeter Hilfsprozess eine Kopie behalten können.
 
-`sotto login` verwendet die gehostete Instanz unter [getsotto.co.uk](https://getsotto.co.uk), sofern du die CLI nicht mit
-`--server <url>` auf einen anderen Server richtest (siehe [Bereitstellung](deploy/README.md) für den eigenen Betrieb). In jedem Fall
-speichert der Server nur Chiffrat: Der Web-Tresor unter derselben Adresse entschlüsselt in deinem
-Browser, mit Schlüsseln, die deine Geräte nie verlassen.
+Bis hierhin bleibt alles auf deinem Rechner. Um ein weiteres Gerät zu synchronisieren, im Team zu
+arbeiten oder CI zu nutzen, melde dich bei einem Server an:
+
+```sh
+sotto login                  # Sotto Cloud by default; --server <url> for your own server
+sotto push                   # upload the active environment's ciphertext
+sotto share DATABASE_URL     # a one-time link whose key never reaches the server
+```
+
+`sotto login` öffnet einen Browser für die Anmeldung mit GitHub. Es verwendet Sotto Cloud unter
+[getsotto.co.uk](https://getsotto.co.uk), sofern du nicht `--server <url>` angibst (siehe
+[Selbst hosten](#selbst-hosten) für den eigenen Betrieb), und spätere Befehle verwenden den gewählten
+Server weiter. In jedem Fall speichert der Server nur Chiffrat: Der Web-Tresor unter `/app` auf
+demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Geräte nie verlassen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
 
@@ -473,12 +501,23 @@ Als `synth.toml` gespeichert, fügt diese Datei ein Theme `synth` hinzu. Mit
 
 ## Selbst hosten
 
-Ein Befehl bringt eine komplette gehostete Instanz hoch: Postgres, Server und Caddy mit automatischem HTTPS,
+Ein Befehl bringt ein komplettes Deployment hoch: Postgres, Server und Caddy mit automatischem HTTPS,
 aus [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); die Anleitung steht in
 [`deploy/README.md`](deploy/README.md). Die Teile funktionieren auch eigenständig: Betreibe Web-App und API unter
 **einem Origin** (damit Sitzungs-Cookie und CSP same-origin bleiben); die mitgelieferte
 [`Caddyfile`](Caddyfile) liefert `web/dist` aus und leitet die API per Reverse-Proxy weiter, mit Sicherheits-Headern;
 das [`Dockerfile`](Dockerfile) baut das Server-Image (Migrationen laufen beim Start).
+
+`SOTTO_DEPLOYMENT_MODE` steht standardmäßig auf `self_hosted`. In diesem Modus wendet der Server
+keine Plan-Limits oder anderen Einschränkungen des gehosteten Dienstes an und braucht kein
+Stripe-Konto. Der Modus `cloud` ist für den Dienst gedacht, den Sotto betreibt; lies die Anleitung,
+bevor du ihn setzt.
+
+Richte die CLI einmal auf deinen Server aus; spätere Befehle verwenden ihn weiter:
+
+```sh
+sotto login --server https://sotto.example.com
+```
 
 ## Architektur
 

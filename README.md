@@ -20,19 +20,33 @@ Sotto is built around one Rust crypto implementation shared by the native CLI an
 client through WebAssembly. The server stores and synchronises encrypted data without ever
 receiving plaintext secrets or usable keys.
 
+## Ways to run Sotto
+
+Sotto is one open-source product that you can run three ways. Whichever you choose, the server
+only ever stores ciphertext.
+
+| Mode | What you get |
+| --- | --- |
+| Local | The CLI and an encrypted vault on your own machine. No account and no server. |
+| Self-hosted | The same Apache-2.0 server on infrastructure you operate. It applies no plan limits and no hosted-service checks; see [Self-hosting](#self-hosting). |
+| Sotto Cloud | The server Sotto operates at [getsotto.co.uk](https://getsotto.co.uk), for when you would rather not run one. `sotto login` uses it by default. Plans and limits are on the [pricing page](https://getsotto.co.uk/#pricing), and service status is at [status.getsotto.co.uk](https://status.getsotto.co.uk). |
+
+You can start locally and add a server later: after `sotto login`, `sotto push` uploads the active
+environment as it stands.
+
 ## Current status
 
 The end-to-end flow works: encrypt locally, sync ciphertext, decrypt on another device or in the
 browser, and share a single secret via a one-time link. Teams work end to end too: organisations
 with roles, per-member environment grants, key rotation on member removal, machine tokens for CI,
-and an account reset for a lost Emergency Kit.
+an organisation audit log, and an account reset for a lost Emergency Kit.
 
 | Component | Available now |
 | --- | --- |
-| Crypto core | KDF, XChaCha20-Poly1305 AEAD + AAD, key wrapping, X25519 sealed-box grants, the environment vault hierarchy, data-key rewrap (rotation), share-link crypto, and key encoding - with native↔WASM golden vectors |
-| CLI | `init`, local secret management, `run`-style injection, `login`/`push`/`pull` sync, new-device `setup`, `share`; teams: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, machine `token create/ls/revoke` (with `SOTTO_TOKEN` mode for CI), lost-kit `reset` |
-| Server | OAuth login + sessions, account + snapshot sync (versioned writes, ETag), orgs + memberships + roles, per-member vault-key grants, transactional key rotation, machine tokens, account reset, and share links - ciphertext only |
-| Web | Login (cookie session), in-browser unlock + vault decryption via your own grant, one-time share create/receive, and a team panel: orgs, members, invite by email, share an environment with a member |
+| Crypto core | KDF, XChaCha20-Poly1305 AEAD + AAD, key wrapping, X25519 sealed-box grants, the environment vault hierarchy, data-key rewrap (rotation), share-link crypto, and key encoding - with native↔WASM golden vectors, codec fuzzing, and Kani proofs for envelope-header and key-symbol parsing |
+| CLI | Local secrets (`init`, `set`, `get`, `ls`, `rm`, `import`, `export`, `run`), environments (`env ls/use/diff/copy`), an interactive dashboard, `login`/`push`/`pull` sync, new-device `setup`, `history` and `rollback`, one-time links (`share`, `shares ls/revoke`); teams: `org create/ls/invite/members/remove/plan/audit`, `grant`, `clone`, `rotate`, expiring machine `token create/ls/revoke` (with `SOTTO_TOKEN` mode for CI); `status`, `cloud status`, lost-kit `reset`, themes, and shell completions |
+| Server | OAuth login + sessions, account + snapshot sync (versioned writes, ETag), orgs + memberships + roles, per-member vault-key grants, transactional key rotation, expiring machine tokens, secret history, an organisation audit log, opt-in organisation deletion with a recovery window, account reset, and one-time links - ciphertext only. A Sotto Cloud deployment also enforces plan limits and can bill through Stripe |
+| Web | A landing page and guides; the vault at `/app`, which unlocks in the browser to browse, search, reveal, and copy secrets, create one-time links, share an environment with a member, and rotate an environment key; a team panel with organisations, members, email invites, the plan, the audit log, and organisation deletion; the one-time link recipient page; and a Sotto Cloud account page at `/cloud` |
 
 ## Install
 
@@ -52,6 +66,11 @@ is installed - before installing (`~/.local/bin` on macOS/Linux, `%LOCALAPPDATA%
 Windows). Prefer to look first? Grab an archive from the
 [releases page](https://github.com/getsotto/sotto/releases) and verify it manually per
 [SECURITY.md](SECURITY.md), or build from source (see [Developing](#developing)).
+
+The installers, the Homebrew formula and the GitHub Action all install published releases, while
+this README follows the `main` branch, which can be ahead of the latest release. A command described
+here may therefore not exist in your installed version yet; `sotto --help` lists the commands your
+version supports.
 
 ### Homebrew (preview)
 
@@ -155,22 +174,30 @@ macOS, Linux, and Windows.
 sotto init                   # create your identity + first project - SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
-sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
-sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
-sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 ```
 
-Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
-Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
-clipboard managers, suspension, or a terminated helper may retain a history copy.
+`sotto init` creates `dev`, `staging` and `prod` environments and selects `dev`. Export writes
+plaintext, so it needs `--reveal` on a terminal, just like `sotto get`; `--format` also takes
+`shell` and `json`. Clipboard clearing is best-effort: replacing the clipboard protects the newer
+content, while clipboard managers, suspension, or a terminated helper may retain a history copy.
 
-`sotto login` uses the hosted instance at [getsotto.co.uk](https://getsotto.co.uk) unless you point
-it elsewhere with `--server <url>` (see [Deploying](deploy/README.md) to run your own). Either way
-the server only ever stores ciphertext - the web vault at the same address decrypts in your
-browser, with keys that never leave your devices.
+Everything so far stays on your machine. To sync another device, work with a team or run CI, log
+in to a server:
+
+```sh
+sotto login                  # Sotto Cloud by default; --server <url> for your own server
+sotto push                   # upload the active environment's ciphertext
+sotto share DATABASE_URL     # a one-time link whose key never reaches the server
+```
+
+`sotto login` opens a browser to sign in with GitHub. It uses Sotto Cloud at
+[getsotto.co.uk](https://getsotto.co.uk) unless you pass `--server <url>` (see
+[Self-hosting](#self-hosting) to run your own), and later commands reuse the server you chose.
+Either way the server only ever stores ciphertext - the web vault at `/app` on the same server
+decrypts in your browser, with keys that never leave your devices.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
@@ -459,12 +486,22 @@ or for one command with `sotto --theme synth <command>`.
 
 ## Self-hosting
 
-One command brings up a complete hosted instance - Postgres, the server, and Caddy with automatic
+One command brings up a complete deployment - Postgres, the server, and Caddy with automatic
 HTTPS - from [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); the runbook is
 [`deploy/README.md`](deploy/README.md). The pieces also work standalone: serve the web app and API
 from **one origin** (so the session cookie and CSP stay same-origin) - the included
 [`Caddyfile`](Caddyfile) serves `web/dist` and reverse-proxies the API, with security headers;
 [`Dockerfile`](Dockerfile) builds the server image (migrations run on boot).
+
+`SOTTO_DEPLOYMENT_MODE` defaults to `self_hosted`. In that mode the server applies no plan limits
+or other hosted-service restrictions, and it needs no Stripe account. The `cloud` mode is for the
+service Sotto operates; read the runbook before you set it.
+
+Point the CLI at your server once; later commands reuse it:
+
+```sh
+sotto login --server https://sotto.example.com
+```
 
 ## Architecture
 
