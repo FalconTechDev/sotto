@@ -18,6 +18,11 @@ use crate::founding_allocator;
 use crate::founding_schedule;
 use crate::org;
 
+/// The operator-facing lifetime of a transfer quote. A client cannot extend this by submitting
+/// its own expiry when it creates the invitation.
+pub const TRANSFER_QUOTE_SECONDS: i64 = 15 * 60;
+pub const TRANSFER_QUOTE_VERSION: i64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferPayer {
     Personal,
@@ -31,6 +36,25 @@ impl TransferPayer {
             Self::Sponsor => "sponsor",
         }
     }
+
+    pub fn parse(value: &str) -> Result<Self, TransferError> {
+        match value {
+            "personal" => Ok(Self::Personal),
+            "sponsor" => Ok(Self::Sponsor),
+            _ => Err(TransferError::InvalidField("payer kind")),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferDraft {
+    pub counterparty_user_id: String,
+    pub beneficiary_id: String,
+    pub destination_kind: TransferPayer,
+    pub destination_organization_id: Option<String>,
+    pub quote_version: i64,
+    pub quote_expires_at_epoch: i64,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +279,153 @@ pub enum TransferError {
     Database(#[from] sqlx::Error),
     #[error("founding allocator error: {0}")]
     Founding(#[from] founding_allocator::FoundingAllocatorError),
+}
+
+/// Derive and validate a transfer request from local billing state. The caller supplies only the
+/// destination and participants; source payer, offer and effective boundary are server-owned.
+pub async fn build_transfer_request(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    draft: &TransferDraft,
+    now_epoch: i64,
+) -> Result<TransferRequest, TransferError> {
+    founding_allocator::lock_capacity(tx).await?;
+    if draft.quote_expires_at_epoch > now_epoch.saturating_add(TRANSFER_QUOTE_SECONDS) {
+        return Err(TransferError::InvalidField("quote expiry"));
+    }
+    if draft.quote_version != TRANSFER_QUOTE_VERSION {
+        return Err(TransferError::InvalidField("quote version"));
+    }
+
+    let personal = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT offer, paid_through_epoch FROM billing_personal_accounts \
+         WHERE user_id = $1 AND state = 'active' AND cancel_at_period_end = FALSE \
+           AND cancellation_requested_at IS NULL AND stripe_subscription_id IS NOT NULL",
+    )
+    .bind(&draft.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let sponsored = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT seat.organization_id, seat.offer, subscription.current_period_end \
+         FROM billing_sponsored_seats AS seat \
+         JOIN billing_sponsored_subscriptions AS subscription \
+           ON subscription.organization_id = seat.organization_id \
+         WHERE seat.beneficiary_id = $1 AND seat.state = 'active' \
+           AND subscription.status = 'active' \
+           AND subscription.provider_subscription_id IS NOT NULL \
+           AND subscription.current_period_end IS NOT NULL \
+           AND seat.effective_from <= $2 \
+           AND (seat.effective_until IS NULL OR \
+                seat.effective_until >= subscription.current_period_end) \
+         ORDER BY seat.organization_id LIMIT 2",
+    )
+    .bind(&draft.beneficiary_id)
+    .bind(now_epoch)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let (source_kind, source_organization_id, source_offer, effective_from) =
+        match (personal, sponsored.as_slice()) {
+            (Some((offer, Some(boundary))), []) => (TransferPayer::Personal, None, offer, boundary),
+            (None, [(organization_id, offer, boundary)]) => (
+                TransferPayer::Sponsor,
+                Some(organization_id.clone()),
+                offer.clone(),
+                *boundary,
+            ),
+            (None, []) | (Some((_, None)), []) => return Err(TransferError::SourceInactive),
+            _ => return Err(TransferError::CorruptState),
+        };
+
+    let mut request = TransferRequest {
+        actor_user_id: actor_user_id.to_owned(),
+        counterparty_user_id: draft.counterparty_user_id.clone(),
+        beneficiary_id: draft.beneficiary_id.clone(),
+        source_kind,
+        source_organization_id,
+        destination_kind: draft.destination_kind,
+        destination_organization_id: draft.destination_organization_id.clone(),
+        offer: parse_offer(&source_offer)?,
+        quote_version: draft.quote_version,
+        quote_expires_at_epoch: draft.quote_expires_at_epoch,
+        effective_from,
+        effective_until: None,
+        idempotency_key: draft.idempotency_key.clone(),
+    };
+    request.validate_shape()?;
+    authorise_transfer_parties(tx, &request).await?;
+
+    let live_transfer: Option<String> = sqlx::query_scalar(
+        "SELECT transfer_id FROM billing_transfer_intents WHERE beneficiary_id = $1 \
+         AND (state IN ('pending','destination_prepared','destination_paid', \
+                        'source_adjustment_pending','unknown') \
+              OR (state = 'awaiting_consent' AND quote_expires_at_epoch > $2)) \
+         ORDER BY transfer_id LIMIT 1 FOR UPDATE",
+    )
+    .bind(&request.beneficiary_id)
+    .bind(now_epoch)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if live_transfer.is_some() {
+        return Err(TransferError::AlreadyInProgress);
+    }
+
+    let source_offer = ensure_source_active(tx, &request, now_epoch).await?;
+    ensure_no_pending_billing_mutation(tx, &request.beneficiary_id).await?;
+    ensure_destination_free(tx, &request).await?;
+    let award_id: Option<String> = sqlx::query_scalar(
+        "SELECT award_id FROM billing_founding_awards WHERE beneficiary_id = $1",
+    )
+    .bind(&request.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let award = if let Some(award_id) = award_id.as_deref() {
+        let award = founding_allocator::load_award(tx, award_id)
+            .await?
+            .ok_or(TransferError::CorruptState)?;
+        let (payer_kind, payer_id) = payer_identity(&request, request.source_kind)?;
+        if award.payer_kind != payer_kind || award.payer_id != payer_id {
+            return Err(TransferError::FoundingPayerConflict);
+        }
+        Some(award)
+    } else {
+        None
+    };
+    request.offer =
+        offer_at_transfer_boundary(&source_offer, request.effective_from, award.as_ref())?;
+    request.validate(now_epoch)?;
+    Ok(request)
+}
+
+fn offer_at_transfer_boundary(
+    source_offer: &str,
+    effective_from: i64,
+    award: Option<&founding_allocator::FoundingAward>,
+) -> Result<BillingOffer, TransferError> {
+    let source_offer = parse_offer(source_offer)?;
+    let Some(award) = award else {
+        if founding_allocator::FoundingOffer::from_billing_offer(source_offer).is_some() {
+            return Err(TransferError::CorruptState);
+        }
+        return Ok(source_offer);
+    };
+    let founding_end = award
+        .original_end_epoch
+        .ok_or(TransferError::CorruptState)?;
+    let founding_offer = award.offer.billing_offer();
+    let expected_source = if effective_from <= founding_end {
+        founding_offer
+    } else {
+        award.offer.standard_billing_offer()
+    };
+    if source_offer != expected_source {
+        return Err(TransferError::SourceTermChanged);
+    }
+    Ok(if effective_from < founding_end {
+        founding_offer
+    } else {
+        award.offer.standard_billing_offer()
+    })
 }
 
 impl From<TransferError> for Error {
@@ -881,6 +1052,50 @@ pub async fn load_for_actor(
     row.map(|row| transfer_from_row(&row)).transpose()
 }
 
+pub async fn load_for_participant(
+    pool: &PgPool,
+    transfer_id: &str,
+    user_id: &str,
+) -> Result<Option<TransferIntent>, TransferError> {
+    let row = sqlx::query(
+        "SELECT * FROM billing_transfer_intents WHERE transfer_id = $1 \
+         AND (actor_user_id = $2 OR counterparty_user_id = $2)",
+    )
+    .bind(transfer_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| transfer_from_row(&row)).transpose()
+}
+
+pub async fn find_by_idempotency(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<TransferIntent>, TransferError> {
+    load_by_idempotency(tx, actor_user_id, idempotency_key).await
+}
+
+pub async fn list_for_participant(
+    pool: &PgPool,
+    user_id: &str,
+    before_transfer_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<TransferIntent>, TransferError> {
+    let rows = sqlx::query(
+        "SELECT * FROM billing_transfer_intents \
+         WHERE (actor_user_id = $1 OR counterparty_user_id = $1) \
+           AND ($2::text IS NULL OR transfer_id < $2) \
+         ORDER BY transfer_id DESC LIMIT $3",
+    )
+    .bind(user_id)
+    .bind(before_transfer_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(transfer_from_row).collect()
+}
+
 async fn ensure_source_active(
     tx: &mut Transaction<'_, Postgres>,
     request: &TransferRequest,
@@ -1154,8 +1369,8 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_offer_at_boundary, validate_source_term, TransferError, TransferPayer,
-        TransferRequest, TransferState,
+        offer_at_transfer_boundary, validate_offer_at_boundary, validate_source_term,
+        TransferError, TransferPayer, TransferRequest, TransferState,
     };
     use crate::billing_catalogue::BillingOffer;
 
@@ -1259,6 +1474,34 @@ mod tests {
         assert!(matches!(
             validate_offer_at_boundary(&transfer, "founding_monthly", Some(&award)),
             Err(TransferError::SourceTermChanged)
+        ));
+    }
+
+    #[test]
+    fn server_derived_offer_keeps_founding_price_only_before_its_original_end() {
+        let award = crate::founding_allocator::FoundingAward {
+            award_id: "award".into(),
+            beneficiary_id: "user".into(),
+            payer_kind: crate::founding_allocator::FoundingPayerKind::Personal,
+            payer_id: "user".into(),
+            offer: crate::founding_allocator::FoundingOffer::Annual,
+            cohort_ordinal: 1,
+            original_start: crate::founding_allocator::FoundingDate::new(2026, 1, 1).unwrap(),
+            original_end: crate::founding_allocator::FoundingDate::new(2027, 1, 1).unwrap(),
+            original_start_epoch: Some(1_000),
+            original_end_epoch: Some(2_000),
+        };
+        assert_eq!(
+            offer_at_transfer_boundary("founding_annual", 1_999, Some(&award)).unwrap(),
+            BillingOffer::FoundingAnnual
+        );
+        assert_eq!(
+            offer_at_transfer_boundary("founding_annual", 2_000, Some(&award)).unwrap(),
+            BillingOffer::StandardAnnual
+        );
+        assert!(matches!(
+            offer_at_transfer_boundary("founding_annual", 2_001, None),
+            Err(TransferError::CorruptState)
         ));
     }
 
