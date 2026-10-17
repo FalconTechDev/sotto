@@ -574,32 +574,9 @@ Die Lieferketten-Richtlinie steht in `deny.toml` und wird in der CI mit
 cargo deny check
 ```
 
-Der vollständige Lockfile-Audit läuft ebenfalls im `supply-chain`-CI-Job.
-Python 3.11 oder neuer ist erforderlich; die CI verwendet 3.12. cargo-audit muss genau 0.22.2 sein:
-
-```sh
-cargo install cargo-audit --version 0.22.2 --locked
-python3 -B -m unittest discover -s scripts/tests -v
-scripts/check-cargo-audit
-```
-
-Die [Audit-Richtlinie](.ci/cargo-audit-policy.toml) dokumentiert exakte Ausnahmen für ruhende `rsa`- und
-`spin`-Lockfile-Einträge. `package`, `version`, `source`, `kind` und `finding` müssen übereinstimmen.
-Über alle Targets darf mit Standard- und allen Workspace-Features kein Abhängigkeitspfad vom Typ
-`normal`, `build` oder `dev` bestehen. Cargos `dev`-Kanten entsprechen `dev-dependencies`.
-
-Neue Befunde, geänderte Identitäten, erreichbare Pakete, fehlgeschlagene Scans und veraltete Ausnahmen
-lassen die CI fehlschlagen. Entferne eine Ausnahme im selben PR, der ihren Befund entfernt.
-Eine leere Ausnahmeliste erfordert einen sauberen Audit. Der Prüfer beendet sich bei Erfolg mit 0,
-bei Richtlinien- oder Scanfehlern mit 1. Rohes `cargo audit` meldet die ruhenden Befunde weiterhin;
-die Ausnahmen beheben die verwundbaren oder zurückgezogenen Releases nicht.
-
-Die [Audit-Standards](.cargo/audit.toml) aktivieren Advisory-Abruf und Yanked-Prüfungen und
-überschreiben die globale Audit-Konfiguration. Füge keine Advisory-Ausnahmen oder Scan-Filter hinzu.
-
-Der JSON-Modus von cargo-audit 0.22.2 kann Yanked-Prüfungen stillschweigend überspringen. Deshalb
-verlangt der Prüfer einen unabhängigen Terminal-Scan ohne Registry-Fehler und mit übereinstimmenden
-Befundidentitäten. Dies belegt einen separaten erfolgreichen Scan, nicht den Abschluss des JSON-Scans.
+Der `supply-chain`-CI-Job prüft das gesamte Lockfile mit `scripts/check-cargo-audit`. Die
+[Anleitung zum Lockfile-Audit](.ci/cargo-audit.md) beschreibt die gepinnte cargo-audit-Version, die
+Richtlinientests und die Regeln für die ruhenden Lockfile-Ausnahmen.
 
 Das implementationsübergreifende Gate beweist, dass native und WASM-Builds übereinstimmen: nativ erzeugtes Chiffrat
 entschlüsselt in WASM Byte für Byte aus gemeinsamen Referenzvektoren:

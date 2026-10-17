@@ -577,35 +577,9 @@ La politique de chaîne d'approvisionnement est définie dans `deny.toml` et vé
 cargo deny check
 ```
 
-L'audit complet du lockfile s'exécute aussi dans le job `supply-chain` de la CI.
-Python 3.11 ou ultérieur est requis ; la CI utilise 3.12. cargo-audit doit être exactement en 0.22.2 :
-
-```sh
-cargo install cargo-audit --version 0.22.2 --locked
-python3 -B -m unittest discover -s scripts/tests -v
-scripts/check-cargo-audit
-```
-
-La [politique d'audit](.ci/cargo-audit-policy.toml) consigne des exceptions exactes pour les entrées
-dormantes `rsa` et `spin`. Les champs `package`, `version`, `source`, `kind` et `finding` doivent
-correspondre. Aucun chemin de dépendance `normal`, `build` ou `dev` ne doit exister sur aucune cible,
-avec les fonctionnalités par défaut ou toutes celles de l'espace de travail. Les arêtes `dev` de Cargo
-correspondent aux `dev-dependencies`.
-
-Les nouveaux résultats, identités modifiées, paquets atteignables, analyses en échec et exceptions
-obsolètes font échouer la CI. Supprimez chaque exception dans la PR qui supprime son résultat.
-Une liste vide exige un audit propre. Le vérificateur renvoie 0 en cas de succès et 1 en cas d'échec
-de la politique ou de l'analyse. `cargo audit` rapporte toujours les résultats dormants ;
-les exceptions ne corrigent pas les versions vulnérables ou retirées.
-
-Les [paramètres d'audit](.cargo/audit.toml) maintiennent la récupération des avis et les vérifications
-des versions retirées, et remplacent la configuration globale du développeur.
-N'ajoutez ni exclusions d'avis ni filtres d'analyse.
-
-Le mode JSON de cargo-audit 0.22.2 peut omettre silencieusement les vérifications des versions
-retirées. Une analyse indépendante au format terminal est donc exigée, sans erreur de registre
-et avec des identités de résultats correspondantes. Cela établit une analyse distincte réussie,
-sans prouver que l'analyse JSON précédente s'est terminée.
+Le job `supply-chain` de la CI audite tout le lockfile avec `scripts/check-cargo-audit`. Le
+[guide d'audit du lockfile](.ci/cargo-audit.md) décrit la version épinglée de cargo-audit, les tests
+de la politique et les règles des exceptions dormantes du lockfile.
 
 Le contrôle inter-implémentations prouve que les compilations native et WASM concordent : le texte chiffré produit en natif
 se déchiffre à l'octet près en WASM à partir de vecteurs de référence partagés :
