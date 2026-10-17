@@ -321,6 +321,7 @@ pub struct SponsoredSubscriptionPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SponsoredSubscriptionSnapshot {
     pub customer_id: Option<String>,
+    pub default_payment_method_id: Option<String>,
     pub subscription_id: String,
     pub status: SubscriptionStatus,
     pub cancel_at_period_end: bool,
@@ -448,6 +449,24 @@ pub trait SubscriptionProvider: Send + Sync {
     ) -> ProviderResult<TransferSubscriptionSchedule> {
         Err(ProviderError::unsupported(
             "personal_transfer_schedule_create",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_source_restoration_subscription(
+        &self,
+        _transfer_id: &str,
+        _beneficiary_id: &str,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _offer: BillingOffer,
+        _price_id: &str,
+        _allocation_reference: &str,
+        _operation_id: &str,
+        _idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported(
+            "personal_source_restoration_subscription_create",
         ))
     }
 
@@ -980,6 +999,73 @@ impl SubscriptionProvider for StripeBilling {
             allocation_reference,
             start_at_epoch,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_source_restoration_subscription(
+        &self,
+        transfer_id: &str,
+        beneficiary_id: &str,
+        customer_id: &str,
+        payment_method_id: &str,
+        _offer: BillingOffer,
+        price_id: &str,
+        allocation_reference: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        if transfer_id.trim().is_empty()
+            || beneficiary_id.trim().is_empty()
+            || customer_id.trim().is_empty()
+            || payment_method_id.trim().is_empty()
+            || price_id.trim().is_empty()
+            || allocation_reference.trim().is_empty()
+            || operation_id.trim().is_empty()
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let form = personal_source_restoration_form(
+            transfer_id,
+            beneficiary_id,
+            customer_id,
+            payment_method_id,
+            price_id,
+            allocation_reference,
+            operation_id,
+        );
+        let created = stripe_post_with_idempotency_at(
+            &self.api_key,
+            &self.api_origin,
+            "subscriptions",
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        let subscription_id = created["id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let observed = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscriptions/{subscription_id}"),
+        )
+        .await?;
+        let snapshot = sponsored_subscription_snapshot(&observed, subscription_id)?;
+        if snapshot.customer_id.as_deref() != Some(customer_id)
+            || snapshot.default_payment_method_id.as_deref() != Some(payment_method_id)
+            || snapshot.items.len() != 1
+            || snapshot.items[0].provider_price_id != price_id
+            || snapshot.items[0].quantity != 1
+            || observed["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
+            || observed["metadata"]["operation_id"].as_str() != Some(operation_id)
+            || observed["metadata"]["sotto_allocation_reference"].as_str()
+                != Some(allocation_reference)
+            || observed["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(snapshot)
     }
 
     async fn create_checkout(
@@ -4320,6 +4406,31 @@ fn personal_transfer_schedule_form(
     form
 }
 
+fn personal_source_restoration_form(
+    transfer_id: &str,
+    beneficiary_id: &str,
+    customer_id: &str,
+    payment_method_id: &str,
+    price_id: &str,
+    allocation_reference: &str,
+    operation_id: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("customer".into(), customer_id.into()),
+        ("items[0][price]".into(), price_id.into()),
+        ("default_payment_method".into(), payment_method_id.into()),
+        ("collection_method".into(), "charge_automatically".into()),
+        ("payment_behavior".into(), "default_incomplete".into()),
+        ("metadata[personal_user_id]".into(), beneficiary_id.into()),
+        ("metadata[operation_id]".into(), operation_id.into()),
+        (
+            "metadata[sotto_allocation_reference]".into(),
+            allocation_reference.into(),
+        ),
+        ("metadata[sotto_transfer_id]".into(), transfer_id.into()),
+    ]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn transfer_schedule_from_object(
     object: &serde_json::Value,
@@ -4675,6 +4786,7 @@ fn sponsored_subscription_snapshot(
         .collect::<ProviderResult<Vec<_>>>()?;
     Ok(SponsoredSubscriptionSnapshot {
         customer_id: object["customer"].as_str().map(str::to_string),
+        default_payment_method_id: stripe_reference(&object["default_payment_method"]),
         subscription_id: base.id,
         status: base.status,
         cancel_at_period_end,
@@ -5203,6 +5315,59 @@ async fn record_transfer_invoice_payment(
     period_start: i64,
     period_end: i64,
 ) -> Result<()> {
+    let restoration = sqlx::query(
+        "SELECT transfer_id, beneficiary_id, source_kind, source_organization_id, offer, \
+                source_restoration_provider_subscription_id, source_restoration_payment_reference, \
+                effective_from, EXISTS (SELECT 1 FROM billing_personal_accounts account \
+                  WHERE account.user_id = billing_transfer_intents.beneficiary_id \
+                    AND account.operation_id = billing_transfer_intents.source_restoration_operation_id \
+                    AND account.stripe_customer_id = $2 \
+                    AND account.stripe_subscription_id = billing_transfer_intents.source_restoration_provider_subscription_id \
+                    AND account.offer = billing_transfer_intents.offer) AS account_binding \
+         FROM billing_transfer_intents WHERE source_restoration_operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .bind(customer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = restoration {
+        let transfer_id: String = row.try_get("transfer_id")?;
+        let source_kind: String = row.try_get("source_kind")?;
+        let source_organization_id: Option<String> = row.try_get("source_organization_id")?;
+        let restored_subscription: Option<String> =
+            row.try_get("source_restoration_provider_subscription_id")?;
+        let recorded_payment: Option<String> =
+            row.try_get("source_restoration_payment_reference")?;
+        let effective_from: i64 = row.try_get("effective_from")?;
+        let restoration_offer: String = row.try_get("offer")?;
+        let account_binding: bool = row.try_get("account_binding")?;
+        if row.try_get::<String, _>("beneficiary_id")? != beneficiary_id
+            || source_kind != destination_kind.as_str()
+            || source_organization_id.as_deref() != destination_organization_id
+            || restoration_offer != offer
+            || !account_binding
+            || restored_subscription.as_deref() != Some(subscription_id)
+            || period_start < effective_from
+            || period_end <= period_start
+            || (recorded_payment.is_some()
+                && recorded_payment.as_deref() != Some(payment_reference))
+        {
+            return Err(Error::Conflict(
+                "paid invoice does not match its source restoration".into(),
+            ));
+        }
+        billing_transfers::record_source_restoration_payment(
+            tx,
+            &transfer_id,
+            operation_id,
+            subscription_id,
+            payment_reference,
+        )
+        .await
+        .map_err(Error::from)?;
+        return Ok(());
+    }
+
     let row = sqlx::query(
         "SELECT transfer_id, beneficiary_id, destination_kind, destination_organization_id, \
                 destination_customer_id, destination_provider_subscription_id, offer, effective_from \
@@ -5246,9 +5411,6 @@ async fn record_transfer_invoice_payment(
     Ok(())
 }
 
-/// Apply an Event retrieved from Stripe's authenticated Events API using the same settlement
-/// stores as signed webhooks. The sealed transport value remains distinct from webhook signature
-/// provenance; this function accepts only the invoice event types enumerated by the scanner.
 async fn repair_event_already_completed(
     pool: &sqlx::PgPool,
     account_id: &str,
@@ -8110,9 +8272,12 @@ async fn invoice_paid(
     let allowed_transfer_ids: Vec<String> = if let Some(period_start) = invoice_period_start {
         sqlx::query_scalar(
             "SELECT transfer_id FROM billing_transfer_intents \
-             WHERE destination_operation_id = $1 AND destination_kind = 'personal' \
+             WHERE ((destination_operation_id = $1 AND destination_kind = 'personal' \
                AND destination_provider_subscription_id = $2 AND beneficiary_id = $3 \
-               AND effective_from = $4 AND state IN \
+               AND effective_from = $4) OR \
+               (source_restoration_operation_id = $1 AND source_kind = 'personal' \
+               AND source_restoration_provider_subscription_id = $2 AND beneficiary_id = $3 \
+               AND effective_from <= $4)) AND state IN \
                  ('pending','destination_prepared','destination_paid','source_adjustment_pending', \
                   'source_restoration_pending','unknown')",
         )
@@ -8147,15 +8312,57 @@ async fn invoice_paid(
                 .or_else(|| object["id"].as_str())
         })
         .ok_or_else(|| Error::Config("paid personal invoice has no payment reference".into()))?;
-    personal_billing::record_invoice_paid(
-        tx,
-        subscription_id,
-        payment_reference,
-        period_end,
-        &paid_through.to_string(),
+    let account_state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM billing_personal_accounts WHERE user_id = $1 AND operation_id = $2 FOR UPDATE",
     )
-    .await
-    .map_err(personal_billing_error)?;
+    .bind(&personal_user_id)
+    .bind(&operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if account_state.as_deref() == Some("pending") {
+        let evidence = verified_personal_invoice.ok_or_else(|| {
+            Error::Internal("pending personal invoice lacks verified payment evidence".into())
+        })?;
+        if evidence.operation_id != operation_id
+            || evidence.allocation.beneficiary_id != personal_user_id
+            || stripe_reference(&object["customer"]).as_deref()
+                != Some(evidence.allocation.provider_customer_id.as_str())
+        {
+            return Err(Error::Conflict(
+                "pending personal invoice binding changed".into(),
+            ));
+        }
+        personal_billing::record_paid_settlement(
+            tx,
+            &operation_id,
+            &evidence.allocation.provider_customer_id,
+            subscription_id,
+            payment_reference,
+            period_end,
+            &paid_through.to_string(),
+        )
+        .await
+        .map_err(personal_billing_error)?;
+        billing_operations::record_provider_result(
+            tx,
+            &operation_id,
+            billing_operations::BillingOperationState::Succeeded,
+            None,
+            Some("source_restoration_paid"),
+        )
+        .await
+        .map_err(Error::from)?;
+    } else {
+        personal_billing::record_invoice_paid(
+            tx,
+            subscription_id,
+            payment_reference,
+            period_end,
+            &paid_through.to_string(),
+        )
+        .await
+        .map_err(personal_billing_error)?;
+    }
     reconcile_personal_founding_invoice(tx, object, subscription_id, catalogue).await?;
     Ok(())
 }
@@ -10519,6 +10726,57 @@ mod tests {
     }
 
     #[test]
+    fn personal_source_restoration_charges_the_original_customer_idempotently() {
+        let fields = personal_source_restoration_form(
+            "transfer:abc",
+            "user_123",
+            "cus_original",
+            "pm_saved",
+            "price_standard_monthly",
+            "alloc_restore",
+            "transfer:abc:source-restoration",
+        )
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            fields.get("customer").map(String::as_str),
+            Some("cus_original")
+        );
+        assert_eq!(
+            fields.get("default_payment_method").map(String::as_str),
+            Some("pm_saved")
+        );
+        assert_eq!(
+            fields.get("items[0][price]").map(String::as_str),
+            Some("price_standard_monthly")
+        );
+        assert_eq!(
+            fields.get("collection_method").map(String::as_str),
+            Some("charge_automatically")
+        );
+        assert_eq!(
+            fields.get("payment_behavior").map(String::as_str),
+            Some("default_incomplete")
+        );
+        assert_eq!(
+            fields
+                .get("metadata[sotto_transfer_id]")
+                .map(String::as_str),
+            Some("transfer:abc")
+        );
+        assert_eq!(
+            fields.get("metadata[operation_id]").map(String::as_str),
+            Some("transfer:abc:source-restoration")
+        );
+        assert_eq!(
+            fields
+                .get("metadata[sotto_allocation_reference]")
+                .map(String::as_str),
+            Some("alloc_restore")
+        );
+    }
+
+    #[test]
     fn transfer_setup_response_requires_expected_customer_and_transfer_metadata() {
         let response = serde_json::json!({
             "id": "cs_test_transfer",
@@ -10789,6 +11047,7 @@ mod tests {
         let subscription = serde_json::json!({
             "id": "sub-sponsored",
             "customer": "cus-sponsored",
+            "default_payment_method": "pm_saved",
             "status": "active",
             "cancel_at_period_end": false,
             "cancel_at": null,
@@ -10807,6 +11066,10 @@ mod tests {
         assert_eq!(snapshot.current_period_start, Some(1_700_000_000));
         assert_eq!(snapshot.current_period_end, Some(1_702_678_400));
         assert_eq!(snapshot.schedule_id.as_deref(), Some("sub_sched"));
+        assert_eq!(
+            snapshot.default_payment_method_id.as_deref(),
+            Some("pm_saved")
+        );
         assert!(!snapshot.cancel_at_period_end);
         assert_eq!(snapshot.cancel_at, None);
 

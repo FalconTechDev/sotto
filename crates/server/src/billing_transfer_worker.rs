@@ -127,8 +127,7 @@ async fn advance(
 ) -> Result<Advance, ExecutionError> {
     let transfer = &lease.transfer;
     if transfer.state == TransferState::SourceRestorationPending {
-        restore_source(pool, provider, catalogue, lease).await?;
-        return Ok(Advance::Advanced);
+        return restore_source(pool, provider, catalogue, lease).await;
     }
     if transfer.destination_schedule_id.is_none() {
         prepare_destination(pool, provider, catalogue, lease).await?;
@@ -667,15 +666,335 @@ fn sponsored_phase_matches_snapshot(
 }
 
 async fn restore_source(
-    _pool: &PgPool,
-    _provider: &dyn SubscriptionProvider,
-    _catalogue: &BillingPriceIds,
-    _lease: &TransferLease,
+    pool: &PgPool,
+    provider: &dyn SubscriptionProvider,
+    catalogue: &BillingPriceIds,
+    lease: &TransferLease,
+) -> Result<Advance, ExecutionError> {
+    let transfer = &lease.transfer;
+    if transfer.source_restoration_payment_reference.is_some() {
+        let subscription_id = transfer
+            .source_restoration_provider_subscription_id
+            .as_deref()
+            .ok_or(ExecutionError::Local(
+                "source_restoration_subscription_missing",
+            ))?;
+        let snapshot = provider.get_sponsored_subscription(subscription_id).await?;
+        if snapshot.subscription_id != subscription_id
+            || snapshot.status != SubscriptionStatus::Active
+            || snapshot.cancel_at_period_end
+            || snapshot.cancel_at.is_some()
+            || snapshot.items.len() != 1
+            || snapshot.items[0].provider_price_id != catalogue.id_for(transfer.offer)
+            || snapshot.items[0].quantity != 1
+            || snapshot
+                .current_period_start
+                .is_none_or(|start| start > epoch_now())
+            || snapshot
+                .current_period_end
+                .is_none_or(|end| end <= epoch_now())
+        {
+            return Err(ExecutionError::Local("source_restoration_not_active"));
+        }
+        let payment_reference = transfer
+            .source_restoration_payment_reference
+            .as_deref()
+            .ok_or(ExecutionError::Local("source_restoration_payment_missing"))?;
+        let reference = format!(
+            "stripe-source-restored:{}:{}",
+            opaque_transfer_id(&transfer.transfer_id),
+            opaque_transfer_id(payment_reference)
+        );
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| ExecutionError::Local("transfer_transaction_unavailable"))?;
+        lock_transfer_for_lease_context(&mut tx, lease).await?;
+        let account = sqlx::query(
+            "SELECT state, stripe_customer_id, stripe_subscription_id, offer, payment_reference, \
+                    paid_through_epoch \
+             FROM billing_personal_accounts \
+             WHERE user_id = $1 AND operation_id = $2 FOR UPDATE",
+        )
+        .bind(&transfer.beneficiary_id)
+        .bind(
+            transfer
+                .source_restoration_operation_id
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("source_restoration_account_lookup_failed"))?
+        .ok_or(ExecutionError::Local("source_restoration_account_missing"))?;
+        let account_state: String = account
+            .try_get("state")
+            .map_err(|_| ExecutionError::Local("source_restoration_account_corrupt"))?;
+        let account_customer: Option<String> = account
+            .try_get("stripe_customer_id")
+            .map_err(|_| ExecutionError::Local("source_restoration_account_corrupt"))?;
+        let account_subscription: Option<String> = account
+            .try_get("stripe_subscription_id")
+            .map_err(|_| ExecutionError::Local("source_restoration_account_corrupt"))?;
+        let account_offer: String = account
+            .try_get("offer")
+            .map_err(|_| ExecutionError::Local("source_restoration_account_corrupt"))?;
+        let account_payment: Option<String> = account
+            .try_get("payment_reference")
+            .map_err(|_| ExecutionError::Local("source_restoration_account_corrupt"))?;
+        let paid_through: Option<i64> = account
+            .try_get("paid_through_epoch")
+            .map_err(|_| ExecutionError::Local("source_restoration_account_corrupt"))?;
+        if account_state != "active"
+            || account_customer.as_deref() != snapshot.customer_id.as_deref()
+            || account_subscription.as_deref() != Some(subscription_id)
+            || account_offer != transfer.offer.as_str()
+            || account_payment.as_deref() != Some(payment_reference)
+            || paid_through.is_none_or(|end| end <= transfer.effective_from)
+        {
+            return Err(ExecutionError::Local("source_restoration_account_unpaid"));
+        }
+        billing_transfers::complete_source_restoration(&mut tx, &transfer.transfer_id, &reference)
+            .await
+            .map_err(|_| ExecutionError::Local("source_restoration_completion_rejected"))?;
+        tx.commit()
+            .await
+            .map_err(|_| ExecutionError::Local("transfer_commit_failed"))?;
+        return Ok(Advance::Advanced);
+    }
+
+    match transfer.source_kind {
+        TransferPayer::Personal => {
+            restore_personal_source(pool, provider, catalogue, lease).await?;
+            Ok(Advance::WaitingForInvoice)
+        }
+        // A sponsor payer uses a shared subscription. Until that rollback can be expressed and
+        // read back without creating a second subscription for the organisation, keep it fenced
+        // for operator recovery instead of claiming that the payer has been restored.
+        TransferPayer::Sponsor => Err(ExecutionError::Local(
+            "sponsored_source_restoration_requires_review",
+        )),
+    }
+}
+
+async fn restore_personal_source(
+    pool: &PgPool,
+    provider: &dyn SubscriptionProvider,
+    catalogue: &BillingPriceIds,
+    lease: &TransferLease,
 ) -> Result<(), ExecutionError> {
-    // Restoration needs the original source invoice phase and payment-method evidence. Until
-    // that provider read-back contract is available, keep the transfer leased for manual review
-    // instead of claiming that a canceled source was restored.
-    Err(ExecutionError::Local("source_restoration_requires_review"))
+    let transfer = &lease.transfer;
+    if transfer.source_kind != TransferPayer::Personal {
+        return Err(ExecutionError::Local("source_binding_changed"));
+    }
+    let old_subscription_id = transfer
+        .source_provider_subscription_id
+        .as_deref()
+        .ok_or(ExecutionError::Local("source_subscription_missing"))?;
+    let original = provider
+        .get_sponsored_subscription(old_subscription_id)
+        .await?;
+    if original.subscription_id != old_subscription_id
+        || original.status != SubscriptionStatus::Canceled
+        || original.cancel_at_period_end
+        || original.cancel_at.is_some()
+    {
+        return Err(ExecutionError::Local("source_subscription_not_ended"));
+    }
+    let customer_id = original
+        .customer_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ExecutionError::Local("source_customer_missing"))?;
+    let payment_method_id = original
+        .default_payment_method_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ExecutionError::Local("source_payment_method_missing"))?;
+    let operation_id = transfer_personal_restoration_operation_id(&transfer.transfer_id);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ExecutionError::Local("transfer_transaction_unavailable"))?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|_| ExecutionError::Local("transfer_capacity_lock_failed"))?;
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(&transfer.beneficiary_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("transfer_beneficiary_missing"))?
+        .ok_or(ExecutionError::Local("transfer_beneficiary_missing"))?;
+    lock_transfer_for_lease(
+        &mut tx,
+        &TransferLease {
+            transfer: transfer.clone(),
+            lease_token: lease.lease_token.clone(),
+            lease_until_epoch: lease.lease_until_epoch,
+        },
+    )
+    .await?;
+
+    let existing_account: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT operation_id, stripe_subscription_id, state FROM billing_personal_accounts \
+         WHERE user_id = $1 FOR UPDATE",
+    )
+    .bind(&transfer.beneficiary_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| ExecutionError::Local("source_account_lookup_failed"))?;
+    if existing_account
+        .as_ref()
+        .is_none_or(|(_, subscription, _)| subscription.as_deref() != Some(old_subscription_id))
+    {
+        return Err(ExecutionError::Local("source_account_binding_changed"));
+    }
+    let existing_operation = existing_account
+        .as_ref()
+        .map(|(operation, _, _)| operation.as_str());
+    let allocation_reference = if existing_operation == Some(&operation_id) {
+        sqlx::query_scalar::<_, String>(
+            "SELECT allocation_reference FROM billing_personal_accounts WHERE user_id = $1",
+        )
+        .bind(&transfer.beneficiary_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("source_account_corrupt"))?
+    } else {
+        sqlx::query(
+            "UPDATE billing_personal_accounts SET state = 'canceled', updated_at = now() \
+             WHERE user_id = $1 AND stripe_subscription_id = $2 \
+               AND state IN ('active','past_due','unpaid')",
+        )
+        .bind(&transfer.beneficiary_id)
+        .bind(old_subscription_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("source_account_state_update_failed"))?;
+        let request_key = format!("{}:source-restoration", transfer.transfer_id);
+        let provider_key = format!("{}:source-restoration", transfer.provider_idempotency_key);
+        sqlx::query(
+            "INSERT INTO billing_operations \
+             (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
+              offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, state) \
+             VALUES ($1,$2,$3,$4,$4,$4,$5,$6,$7,$8,'pending') ON CONFLICT (operation_id) DO NOTHING",
+        )
+        .bind(&operation_id)
+        .bind(&request_key)
+        .bind(&transfer.request_hash)
+        .bind(&transfer.beneficiary_id)
+        .bind(transfer.offer.as_str())
+        .bind(transfer.quote_version)
+        .bind(epoch_now().saturating_add(900))
+        .bind(&provider_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("source_operation_insert_failed"))?;
+        let allocation = crate::personal_billing::begin_account(
+            &mut tx,
+            &transfer.beneficiary_id,
+            &operation_id,
+            transfer.offer,
+            epoch_now().saturating_add(86_400),
+            epoch_now(),
+        )
+        .await
+        .map_err(|_| ExecutionError::Local("source_account_reservation_failed"))?;
+        sqlx::query(
+            "UPDATE billing_personal_accounts SET stripe_customer_id = $2, updated_at = now() \
+             WHERE user_id = $1 AND operation_id = $3 AND state = 'pending'",
+        )
+        .bind(&transfer.beneficiary_id)
+        .bind(customer_id)
+        .bind(&operation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("source_customer_binding_failed"))?;
+        allocation
+    };
+    billing_transfers::begin_source_restoration_payment(
+        &mut tx,
+        &transfer.transfer_id,
+        &operation_id,
+    )
+    .await
+    .map_err(|_| ExecutionError::Local("source_restoration_binding_failed"))?;
+    tx.commit()
+        .await
+        .map_err(|_| ExecutionError::Local("transfer_commit_failed"))?;
+
+    if transfer
+        .source_restoration_provider_subscription_id
+        .is_none()
+    {
+        let restored = provider
+            .create_personal_source_restoration_subscription(
+                &transfer.transfer_id,
+                &transfer.beneficiary_id,
+                customer_id,
+                payment_method_id,
+                transfer.offer,
+                catalogue.id_for(transfer.offer),
+                &allocation_reference,
+                &operation_id,
+                &format!("{}:source-restoration", transfer.provider_idempotency_key),
+            )
+            .await?;
+        if restored.customer_id.as_deref() != Some(customer_id)
+            || restored.default_payment_method_id.as_deref() != Some(payment_method_id)
+            || !matches!(
+                restored.status,
+                SubscriptionStatus::Active | SubscriptionStatus::Incomplete
+            )
+            || restored.items.len() != 1
+            || restored.items[0].provider_price_id != catalogue.id_for(transfer.offer)
+            || restored.items[0].quantity != 1
+        {
+            return Err(ExecutionError::Local(
+                "source_restoration_provider_binding_invalid",
+            ));
+        }
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| ExecutionError::Local("transfer_transaction_unavailable"))?;
+        founding_allocator::lock_capacity(&mut tx)
+            .await
+            .map_err(|_| ExecutionError::Local("transfer_capacity_lock_failed"))?;
+        lock_transfer_for_lease(
+            &mut tx,
+            &TransferLease {
+                transfer: transfer.clone(),
+                lease_token: lease.lease_token.clone(),
+                lease_until_epoch: lease.lease_until_epoch,
+            },
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE billing_personal_accounts SET stripe_customer_id = $2, stripe_subscription_id = $3, updated_at = now() \
+             WHERE user_id = $1 AND operation_id = $4 AND state = 'pending'",
+        )
+        .bind(&transfer.beneficiary_id)
+        .bind(customer_id)
+        .bind(&restored.subscription_id)
+        .bind(&operation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ExecutionError::Local("source_subscription_binding_failed"))?;
+        billing_transfers::record_source_restoration_subscription(
+            &mut tx,
+            &transfer.transfer_id,
+            &operation_id,
+            &restored.subscription_id,
+        )
+        .await
+        .map_err(|_| ExecutionError::Local("source_restoration_binding_failed"))?;
+        tx.commit()
+            .await
+            .map_err(|_| ExecutionError::Local("transfer_commit_failed"))?;
+    }
+    Ok(())
 }
 
 async fn seed_personal_destination(
@@ -971,6 +1290,15 @@ async fn lock_transfer_context(
     lease: &TransferLease,
     allow_source_adjustment: bool,
 ) -> Result<TransferIntent, ExecutionError> {
+    let transfer = lock_transfer_for_lease_context(tx, lease).await?;
+    validate_local_bindings(tx, &transfer, allow_source_adjustment).await?;
+    Ok(transfer)
+}
+
+async fn lock_transfer_for_lease_context(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &TransferLease,
+) -> Result<TransferIntent, ExecutionError> {
     founding_allocator::lock_capacity(tx)
         .await
         .map_err(|_| ExecutionError::Local("transfer_capacity_lock_failed"))?;
@@ -1006,9 +1334,7 @@ async fn lock_transfer_context(
             .map_err(|_| ExecutionError::Local("transfer_organisation_lock_failed"))?
             .ok_or(ExecutionError::Local("transfer_organisation_missing"))?;
     }
-    let transfer = lock_transfer_for_lease(tx, lease).await?;
-    validate_local_bindings(tx, &transfer, allow_source_adjustment).await?;
-    Ok(transfer)
+    lock_transfer_for_lease(tx, lease).await
 }
 
 async fn validate_local_bindings(
@@ -1237,6 +1563,10 @@ fn transfer_sponsored_operation_id(transfer_id: &str) -> String {
     format!("{transfer_id}:destination")
 }
 
+fn transfer_personal_restoration_operation_id(transfer_id: &str) -> String {
+    format!("{transfer_id}:source-restoration")
+}
+
 fn transfer_allocation_reference(transfer_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(transfer_id.as_bytes());
@@ -1306,6 +1636,9 @@ mod tests {
             destination_payment_reference: None,
             source_adjustment_reference: None,
             source_restoration_reference: None,
+            source_restoration_operation_id: None,
+            source_restoration_provider_subscription_id: None,
+            source_restoration_payment_reference: None,
             founding_award_id: None,
             execution_lease_token: Some("lease".into()),
             execution_lease_until_epoch: Some(900),
@@ -1324,6 +1657,7 @@ mod tests {
     fn snapshot(subscription_id: &str) -> SponsoredSubscriptionSnapshot {
         SponsoredSubscriptionSnapshot {
             customer_id: Some("cus_test".into()),
+            default_payment_method_id: None,
             subscription_id: subscription_id.into(),
             status: SubscriptionStatus::Active,
             cancel_at_period_end: false,
