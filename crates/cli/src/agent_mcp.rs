@@ -523,7 +523,7 @@ mod tests {
             marker
         );
         let manifest = format!(
-            "version = 1\n\n[[task]]\nname = \"verify\"\ndescription = \"Canary test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", {:?}]\nenvironments = [\"dev\"]\n",
+            "version = 1\n\n[[task]]\nname = \"verify\"\ndescription = \"Canary test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", {:?}]\nenvironments = [\"dev\"]\n\n[[task]]\nname = \"fail\"\ndescription = \"Failure mapping test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", \"printf 'hidden failure output'; exit 7\"]\nenvironments = [\"dev\"]\n\n[[task]]\nname = \"slow\"\ndescription = \"Timeout mapping test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", \"sleep 5\"]\nenvironments = [\"dev\"]\ntimeout_seconds = 1\n",
             script
         );
         std::fs::write(root.path().join("sotto.tasks.toml"), manifest).unwrap();
@@ -531,27 +531,47 @@ mod tests {
         app.set(&config, "MCP_CANARY", b"synthetic-value").unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let manifest = TaskManifest::load_from(&canonical_root).unwrap();
-        let task = &manifest.tasks()[0];
-        let executable = task.resolve_executable(&canonical_root).unwrap();
-        let fingerprint =
-            approval_fingerprint(&manifest.fingerprint_for(task.name()).unwrap(), &executable)
-                .unwrap();
         let approvals = ApprovalStore::open(data.path()).unwrap();
-        approvals
-            .approve(
-                &config.project_id,
-                &project_root_key(&canonical_root),
-                task.name(),
-                "dev",
-                &fingerprint,
-            )
-            .unwrap();
+        for task in manifest.tasks() {
+            let executable = task.resolve_executable(&canonical_root).unwrap();
+            let fingerprint =
+                approval_fingerprint(&manifest.fingerprint_for(task.name()).unwrap(), &executable)
+                    .unwrap();
+            approvals
+                .approve(
+                    &config.project_id,
+                    &project_root_key(&canonical_root),
+                    task.name(),
+                    "dev",
+                    &fingerprint,
+                )
+                .unwrap();
+        }
         let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
+        let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let mut client = ().serve(client_transport).await.unwrap();
+        assert_eq!(client.list_tools(None).await.unwrap().tools.len(), 2);
 
-        let result = server
-            .execute_task("verify", "dev", std::future::pending())
-            .await;
-
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new(RUN_TASK).with_arguments(
+                    json!({"task":"verify", "environment":"dev"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
         assert_eq!(result.is_error, Some(false));
         assert!(
             marker.exists(),
@@ -560,6 +580,51 @@ mod tests {
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("synthetic-value"), "{serialized}");
         assert!(!serialized.contains("child output"), "{serialized}");
+
+        let failed = client
+            .call_tool(
+                CallToolRequestParams::new(RUN_TASK).with_arguments(
+                    json!({"task":"fail", "environment":"dev"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.is_error, Some(true));
+        assert_eq!(
+            failed.structured_content.as_ref().unwrap()["status"],
+            "failed"
+        );
+        assert_eq!(failed.structured_content.as_ref().unwrap()["exit_code"], 7);
+        assert!(!serde_json::to_string(&failed)
+            .unwrap()
+            .contains("hidden failure output"));
+
+        let timed_out = client
+            .call_tool(
+                CallToolRequestParams::new(RUN_TASK).with_arguments(
+                    json!({"task":"slow", "environment":"dev"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timed_out.is_error, Some(true));
+        assert_eq!(
+            timed_out.structured_content.as_ref().unwrap()["status"],
+            "timed_out"
+        );
+        assert_eq!(
+            timed_out.structured_content.as_ref().unwrap()["exit_code"],
+            Value::Null
+        );
+
+        client.close().await.unwrap();
+        server_task.await.unwrap();
     }
 
     #[cfg(unix)]

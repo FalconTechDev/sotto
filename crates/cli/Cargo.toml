@@ -55,6 +55,7 @@ rmcp = { version = "3.5.1", default-features = false, features = ["server", "tra
 
 [dev-dependencies]
 tempfile = "3"
+rmcp = { version = "3.5.1", default-features = false, features = ["client"] }
 # End-to-end test: run the real server in-process against Postgres and drive it over HTTP.
 sotto-server = { path = "../server" }
 axum = { workspace = true }
