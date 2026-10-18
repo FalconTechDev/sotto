@@ -10196,12 +10196,12 @@ mod tests {
                 "INSERT INTO billing_transfer_intents \
                  (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
                   destination_kind, destination_organization_id, offer, quote_version, \
-                  quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+                  quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, request_hash, \
                   provider_idempotency_key, destination_operation_id, source_provider_subscription_id, \
                   destination_provider_subscription_id, destination_customer_id, state, result_code, \
                   destination_payment_reference, destination_period_end, destination_expected_period_end) \
                  VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
-                         $4, $5, $6, $6, $6, $7, 'sub_source', 'sub_destination', 'cus_destination', \
+                         $4, $4, $5, $6, $6, $6, $7, 'sub_source', 'sub_destination', 'cus_destination', \
                          $8, $9, $10, $11, $12)",
             )
             .bind(transfer_id)
@@ -10224,12 +10224,12 @@ mod tests {
             "INSERT INTO billing_transfer_intents \
              (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
               destination_kind, destination_organization_id, offer, quote_version, \
-              quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+              quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, request_hash, \
               provider_idempotency_key, source_provider_subscription_id, state, result_code, \
               source_restoration_operation_id, source_restoration_provider_subscription_id, \
               source_restoration_payment_reference) \
              VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
-                     $4, $5, $6, $6, $6, 'sub_source', 'failed', 'destination_initial_payment_failed', \
+                     $4, $4, $5, $6, $6, $6, 'sub_source', 'failed', 'destination_initial_payment_failed', \
                      $7, 'sub_restored', 'pi_restoration_boundary')",
         )
         .bind(&restoration_id)

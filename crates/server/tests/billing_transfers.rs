@@ -1249,12 +1249,12 @@ async fn source_restoration_keeps_beneficiary_fenced_until_provider_confirmation
         "INSERT INTO billing_transfer_intents \
          (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
           destination_kind, destination_organization_id, offer, quote_version, \
-          quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+          quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, request_hash, \
           provider_idempotency_key, source_provider_subscription_id, \
           destination_provider_subscription_id, destination_operation_id, source_operation_id, \
           source_adjustment_reference, state) \
          VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
-                 2000000000, 2000000100, $1, $1, $1, 'sub_source', 'sub_destination', \
+                 2000000000, 2000000000, 2000000100, $1, $1, $1, 'sub_source', 'sub_destination', \
                  'op_destination', 'op_source', 'schedule_source', 'source_adjustment_pending')",
     )
     .bind(&transfer_id)
@@ -1598,6 +1598,15 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         BeginTransfer::AlreadyExists(_) => panic!("expired invitation unexpectedly existed"),
     };
     tx.commit().await.expect("commit expired invitation");
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET consent_expires_at_epoch = $2 \
+         WHERE transfer_id = $1",
+    )
+    .bind(&expired_id)
+    .bind(1_800_001_000_i64)
+    .execute(&pool)
+    .await
+    .expect("expire the invitation consent window");
 
     let mut fresh = request;
     fresh.idempotency_key = "fresh-invitation".into();
@@ -1622,7 +1631,7 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
     .await
     .expect("read expired invitation");
     assert_eq!(expired_state, ("failed".into(), "consent_expired".into()));
-    let withdrawn = withdraw_transfer(&mut tx, &fresh_id, &admin)
+    let withdrawn = withdraw_transfer(&mut tx, &fresh_id, &admin, 1_800_001_001)
         .await
         .expect("actor can withdraw invitation");
     assert_eq!(withdrawn.state, TransferState::Failed);
