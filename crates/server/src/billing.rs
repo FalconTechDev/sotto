@@ -376,6 +376,7 @@ pub struct TransferSubscriptionSchedule {
     pub customer_id: String,
     pub subscription_id: Option<String>,
     pub start_at_epoch: i64,
+    pub expected_period_end_epoch: i64,
     pub status: String,
 }
 
@@ -450,6 +451,18 @@ pub trait SubscriptionProvider: Send + Sync {
         Err(ProviderError::unsupported(
             "personal_transfer_schedule_create",
         ))
+    }
+
+    /// Preview the upcoming sponsored subscription invoice after its schedule has been updated.
+    /// The returned line period is Stripe's billing boundary, including the organisation's
+    /// existing anchor day.
+    async fn preview_transfer_period_end(
+        &self,
+        _subscription_id: &str,
+        _price_id: &str,
+        _period_start: i64,
+    ) -> ProviderResult<i64> {
+        Err(ProviderError::unsupported("transfer_period_preview"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1014,6 +1027,30 @@ impl SubscriptionProvider for StripeBilling {
             price_id,
             allocation_reference,
             start_at_epoch,
+        )
+    }
+
+    async fn preview_transfer_period_end(
+        &self,
+        subscription_id: &str,
+        price_id: &str,
+        period_start: i64,
+    ) -> ProviderResult<i64> {
+        if subscription_id.trim().is_empty() || price_id.trim().is_empty() || period_start <= 0 {
+            return Err(ProviderError::malformed_response());
+        }
+        let invoice = stripe_post_at(
+            &self.api_key,
+            &self.api_origin,
+            "invoices/create_preview",
+            &[("subscription".into(), subscription_id.into())],
+        )
+        .await?;
+        preview_subscription_period_end_from_invoice(
+            &invoice,
+            subscription_id,
+            price_id,
+            period_start,
         )
     }
 
@@ -4197,8 +4234,17 @@ async fn stripe_post(
     path: &str,
     form: &[(String, String)],
 ) -> ProviderResult<serde_json::Value> {
+    stripe_post_at(api_key, "https://api.stripe.com", path, form).await
+}
+
+async fn stripe_post_at(
+    api_key: &str,
+    api_origin: &str,
+    path: &str,
+    form: &[(String, String)],
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
-        .post(format!("https://api.stripe.com/v1/{path}"))
+        .post(format!("{}/v1/{path}", api_origin.trim_end_matches('/')))
         .bearer_auth(api_key)
         .headers(stripe_headers(None)?)
         .form(form)
@@ -4578,6 +4624,12 @@ fn transfer_schedule_from_object(
         customer_id: observed_customer.to_string(),
         subscription_id,
         start_at_epoch,
+        expected_period_end_epoch: FoundingDate::anchored_term_end_epoch(
+            start_at_epoch,
+            FoundingOffer::for_billing_offer_interval(offer),
+            1,
+        )
+        .map_err(|_| ProviderError::malformed_response())?,
         status: status.to_string(),
     })
 }
@@ -8299,6 +8351,40 @@ fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
     object["parent"]["subscription_details"]["subscription"].as_str()
 }
 
+fn preview_subscription_period_end_from_invoice(
+    invoice: &serde_json::Value,
+    subscription_id: &str,
+    price_id: &str,
+    period_start: i64,
+) -> ProviderResult<i64> {
+    if invoice["object"].as_str() != Some("invoice")
+        || invoice_subscription_id(invoice) != Some(subscription_id)
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let matching_ends: Vec<i64> = invoice["lines"]["data"]
+        .as_array()
+        .ok_or_else(ProviderError::malformed_response)?
+        .iter()
+        .filter(|line| {
+            line["parent"]["type"].as_str() == Some("subscription_item_details")
+                && line["parent"]["subscription_item_details"]["proration"].as_bool() != Some(true)
+        })
+        .filter(|line| {
+            line["price"]["id"].as_str() == Some(price_id)
+                || line["pricing"]["price_details"]["price"].as_str() == Some(price_id)
+                || line["parent"]["subscription_item_details"]["price"].as_str() == Some(price_id)
+        })
+        .filter(|line| line["period"]["start"].as_i64() == Some(period_start))
+        .filter_map(|line| line["period"]["end"].as_i64())
+        .filter(|period_end| *period_end > period_start)
+        .collect();
+    let [period_end] = matching_ends.as_slice() else {
+        return Err(ProviderError::malformed_response());
+    };
+    Ok(*period_end)
+}
+
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
@@ -9187,10 +9273,66 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
     use std::collections::HashSet;
     use std::str::FromStr;
     use std::sync::Mutex;
     use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct PreviewHttpState {
+        request: Arc<Mutex<Option<String>>>,
+    }
+
+    async fn preview_http_mock(
+        State(state): State<PreviewHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small Stripe preview request");
+        *state.request.lock().expect("preview request lock") =
+            Some(String::from_utf8(body.to_vec()).expect("form body is UTF-8"));
+        axum::Json(serde_json::json!({
+            "object": "invoice",
+            "parent": {"subscription_details": {"subscription": "sub-preview"}},
+            "lines": {"data": [{
+                "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                    "subscription": "sub-preview", "proration": false
+                }},
+                "pricing": {"price_details": {"price": "price-monthly"}},
+                "period": {"start": 1_802_592_000, "end": 1_805_270_400}
+            }]}
+        }))
+        .into_response()
+    }
+
+    async fn preview_http_server() -> (
+        String,
+        Arc<Mutex<Option<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind preview mock");
+        let address = listener.local_addr().expect("preview mock address");
+        let request = Arc::new(Mutex::new(None));
+        let state = PreviewHttpState {
+            request: request.clone(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/invoices/create_preview",
+                axum::routing::post(preview_http_mock),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve preview mock");
+        });
+        (format!("http://{address}"), request, server)
+    }
 
     #[derive(Clone)]
     struct CancellationHttpState {
@@ -9905,6 +10047,26 @@ mod tests {
         assert!(transition_update
             .2
             .contains("phases%5B0%5D%5Bend_date%5D=1707776000"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sponsored_transfer_reads_the_next_period_from_stripe_preview() {
+        let (origin, request, server) = preview_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            api_origin: origin,
+        };
+        let end = provider
+            .preview_transfer_period_end("sub-preview", "price-monthly", 1_802_592_000)
+            .await
+            .expect("Stripe preview returns the sponsor's anchored renewal period");
+        assert_eq!(end, 1_805_270_400);
+        let request = request.lock().expect("preview request lock");
+        let body = request.as_deref().expect("preview request was sent");
+        assert!(body.contains("subscription=sub-preview"));
+        drop(request);
         server.abort();
     }
 
@@ -11059,6 +11221,11 @@ mod tests {
         .expect("schedule matches its future obligation");
         assert_eq!(schedule.schedule_id, "sub_sched_transfer");
         assert_eq!(schedule.start_at_epoch, 1_900_000_000);
+        assert_eq!(
+            schedule.expected_period_end_epoch,
+            FoundingDate::anchored_term_end_epoch(1_900_000_000, FoundingOffer::Monthly, 1)
+                .unwrap()
+        );
         assert_eq!(schedule.subscription_id, None);
 
         let mut changed_boundary = response.clone();
@@ -11149,6 +11316,83 @@ mod tests {
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
         assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
+    }
+
+    #[test]
+    fn sponsored_transfer_period_preview_uses_stripe_line_boundaries() {
+        let at = |year, month, day, hour| {
+            FoundingDate::new(year, month, day)
+                .unwrap()
+                .to_unix_seconds()
+                + i64::from(hour) * 60 * 60
+        };
+        let monthly_start = at(2027, 4, 30, 8);
+        let monthly_end = at(2027, 5, 31, 8);
+        let annual_start = at(2027, 2, 28, 9);
+        let annual_end = at(2028, 2, 29, 9);
+        let invoice = serde_json::json!({
+            "object": "invoice",
+            "parent": {"subscription_details": {"subscription": "sub-sponsor"}},
+            "lines": {"data": [
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": false
+                    }},
+                    "pricing": {"price_details": {"price": "price-monthly"}},
+                    "period": {"start": monthly_start - 31 * 86_400, "end": monthly_start}
+                },
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": false
+                    }},
+                    "pricing": {"price_details": {"price": "price-monthly"}},
+                    "period": {"start": monthly_start, "end": monthly_end}
+                },
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": true
+                    }},
+                    "pricing": {"price_details": {"price": "price-monthly"}},
+                    "period": {"start": monthly_start, "end": monthly_start + 100}
+                },
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": false
+                    }},
+                    "pricing": {"price_details": {"price": "price-annual"}},
+                    "period": {"start": annual_start, "end": annual_end}
+                }
+            ]}
+        });
+        assert_eq!(
+            preview_subscription_period_end_from_invoice(
+                &invoice,
+                "sub-sponsor",
+                "price-monthly",
+                monthly_start,
+            )
+            .unwrap(),
+            monthly_end,
+            "a subscription anchored on the 31st renews on 31 May after 30 April"
+        );
+        assert_eq!(
+            preview_subscription_period_end_from_invoice(
+                &invoice,
+                "sub-sponsor",
+                "price-annual",
+                annual_start,
+            )
+            .unwrap(),
+            annual_end,
+            "an annual 29 February anchor returns to 29 February in the leap year"
+        );
+        assert!(preview_subscription_period_end_from_invoice(
+            &invoice,
+            "another-subscription",
+            "price-monthly",
+            monthly_start,
+        )
+        .is_err());
     }
 
     #[test]

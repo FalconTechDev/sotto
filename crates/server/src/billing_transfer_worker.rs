@@ -267,6 +267,7 @@ async fn prepare_personal_destination(
         &schedule.schedule_id,
         schedule.subscription_id.as_deref(),
         Some(setup_intent_id),
+        schedule.expected_period_end_epoch,
     )
     .await
     .map_err(|_| ExecutionError::Local("destination_schedule_record_failed"))?;
@@ -323,6 +324,16 @@ async fn prepare_sponsored_destination(
             .as_deref()
             .ok_or(ExecutionError::Local("destination_subscription_missing"))?,
     )?;
+    let expected_period_end = provider
+        .preview_transfer_period_end(
+            &updated.subscription_id,
+            catalogue.id_for(transfer.offer),
+            transfer.effective_from,
+        )
+        .await?;
+    if expected_period_end <= transfer.effective_from {
+        return Err(ExecutionError::Local("destination_period_preview_invalid"));
+    }
     let schedule_id = updated
         .schedule_id
         .as_deref()
@@ -342,6 +353,7 @@ async fn prepare_sponsored_destination(
         schedule_id,
         Some(&updated.subscription_id),
         None,
+        expected_period_end,
     )
     .await
     .map_err(|_| ExecutionError::Local("destination_schedule_record_failed"))?;
@@ -1905,6 +1917,7 @@ mod tests {
             source_provider_subscription_id: Some("sub_source".into()),
             destination_payment_reference: None,
             destination_period_end: None,
+            destination_expected_period_end: None,
             source_adjustment_reference: None,
             source_restoration_reference: None,
             source_restoration_operation_id: None,
@@ -1914,6 +1927,7 @@ mod tests {
             execution_lease_token: Some("lease".into()),
             execution_lease_until_epoch: Some(900),
             execution_attempt_count: 1,
+            execution_manual_review_required: false,
             destination_customer_id: None,
             destination_schedule_id: None,
             source_schedule_id: None,

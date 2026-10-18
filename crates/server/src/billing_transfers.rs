@@ -245,6 +245,7 @@ pub struct TransferIntent {
     pub source_provider_subscription_id: Option<String>,
     pub destination_payment_reference: Option<String>,
     pub destination_period_end: Option<i64>,
+    pub destination_expected_period_end: Option<i64>,
     pub source_adjustment_reference: Option<String>,
     pub source_restoration_reference: Option<String>,
     pub source_restoration_operation_id: Option<String>,
@@ -256,6 +257,7 @@ pub struct TransferIntent {
     /// Consecutive failed execution attempts; claims and invoice waits do not increment it, and
     /// successful progress resets it.
     pub execution_attempt_count: i32,
+    pub execution_manual_review_required: bool,
     pub destination_customer_id: Option<String>,
     pub destination_schedule_id: Option<String>,
     pub source_schedule_id: Option<String>,
@@ -1168,6 +1170,7 @@ pub async fn record_destination_setup_completion(
 /// Persist a provider-read-back schedule before preparing the source side. Personal schedules
 /// require the beneficiary's verified SetupIntent; sponsored schedules must bind an existing
 /// subscription and do not accept personal setup evidence.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_destination_schedule(
     tx: &mut Transaction<'_, Postgres>,
     transfer_id: &str,
@@ -1176,16 +1179,21 @@ pub async fn record_destination_schedule(
     schedule_id: &str,
     subscription_id: Option<&str>,
     setup_intent_id: Option<&str>,
+    expected_period_end: i64,
 ) -> Result<TransferIntent, TransferError> {
     if [operation_id, customer_id, schedule_id]
         .iter()
         .any(|value| value.trim().is_empty())
         || subscription_id.is_some_and(|value| value.trim().is_empty())
         || setup_intent_id.is_some_and(|value| value.trim().is_empty())
+        || expected_period_end <= 0
     {
         return Err(TransferError::InvalidField("destination schedule evidence"));
     }
     let current = load_transfer(tx, transfer_id).await?;
+    if expected_period_end <= current.effective_from {
+        return Err(TransferError::DestinationTermChanged);
+    }
     match current.destination_kind {
         TransferPayer::Personal
             if current.destination_customer_id.as_deref() != Some(customer_id)
@@ -1204,6 +1212,7 @@ pub async fn record_destination_schedule(
             || current.destination_operation_id.as_deref() != Some(operation_id)
             || current.destination_customer_id.as_deref() != Some(customer_id)
             || current.destination_provider_subscription_id.as_deref() != subscription_id
+            || current.destination_expected_period_end != Some(expected_period_end)
         {
             return Err(TransferError::ResultConflict);
         }
@@ -1219,6 +1228,7 @@ pub async fn record_destination_schedule(
         "UPDATE billing_transfer_intents SET state = 'destination_prepared', \
              destination_operation_id = $2, destination_customer_id = $3, \
              destination_schedule_id = $4, destination_provider_subscription_id = $5, \
+             destination_expected_period_end = $6, \
              updated_at = now() \
          WHERE transfer_id = $1 AND state IN ('pending','unknown') \
            AND (destination_customer_id IS NULL OR destination_customer_id = $3) \
@@ -1230,6 +1240,7 @@ pub async fn record_destination_schedule(
     .bind(customer_id)
     .bind(schedule_id)
     .bind(subscription_id)
+    .bind(expected_period_end)
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_none() {
@@ -1238,6 +1249,7 @@ pub async fn record_destination_schedule(
             || current.destination_operation_id.as_deref() != Some(operation_id)
             || current.destination_customer_id.as_deref() != Some(customer_id)
             || current.destination_provider_subscription_id.as_deref() != subscription_id
+            || current.destination_expected_period_end != Some(expected_period_end)
         {
             return Err(TransferError::ResultConflict);
         }
@@ -1342,19 +1354,54 @@ pub async fn record_destination_paid(
     }
     founding_allocator::lock_capacity(tx).await?;
     let current = load_transfer(tx, transfer_id).await?;
-    if current.effective_from != invoice_period_start {
-        return Err(TransferError::DestinationTermChanged);
-    }
-    let expected_period_end = expected_transfer_period_end(current.offer, current.effective_from)
-        .ok_or(TransferError::DestinationTermChanged)?;
-    if invoice_period_end != expected_period_end {
-        return Err(TransferError::DestinationTermChanged);
-    }
     if current
         .destination_period_end
         .is_some_and(|recorded_end| recorded_end != invoice_period_end)
     {
         return Err(TransferError::ResultConflict);
+    }
+    let expected_period_end = current.destination_expected_period_end.or_else(|| {
+        (current.destination_kind == TransferPayer::Personal)
+            .then(|| expected_transfer_period_end(current.offer, current.effective_from))
+            .flatten()
+    });
+    let period_mismatch_code = if current.effective_from != invoice_period_start {
+        Some("destination_period_start_mismatch")
+    } else if expected_period_end != Some(invoice_period_end) {
+        Some("destination_period_end_mismatch")
+    } else {
+        None
+    };
+    if let Some(period_mismatch_code) = period_mismatch_code {
+        let recorded_period_end =
+            (invoice_period_end > current.effective_from).then_some(invoice_period_end);
+        let updated = sqlx::query(
+            "UPDATE billing_transfer_intents SET \
+             destination_payment_reference = $2, destination_period_end = $3, \
+             execution_manual_review_required = TRUE, \
+             last_execution_error_code = $4, \
+             execution_next_attempt_at = 'infinity'::timestamptz, updated_at = now() \
+             WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending') \
+               AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
+               AND (destination_period_end IS NULL OR destination_period_end = $3) \
+             RETURNING transfer_id",
+        )
+        .bind(transfer_id)
+        .bind(payment_reference)
+        .bind(recorded_period_end)
+        .bind(period_mismatch_code)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if updated.is_none() {
+            let current = load_transfer(tx, transfer_id).await?;
+            if current.destination_payment_reference.as_deref() != Some(payment_reference)
+                || current.destination_period_end != recorded_period_end
+                || current.last_execution_error_code.as_deref() != Some(period_mismatch_code)
+            {
+                return Err(TransferError::ResultConflict);
+            }
+        }
+        return load_transfer(tx, transfer_id).await;
     }
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET \
@@ -1846,6 +1893,7 @@ async fn claim_due_matching(
                     OR transfer.destination_setup_intent_id IS NOT NULL) \
                AND (transfer.execution_next_attempt_at <= now() \
                     OR ($4 AND transfer.execution_manual_review_required)) \
+               AND (NOT transfer.execution_manual_review_required OR $4) \
                AND (transfer.execution_lease_until IS NULL OR transfer.execution_lease_until <= now()) \
                AND ($3::TEXT IS NULL OR transfer.transfer_id = $3) \
              ORDER BY transfer.execution_next_attempt_at, transfer.created_at, transfer.transfer_id \
@@ -1890,27 +1938,36 @@ pub async fn release_execution_lease(
         return Err(TransferError::InvalidField("execution lease"));
     }
     let mut tx = pool.begin().await?;
-    let attempts = sqlx::query_scalar::<_, i32>(
-        "SELECT execution_attempt_count FROM billing_transfer_intents \
+    let prior = sqlx::query_as::<_, (i32, bool, Option<String>, Option<String>)>(
+        "SELECT execution_attempt_count, execution_manual_review_required, \
+                last_execution_error_code, result_code FROM billing_transfer_intents \
          WHERE transfer_id = $1 AND execution_lease_token = $2 FOR UPDATE",
     )
     .bind(transfer_id)
     .bind(lease_token)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(previous_failures) = attempts else {
+    let Some((previous_failures, already_requires_review, previous_error, previous_result)) = prior
+    else {
         tx.rollback().await?;
         return Ok(false);
     };
     let failure_count = previous_failures.saturating_add(1);
-    let manual_review_required = failure.requires_manual_review(failure_count);
+    let manual_review_required =
+        already_requires_review || failure.requires_manual_review(failure_count);
     let unknown_state_required = failure.needs_unknown_state() || manual_review_required;
-    let result_code =
-        if manual_review_required && failure != TransferExecutionFailure::ProviderRejected {
-            "automatic_retry_limit_reached"
-        } else {
-            failure.as_str()
-        };
+    let error_code = if already_requires_review {
+        previous_error.unwrap_or_else(|| failure.as_str().to_owned())
+    } else {
+        failure.as_str().to_owned()
+    };
+    let result_code: String = if already_requires_review {
+        previous_result.unwrap_or_else(|| "manual_review_required".to_owned())
+    } else if manual_review_required && failure != TransferExecutionFailure::ProviderRejected {
+        "automatic_retry_limit_reached".to_owned()
+    } else {
+        failure.as_str().to_owned()
+    };
     let row = sqlx::query(
         "UPDATE billing_transfer_intents SET \
              state = CASE WHEN $3 THEN 'unknown' ELSE state END, \
@@ -1927,7 +1984,7 @@ pub async fn release_execution_lease(
     .bind(transfer_id)
     .bind(lease_token)
     .bind(unknown_state_required)
-    .bind(failure.as_str())
+    .bind(error_code)
     .bind(result_code)
     .bind(manual_review_required)
     .bind(transfer_retry_delay_seconds(failure, failure_count))
@@ -1957,10 +2014,15 @@ pub async fn finish_execution_lease(
 ) -> Result<bool, TransferError> {
     let rows = sqlx::query(
         "UPDATE billing_transfer_intents SET execution_lease_token = NULL, \
-             execution_lease_until = NULL, execution_next_attempt_at = now(), \
-             execution_attempt_count = 0, \
-             execution_manual_review_required = FALSE, result_code = NULL, \
-             last_execution_error_code = NULL, updated_at = now() \
+             execution_lease_until = NULL, \
+             execution_next_attempt_at = CASE WHEN execution_manual_review_required \
+                 THEN 'infinity'::timestamptz ELSE now() END, \
+             execution_attempt_count = CASE WHEN execution_manual_review_required \
+                 THEN execution_attempt_count ELSE 0 END, \
+             result_code = CASE WHEN execution_manual_review_required \
+                 THEN COALESCE(result_code, 'manual_review_required') ELSE NULL END, \
+             last_execution_error_code = CASE WHEN execution_manual_review_required \
+                 THEN last_execution_error_code ELSE NULL END, updated_at = now() \
          WHERE transfer_id = $1 AND execution_lease_token = $2",
     )
     .bind(transfer_id)
@@ -1985,8 +2047,11 @@ pub async fn defer_execution_lease(
     let rows = sqlx::query(
         "UPDATE billing_transfer_intents SET execution_lease_token = NULL, \
              execution_lease_until = NULL, \
-             execution_attempt_count = 0, \
-             execution_next_attempt_at = now() + ($3 * interval '1 second'), updated_at = now() \
+             execution_attempt_count = CASE WHEN execution_manual_review_required \
+                 THEN execution_attempt_count ELSE 0 END, \
+             execution_next_attempt_at = CASE WHEN execution_manual_review_required \
+                 THEN 'infinity'::timestamptz \
+                 ELSE now() + ($3 * interval '1 second') END, updated_at = now() \
          WHERE transfer_id = $1 AND execution_lease_token = $2",
     )
     .bind(transfer_id)
@@ -2289,6 +2354,7 @@ pub(crate) fn transfer_from_row(
         source_provider_subscription_id: row.try_get("source_provider_subscription_id")?,
         destination_payment_reference: row.try_get("destination_payment_reference")?,
         destination_period_end: row.try_get("destination_period_end")?,
+        destination_expected_period_end: row.try_get("destination_expected_period_end")?,
         source_adjustment_reference: row.try_get("source_adjustment_reference")?,
         source_restoration_reference: row.try_get("source_restoration_reference")?,
         source_restoration_operation_id: row.try_get("source_restoration_operation_id")?,
@@ -2301,6 +2367,7 @@ pub(crate) fn transfer_from_row(
         execution_lease_until_epoch: row
             .try_get::<Option<i64>, _>("execution_lease_until_epoch")?,
         execution_attempt_count: row.try_get("execution_attempt_count")?,
+        execution_manual_review_required: row.try_get("execution_manual_review_required")?,
         destination_customer_id: row.try_get("destination_customer_id")?,
         destination_schedule_id: row.try_get("destination_schedule_id")?,
         source_schedule_id: row.try_get("source_schedule_id")?,
