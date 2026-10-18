@@ -258,6 +258,9 @@ pub struct TransferIntent {
     /// successful progress resets it.
     pub execution_attempt_count: i32,
     pub execution_manual_review_required: bool,
+    /// Changes whenever new evidence parks this intent for operator review. Decisions are bound
+    /// to this value so an old approval cannot release a later review.
+    pub execution_review_generation: i64,
     pub destination_customer_id: Option<String>,
     pub destination_schedule_id: Option<String>,
     pub source_schedule_id: Option<String>,
@@ -278,6 +281,40 @@ pub struct TransferLease {
 }
 
 pub const TRANSFER_EXECUTION_LEASE_SECONDS: i64 = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferReviewAction {
+    Hold,
+    Resume,
+}
+
+impl TransferReviewAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Resume => "resume",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, TransferError> {
+        match value {
+            "hold" => Ok(Self::Hold),
+            "resume" => Ok(Self::Resume),
+            _ => Err(TransferError::InvalidField("review action")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferReviewDecision {
+    pub decision_id: i64,
+    pub operator_label: String,
+    pub action: TransferReviewAction,
+    pub reason_code: String,
+    pub review_generation: i64,
+    pub idempotency_key: String,
+    pub created_at_epoch: i64,
+}
 const MAX_TRANSFER_RETRY_DELAY_SECONDS: i64 = 60 * 60;
 const MAX_AUTOMATIC_TRANSFER_ATTEMPTS: i32 = 20;
 
@@ -1379,6 +1416,10 @@ pub async fn record_destination_paid(
             "UPDATE billing_transfer_intents SET \
              destination_payment_reference = $2, destination_period_end = $3, \
              execution_manual_review_required = TRUE, \
+             execution_review_generation = execution_review_generation + CASE \
+                 WHEN execution_manual_review_required AND last_execution_error_code = $4 \
+                   AND destination_payment_reference = $2 \
+                   AND destination_period_end IS NOT DISTINCT FROM $3 THEN 0 ELSE 1 END, \
              last_execution_error_code = $4, \
              execution_next_attempt_at = 'infinity'::timestamptz, updated_at = now() \
              WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
@@ -1409,6 +1450,11 @@ pub async fn record_destination_paid(
          destination_payment_reference = $2, destination_period_end = $3, \
          execution_manual_review_required = CASE WHEN state = 'unknown' THEN TRUE \
              ELSE execution_manual_review_required END, \
+         execution_review_generation = execution_review_generation + CASE \
+             WHEN state = 'unknown' AND (NOT execution_manual_review_required \
+               OR last_execution_error_code IS DISTINCT FROM 'destination_invoice_received_while_unknown' \
+               OR destination_payment_reference IS DISTINCT FROM $2 \
+               OR destination_period_end IS DISTINCT FROM $3) THEN 1 ELSE 0 END, \
          last_execution_error_code = CASE WHEN state = 'unknown' \
              THEN 'destination_invoice_received_while_unknown' \
              ELSE last_execution_error_code END, \
@@ -1858,7 +1904,7 @@ pub async fn mark_failed(
 /// of rows (one here), skips work owned by another live lease, and returns expired leases to
 /// the same stable provider operation keys after a process restart.
 pub async fn claim_due(pool: &PgPool) -> Result<Option<TransferLease>, TransferError> {
-    claim_due_matching(pool, None, false).await
+    claim_due_matching(pool, None).await
 }
 
 /// Claim a known transfer after an operator or callback has requested immediate reconciliation.
@@ -1870,25 +1916,12 @@ pub async fn claim_transfer_for_execution(
     if transfer_id.trim().is_empty() {
         return Err(TransferError::InvalidField("transfer_id"));
     }
-    claim_due_matching(pool, Some(transfer_id), false).await
-}
-
-/// Claim an item parked for operator reconciliation. Callers must establish operator authority
-/// before invoking this path; it deliberately bypasses the due time only for a manual-review row.
-pub async fn claim_transfer_for_manual_recovery(
-    pool: &PgPool,
-    transfer_id: &str,
-) -> Result<Option<TransferLease>, TransferError> {
-    if transfer_id.trim().is_empty() {
-        return Err(TransferError::InvalidField("transfer_id"));
-    }
-    claim_due_matching(pool, Some(transfer_id), true).await
+    claim_due_matching(pool, Some(transfer_id)).await
 }
 
 async fn claim_due_matching(
     pool: &PgPool,
     only_transfer_id: Option<&str>,
-    manual_recovery: bool,
 ) -> Result<Option<TransferLease>, TransferError> {
     let lease_token = Uuid::new_v4().to_string();
     let mut tx = pool.begin().await?;
@@ -1897,11 +1930,10 @@ async fn claim_due_matching(
              SELECT transfer.transfer_id FROM billing_transfer_intents AS transfer \
              WHERE transfer.state IN ('pending','destination_prepared','destination_paid', \
                              'source_adjustment_pending','source_restoration_pending','unknown') \
-               AND ($4 OR transfer.destination_kind <> 'personal' \
+               AND (transfer.destination_kind <> 'personal' \
                     OR transfer.destination_setup_intent_id IS NOT NULL) \
-               AND (transfer.execution_next_attempt_at <= now() \
-                    OR ($4 AND transfer.execution_manual_review_required)) \
-               AND (NOT transfer.execution_manual_review_required OR $4) \
+               AND transfer.execution_next_attempt_at <= now() \
+               AND NOT transfer.execution_manual_review_required \
                AND (transfer.execution_lease_until IS NULL OR transfer.execution_lease_until <= now()) \
                AND ($3::TEXT IS NULL OR transfer.transfer_id = $3) \
              ORDER BY transfer.execution_next_attempt_at, transfer.created_at, transfer.transfer_id \
@@ -1918,7 +1950,6 @@ async fn claim_due_matching(
     .bind(TRANSFER_EXECUTION_LEASE_SECONDS)
     .bind(&lease_token)
     .bind(only_transfer_id)
-    .bind(manual_recovery)
     .fetch_optional(&mut *tx)
     .await?;
     let lease = row
@@ -1932,6 +1963,209 @@ async fn claim_due_matching(
         .transpose()?;
     tx.commit().await?;
     Ok(lease)
+}
+
+/// Return a bounded, stable page of transfers awaiting an operator decision. The cursor is the
+/// last transfer id, not a client-selected sort expression.
+pub async fn list_manual_review_transfers(
+    pool: &PgPool,
+    after_transfer_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<TransferIntent>, TransferError> {
+    if !(1..=51).contains(&limit)
+        || after_transfer_id.is_some_and(|cursor| cursor.trim().is_empty() || cursor.len() > 256)
+    {
+        return Err(TransferError::InvalidField("manual review page"));
+    }
+    let rows = sqlx::query(
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents \
+         WHERE execution_manual_review_required \
+           AND ($1::TEXT IS NULL OR transfer_id > $1) \
+         ORDER BY transfer_id ASC LIMIT $2",
+    )
+    .bind(after_transfer_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(transfer_from_row).collect()
+}
+
+/// Load one parked transfer and its bounded audit history for a protected operator view.
+pub async fn load_manual_review_transfer(
+    pool: &PgPool,
+    transfer_id: &str,
+) -> Result<Option<(TransferIntent, Vec<TransferReviewDecision>)>, TransferError> {
+    let row = sqlx::query(
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(transfer_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let transfer = transfer_from_row(&row)?;
+    if !transfer.execution_manual_review_required {
+        return Ok(None);
+    }
+    let rows = sqlx::query(
+        "SELECT decision_id, operator_label, action, reason_code, review_generation, \
+                idempotency_key, EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_epoch \
+         FROM billing_transfer_review_decisions WHERE transfer_id = $1 \
+         ORDER BY decision_id DESC LIMIT 50",
+    )
+    .bind(transfer_id)
+    .fetch_all(pool)
+    .await?;
+    let decisions = rows
+        .iter()
+        .map(transfer_review_decision_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some((transfer, decisions)))
+}
+
+/// Persist a protected operator hold or resume decision. Resume only makes the intent eligible for
+/// the ordinary worker; it does not record provider success or perform a provider operation.
+pub async fn record_operator_review_decision(
+    pool: &PgPool,
+    transfer_id: &str,
+    operator_label: &str,
+    action: TransferReviewAction,
+    reason_code: &str,
+    review_generation: i64,
+    idempotency_key: &str,
+) -> Result<(TransferIntent, TransferReviewDecision), TransferError> {
+    if transfer_id.trim().is_empty() || transfer_id.len() > 256 {
+        return Err(TransferError::InvalidField("transfer_id"));
+    }
+    if !valid_operator_label(operator_label) {
+        return Err(TransferError::InvalidField("operator"));
+    }
+    if !valid_review_reason(reason_code) {
+        return Err(TransferError::InvalidField("review reason"));
+    }
+    if review_generation < 0 {
+        return Err(TransferError::InvalidField("review generation"));
+    }
+    if idempotency_key.trim().is_empty()
+        || idempotency_key.len() > 128
+        || idempotency_key.chars().any(char::is_control)
+    {
+        return Err(TransferError::InvalidField("review idempotency key"));
+    }
+
+    let mut tx = pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx).await?;
+    let row = sqlx::query(
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch, \
+                (execution_lease_until IS NOT NULL AND execution_lease_until > now()) AS active_lease \
+         FROM billing_transfer_intents WHERE transfer_id = $1 FOR UPDATE",
+    )
+    .bind(transfer_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(TransferError::MissingTransfer)?;
+    let current = transfer_from_row(&row)?;
+
+    if let Some(existing) = sqlx::query(
+        "SELECT decision_id, operator_label, action, reason_code, review_generation, \
+                idempotency_key, EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_epoch \
+         FROM billing_transfer_review_decisions \
+         WHERE transfer_id = $1 AND idempotency_key = $2",
+    )
+    .bind(transfer_id)
+    .bind(idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let decision = transfer_review_decision_from_row(&existing)?;
+        if decision.operator_label != operator_label.trim()
+            || decision.action != action
+            || decision.reason_code != reason_code
+            || decision.review_generation != review_generation
+        {
+            return Err(TransferError::ResultConflict);
+        }
+        tx.commit().await?;
+        return Ok((current, decision));
+    }
+
+    let active_lease: bool = row.try_get("active_lease")?;
+    if !current.execution_manual_review_required
+        || current.execution_review_generation != review_generation
+        || active_lease
+    {
+        return Err(TransferError::InvalidTransition);
+    }
+
+    let decision_row = sqlx::query(
+        "INSERT INTO billing_transfer_review_decisions \
+         (transfer_id, operator_label, action, reason_code, review_generation, idempotency_key) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING decision_id, operator_label, action, reason_code, review_generation, \
+                   idempotency_key, EXTRACT(EPOCH FROM created_at)::BIGINT AS created_at_epoch",
+    )
+    .bind(transfer_id)
+    .bind(operator_label.trim())
+    .bind(action.as_str())
+    .bind(reason_code)
+    .bind(review_generation)
+    .bind(idempotency_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    let decision = transfer_review_decision_from_row(&decision_row)?;
+
+    if action == TransferReviewAction::Resume {
+        let updated = sqlx::query(
+            "UPDATE billing_transfer_intents SET \
+                 execution_manual_review_required = FALSE, execution_next_attempt_at = now(), \
+                 execution_attempt_count = 0, result_code = NULL, updated_at = now() \
+             WHERE transfer_id = $1 AND execution_manual_review_required \
+               AND execution_review_generation = $2 \
+               AND (execution_lease_until IS NULL OR execution_lease_until <= now()) \
+             RETURNING transfer_id",
+        )
+        .bind(transfer_id)
+        .bind(review_generation)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if updated.is_none() {
+            return Err(TransferError::InvalidTransition);
+        }
+    }
+
+    let transfer = load_transfer(&mut tx, transfer_id).await?;
+    tx.commit().await?;
+    Ok((transfer, decision))
+}
+
+fn valid_review_reason(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_operator_label(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn transfer_review_decision_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<TransferReviewDecision, TransferError> {
+    Ok(TransferReviewDecision {
+        decision_id: row.try_get("decision_id")?,
+        operator_label: row.try_get("operator_label")?,
+        action: TransferReviewAction::parse(&row.try_get::<String, _>("action")?)?,
+        reason_code: row.try_get("reason_code")?,
+        review_generation: row.try_get("review_generation")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        created_at_epoch: row.try_get("created_at_epoch")?,
+    })
 }
 
 /// Release a worker lease after a retryable or ambiguous result. A provider timeout is recorded
@@ -1983,6 +2217,8 @@ pub async fn release_execution_lease(
              result_code = CASE WHEN $3 THEN $5 ELSE result_code END, \
              execution_attempt_count = $8, \
              execution_manual_review_required = $6, \
+             execution_review_generation = execution_review_generation + \
+                 CASE WHEN $6 AND NOT execution_manual_review_required THEN 1 ELSE 0 END, \
              execution_lease_token = NULL, execution_lease_until = NULL, \
              execution_next_attempt_at = CASE WHEN $6 THEN 'infinity'::timestamptz \
                  ELSE now() + ($7 * interval '1 second') END, updated_at = now() \
@@ -2376,6 +2612,7 @@ pub(crate) fn transfer_from_row(
             .try_get::<Option<i64>, _>("execution_lease_until_epoch")?,
         execution_attempt_count: row.try_get("execution_attempt_count")?,
         execution_manual_review_required: row.try_get("execution_manual_review_required")?,
+        execution_review_generation: row.try_get("execution_review_generation")?,
         destination_customer_id: row.try_get("destination_customer_id")?,
         destination_schedule_id: row.try_get("destination_schedule_id")?,
         source_schedule_id: row.try_get("source_schedule_id")?,

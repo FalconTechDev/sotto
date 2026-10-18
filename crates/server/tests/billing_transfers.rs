@@ -2,19 +2,21 @@
 
 use std::str::FromStr;
 
-use sqlx::{postgres::PgConnectOptions, PgPool};
+use sqlx::{postgres::PgConnectOptions, PgPool, Row};
 use uuid::Uuid;
 
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_source_restoration_payment, begin_transfer,
-    claim_transfer_for_execution, claim_transfer_for_manual_recovery, complete_source_adjustment,
-    complete_source_restoration, defer_execution_lease, finish_execution_lease,
-    lock_and_check_no_live_transfer, mark_failed, record_destination_paid,
-    record_destination_prepared, record_destination_schedule, record_destination_setup_completion,
+    claim_transfer_for_execution, complete_source_adjustment, complete_source_restoration,
+    defer_execution_lease, finish_execution_lease, list_manual_review_transfers,
+    load_manual_review_transfer, lock_and_check_no_live_transfer, mark_failed,
+    record_destination_paid, record_destination_prepared, record_destination_schedule,
+    record_destination_setup_completion, record_operator_review_decision,
     record_source_restoration_payment, record_source_restoration_subscription,
     release_execution_lease, request_source_restoration, withdraw_transfer, BeginTransfer,
-    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferState,
+    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferReviewAction,
+    TransferState,
 };
 use sotto_server::db;
 use sotto_server::founding_allocator::{FoundingDate, FoundingOffer};
@@ -42,6 +44,16 @@ async fn pool_or_skip() -> Option<PgPool> {
 
 async fn cleanup(pool: &PgPool, fixture: &str) {
     let pattern = format!("transfer-test-{fixture}-%");
+    sqlx::query(
+        "DELETE FROM billing_transfer_review_decisions \
+         WHERE transfer_id IN (SELECT transfer_id FROM billing_transfer_intents \
+           WHERE actor_user_id LIKE $1 OR beneficiary_id LIKE $1 \
+              OR source_organization_id LIKE $1 OR destination_organization_id LIKE $1)",
+    )
+    .bind(&pattern)
+    .execute(pool)
+    .await
+    .expect("clean transfer review decisions");
     sqlx::query(
         "DELETE FROM billing_transfer_intents
          WHERE actor_user_id LIKE $1 OR beneficiary_id LIKE $1
@@ -432,19 +444,188 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     )
     .await
     .expect("park a definitively rejected provider step for review");
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET execution_next_attempt_at = now() WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .execute(&pool)
+    .await
+    .expect("make the parked transfer otherwise due");
     assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
         .await
         .expect("manual review blocks automatic polling")
         .is_none());
-    let manual_retry = claim_transfer_for_manual_recovery(&pool, &transfer.transfer_id)
+    let parked = sqlx::query(
+        "SELECT execution_review_generation FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(&transfer.transfer_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read review generation");
+    let review_generation: i64 = parked
+        .try_get("execution_review_generation")
+        .expect("generation is present");
+    let queue = list_manual_review_transfers(&pool, None, 50)
         .await
-        .expect("explicit reconciliation can claim manual review")
-        .expect("manual recovery is due on demand");
+        .expect("read bounded review queue");
+    assert!(queue
+        .iter()
+        .any(|item| item.transfer_id == transfer.transfer_id));
+    let details = load_manual_review_transfer(&pool, &transfer.transfer_id)
+        .await
+        .expect("load manual review details")
+        .expect("manual review is visible to the protected store API");
+    assert_eq!(details.0.execution_review_generation, review_generation);
+    assert!(details.1.is_empty());
+    let (held, hold_decision) = record_operator_review_decision(
+        &pool,
+        &transfer.transfer_id,
+        "billing-operator-test",
+        TransferReviewAction::Hold,
+        "awaiting_provider_check",
+        review_generation,
+        "review-hold-test-key",
+    )
+    .await
+    .expect("operator can durably keep the transfer on hold");
+    assert!(held.execution_manual_review_required);
+    let (_, repeated_hold) = record_operator_review_decision(
+        &pool,
+        &transfer.transfer_id,
+        "billing-operator-test",
+        TransferReviewAction::Hold,
+        "awaiting_provider_check",
+        review_generation,
+        "review-hold-test-key",
+    )
+    .await
+    .expect("same hold replays idempotently");
+    assert_eq!(hold_decision.decision_id, repeated_hold.decision_id);
+    assert!(matches!(
+        record_operator_review_decision(
+            &pool,
+            &transfer.transfer_id,
+            "billing-operator-test",
+            TransferReviewAction::Resume,
+            "provider_checked",
+            review_generation + 1,
+            "stale-review-key",
+        )
+        .await,
+        Err(TransferError::InvalidTransition)
+    ));
+    let (resumed, decision) = record_operator_review_decision(
+        &pool,
+        &transfer.transfer_id,
+        "billing-operator-test",
+        TransferReviewAction::Resume,
+        "provider_checked",
+        review_generation,
+        "review-resume-test-key",
+    )
+    .await
+    .expect("operator explicitly resumes the parked transfer");
+    assert!(!resumed.execution_manual_review_required);
+    assert_eq!(decision.review_generation, review_generation);
+    let manual_retry = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("approved transfer is due for ordinary worker polling")
+        .expect("manual review is released only after explicit approval");
+    release_execution_lease(
+        &pool,
+        &transfer.transfer_id,
+        &manual_retry.lease_token,
+        TransferExecutionFailure::ProviderRejected,
+    )
+    .await
+    .expect("a new definitive failure returns the transfer to review");
+    let parked_again = load_manual_review_transfer(&pool, &transfer.transfer_id)
+        .await
+        .expect("read renewed manual review")
+        .expect("new failure is parked");
+    assert_eq!(
+        parked_again.0.execution_review_generation,
+        review_generation + 1
+    );
+    let (old_resume_replay, old_resume) = record_operator_review_decision(
+        &pool,
+        &transfer.transfer_id,
+        "billing-operator-test",
+        TransferReviewAction::Resume,
+        "provider_checked",
+        review_generation,
+        "review-resume-test-key",
+    )
+    .await
+    .expect("an idempotent replay returns the original decision");
+    assert!(old_resume_replay.execution_manual_review_required);
+    assert_eq!(decision.decision_id, old_resume.decision_id);
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin invoice evidence transaction");
+    record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_manual_review_test",
+        transfer.effective_from,
+        transfer.effective_from + 30 * 24 * 60 * 60,
+    )
+    .await
+    .expect("mismatched paid-period evidence parks without aborting the transaction");
+    record_destination_paid(
+        &mut tx,
+        &transfer.transfer_id,
+        "pi_manual_review_test",
+        transfer.effective_from,
+        transfer.effective_from + 30 * 24 * 60 * 60,
+    )
+    .await
+    .expect("replaying the same invoice does not create another review generation");
+    tx.commit().await.expect("commit invoice evidence");
+    let evidence_changed = load_manual_review_transfer(&pool, &transfer.transfer_id)
+        .await
+        .expect("read changed evidence")
+        .expect("mismatched evidence remains parked");
+    let current_review_generation = evidence_changed.0.execution_review_generation;
+    assert_eq!(current_review_generation, review_generation + 2);
+    assert!(matches!(
+        record_operator_review_decision(
+            &pool,
+            &transfer.transfer_id,
+            "billing-operator-test",
+            TransferReviewAction::Resume,
+            "provider_checked",
+            review_generation + 1,
+            "stale-after-invoice-key",
+        )
+        .await,
+        Err(TransferError::InvalidTransition)
+    ));
+    let (resumed_again, _) = record_operator_review_decision(
+        &pool,
+        &transfer.transfer_id,
+        "billing-operator-test",
+        TransferReviewAction::Resume,
+        "retry_verified",
+        current_review_generation,
+        "review-resume-second-key",
+    )
+    .await
+    .expect("new evidence needs a new decision");
+    assert!(!resumed_again.execution_manual_review_required);
+    let manual_retry = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("claim the newly approved attempt")
+        .expect("a current decision reopens the normal worker path");
     finish_execution_lease(&pool, &transfer.transfer_id, &manual_retry.lease_token)
         .await
-        .expect("manual recovery clears the review marker after success");
+        .expect("successful progress clears its lease");
     sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'pending', result_code = NULL, \
+         destination_payment_reference = NULL, destination_period_end = NULL, \
+         execution_manual_review_required = FALSE, execution_review_generation = 0, \
+         execution_attempt_count = 0, last_execution_error_code = NULL, \
          execution_next_attempt_at = now() WHERE transfer_id = $1",
     )
     .bind(&transfer.transfer_id)

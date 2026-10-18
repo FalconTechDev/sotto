@@ -43,6 +43,7 @@ fn app(pool: PgPool, transfers_enabled: bool) -> Router {
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: transfers_enabled,

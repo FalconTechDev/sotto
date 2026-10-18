@@ -802,6 +802,7 @@ mod tests {
             execution_lease_until_epoch: None,
             execution_attempt_count: 0,
             execution_manual_review_required: false,
+            execution_review_generation: 0,
             destination_customer_id: None,
             destination_schedule_id: None,
             source_schedule_id: None,
