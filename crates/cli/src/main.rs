@@ -778,7 +778,9 @@ fn run() -> Result<()> {
                 })?,
             ),
         },
-        Command::Mcp => unreachable!("MCP is handled before local command setup"),
+        Command::Mcp => Err(Error::Input(
+            "MCP server must start before local command setup".into(),
+        )),
         Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
