@@ -175,6 +175,11 @@ fn stdio_mcp_lists_only_strict_task_tools_and_never_spawns_without_approval() {
         run_schema["inputSchema"]["required"],
         json!(["task", "environment"])
     );
+    assert_eq!(run_schema["outputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        run_schema["outputSchema"]["required"],
+        json!(["task", "environment", "status", "exit_code", "summary"])
+    );
 
     let listed_tasks = &by_id(3)["result"]["structuredContent"]["tasks"];
     assert_eq!(listed_tasks[0]["name"], "danger");

@@ -12,7 +12,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation, JsonObject,
     ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{RequestContext, RunningService, Service};
 use rmcp::RoleServer;
 use rmcp::{transport::stdio, ServiceExt};
 use serde::Serialize;
@@ -211,11 +211,34 @@ pub async fn serve_stdio(server: SottoMcpServer) -> Result<()> {
         .serve(stdio())
         .await
         .map_err(|error| Error::Io(format!("starting Sotto MCP server: {error}")))?;
-    service
-        .waiting()
-        .await
-        .map_err(|error| Error::Io(format!("Sotto MCP server stopped unexpectedly: {error}")))?;
-    Ok(())
+    wait_for_shutdown(service, tokio::signal::ctrl_c()).await
+}
+
+async fn wait_for_shutdown<S, F>(service: RunningService<RoleServer, S>, shutdown: F) -> Result<()>
+where
+    S: Service<RoleServer>,
+    F: Future<Output = std::io::Result<()>> + Send,
+{
+    let cancellation = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+
+    tokio::select! {
+        result = &mut waiting => {
+            result.map_err(|error| Error::Io(format!("Sotto MCP server stopped unexpectedly: {error}")))?;
+            Ok(())
+        }
+        signal = shutdown => {
+            // Cancelling the RMCP service cancels active request contexts. The run_task handler
+            // forwards that cancellation to the shared runner and waits for its child to stop.
+            cancellation.cancel();
+            (&mut waiting)
+                .await
+                .map_err(|error| Error::Io(format!("stopping Sotto MCP server: {error}")))?;
+            signal.map_err(|error| Error::Io(format!("waiting for Sotto MCP shutdown signal: {error}")))?;
+            Ok(())
+        }
+    }
 }
 
 fn tool_definitions() -> Vec<Tool> {
@@ -231,7 +254,7 @@ fn tool_definitions() -> Vec<Tool> {
         ),
         Tool::new(
             RUN_TASK,
-            "Run a declared task with one allowed Sotto environment after local approval. The task receives that environment's plaintext secrets. Child output is discarded.",
+            "Run a declared task with one allowed Sotto environment after local approval. The task receives that environment's plaintext secrets. Returns task, environment, status, exit_code, and a Sotto-generated summary. Child output is discarded.",
             schema(json!({
                 "type": "object",
                 "properties": {
@@ -246,7 +269,22 @@ fn tool_definitions() -> Vec<Tool> {
                 "required": ["task", "environment"],
                 "additionalProperties": false
             })),
-        ),
+        )
+        .with_raw_output_schema(schema(json!({
+            "type": "object",
+            "properties": {
+                "task": { "type": "string" },
+                "environment": { "type": "string" },
+                "status": {
+                    "type": "string",
+                    "enum": ["completed", "failed", "timed_out", "cancelled", "could_not_start", "wait_failed", "error"]
+                },
+                "exit_code": { "type": ["integer", "null"] },
+                "summary": { "type": "string" }
+            },
+            "required": ["task", "environment", "status", "exit_code", "summary"],
+            "additionalProperties": false
+        }))),
     ]
 }
 
@@ -381,6 +419,12 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+        let output_schema = run_task.output_schema.unwrap();
+        assert_eq!(output_schema["additionalProperties"], false);
+        assert_eq!(
+            output_schema["required"],
+            json!(["task", "environment", "status", "exit_code", "summary"])
         );
     }
 
@@ -659,7 +703,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn cancelling_an_mcp_run_stops_the_approved_child() {
+    async fn request_cancellation_and_server_shutdown_stop_approved_children() {
         let root = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
@@ -683,38 +727,46 @@ mod tests {
         config.save_to(root.path()).unwrap();
         let started = root.path().join("started");
         let marker = root.path().join("should-not-finish");
+        let shutdown_started = root.path().join("shutdown-started");
+        let shutdown_marker = root.path().join("shutdown-should-not-finish");
         let manifest = format!(
-            "version = 1\n\n[[task]]\nname = \"slow\"\ndescription = \"Cancellation test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", {:?}]\nenvironments = [\"dev\"]\n",
-            format!("touch {:?}; sleep 1; touch {:?}", started, marker)
+            "version = 1\n\n[[task]]\nname = \"slow\"\ndescription = \"Cancellation test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", {:?}]\nenvironments = [\"dev\"]\n\n[[task]]\nname = \"shutdown_slow\"\ndescription = \"Shutdown test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", {:?}]\nenvironments = [\"dev\"]\n",
+            format!("touch {:?}; sleep 1; touch {:?}", started, marker),
+            format!(
+                "touch {:?}; sleep 1; touch {:?}",
+                shutdown_started, shutdown_marker
+            ),
         );
         std::fs::write(root.path().join("sotto.tasks.toml"), manifest).unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let manifest = TaskManifest::load_from(&canonical_root).unwrap();
-        let task = &manifest.tasks()[0];
-        let executable = task.resolve_executable(&canonical_root).unwrap();
-        let fingerprint =
-            approval_fingerprint(&manifest.fingerprint_for(task.name()).unwrap(), &executable)
-                .unwrap();
         let approvals = ApprovalStore::open(data.path()).unwrap();
-        approvals
-            .approve(
-                &config.project_id,
-                &project_root_key(&canonical_root),
-                task.name(),
-                "dev",
-                &fingerprint,
-            )
-            .unwrap();
+        for task in manifest.tasks() {
+            let executable = task.resolve_executable(&canonical_root).unwrap();
+            let fingerprint =
+                approval_fingerprint(&manifest.fingerprint_for(task.name()).unwrap(), &executable)
+                    .unwrap();
+            approvals
+                .approve(
+                    &config.project_id,
+                    &project_root_key(&canonical_root),
+                    task.name(),
+                    "dev",
+                    &fingerprint,
+                )
+                .unwrap();
+        }
         let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
         let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
+        let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
-            server
-                .serve(server_transport)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap();
+            let service = server.serve(server_transport).await.unwrap();
+            wait_for_shutdown(service, async move {
+                let _ = shutdown_signal.await;
+                Ok(())
+            })
+            .await
+            .unwrap();
         });
         let mut client = ().serve(client_transport).await.unwrap();
         let arguments = json!({"task":"slow", "environment":"dev"})
@@ -749,7 +801,37 @@ mod tests {
         .await
         .expect_err("cancelled task must not complete its post-sleep action");
         assert!(!marker.exists());
+
+        let shutdown_request =
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new(RUN_TASK).with_arguments(
+                    json!({"task":"shutdown_slow", "environment":"dev"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            ));
+        let _active_run = client
+            .peer()
+            .send_cancellable_request(
+                shutdown_request,
+                rmcp::service::PeerRequestOptions::no_options(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !shutdown_started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown task child should start before server shutdown");
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("server shutdown should wait for its active child to stop")
+            .unwrap();
+        assert!(!shutdown_marker.exists());
         client.close().await.unwrap();
-        server_task.await.unwrap();
     }
 }
