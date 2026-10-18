@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::billing_catalogue::BillingOffer;
 use crate::error::Error;
-use crate::founding_allocator;
+use crate::founding_allocator::{self, FoundingDate, FoundingOffer};
 use crate::founding_schedule;
 use crate::org;
 
@@ -253,6 +253,8 @@ pub struct TransferIntent {
     pub founding_award_id: Option<String>,
     pub execution_lease_token: Option<String>,
     pub execution_lease_until_epoch: Option<i64>,
+    /// Consecutive failed execution attempts; claims and invoice waits do not increment it, and
+    /// successful progress resets it.
     pub execution_attempt_count: i32,
     pub destination_customer_id: Option<String>,
     pub destination_schedule_id: Option<String>,
@@ -1343,6 +1345,11 @@ pub async fn record_destination_paid(
     if current.effective_from != invoice_period_start {
         return Err(TransferError::DestinationTermChanged);
     }
+    let expected_period_end = expected_transfer_period_end(current.offer, current.effective_from)
+        .ok_or(TransferError::DestinationTermChanged)?;
+    if invoice_period_end != expected_period_end {
+        return Err(TransferError::DestinationTermChanged);
+    }
     if current
         .destination_period_end
         .is_some_and(|recorded_end| recorded_end != invoice_period_end)
@@ -1378,6 +1385,14 @@ pub async fn record_destination_paid(
         return Err(TransferError::ResultConflict);
     }
     load_transfer(tx, transfer_id).await
+}
+
+fn expected_transfer_period_end(offer: BillingOffer, period_start: i64) -> Option<i64> {
+    let interval = match offer {
+        BillingOffer::StandardMonthly | BillingOffer::FoundingMonthly => FoundingOffer::Monthly,
+        BillingOffer::StandardAnnual | BillingOffer::FoundingAnnual => FoundingOffer::Annual,
+    };
+    FoundingDate::anchored_term_end_epoch(period_start, interval, 1).ok()
 }
 
 /// Begin the source adjustment after the destination has been prepared. It can precede the
@@ -1839,7 +1854,6 @@ async fn claim_due_matching(
          UPDATE billing_transfer_intents AS transfer SET \
              execution_lease_token = $2, \
              execution_lease_until = now() + ($1 * interval '1 second'), \
-             execution_attempt_count = transfer.execution_attempt_count + 1, \
              updated_at = now() \
          FROM candidate WHERE transfer.transfer_id = candidate.transfer_id \
          RETURNING transfer.*, EXTRACT(EPOCH FROM transfer.execution_lease_until)::BIGINT \
@@ -1884,11 +1898,12 @@ pub async fn release_execution_lease(
     .bind(lease_token)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(attempts) = attempts else {
+    let Some(previous_failures) = attempts else {
         tx.rollback().await?;
         return Ok(false);
     };
-    let manual_review_required = failure.requires_manual_review(attempts);
+    let failure_count = previous_failures.saturating_add(1);
+    let manual_review_required = failure.requires_manual_review(failure_count);
     let unknown_state_required = failure.needs_unknown_state() || manual_review_required;
     let result_code =
         if manual_review_required && failure != TransferExecutionFailure::ProviderRejected {
@@ -1901,6 +1916,7 @@ pub async fn release_execution_lease(
              state = CASE WHEN $3 THEN 'unknown' ELSE state END, \
              last_execution_error_code = $4, \
              result_code = CASE WHEN $3 THEN $5 ELSE result_code END, \
+             execution_attempt_count = $8, \
              execution_manual_review_required = $6, \
              execution_lease_token = NULL, execution_lease_until = NULL, \
              execution_next_attempt_at = CASE WHEN $6 THEN 'infinity'::timestamptz \
@@ -1914,7 +1930,8 @@ pub async fn release_execution_lease(
     .bind(failure.as_str())
     .bind(result_code)
     .bind(manual_review_required)
-    .bind(transfer_retry_delay_seconds(failure, attempts))
+    .bind(transfer_retry_delay_seconds(failure, failure_count))
+    .bind(failure_count)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1941,6 +1958,7 @@ pub async fn finish_execution_lease(
     let rows = sqlx::query(
         "UPDATE billing_transfer_intents SET execution_lease_token = NULL, \
              execution_lease_until = NULL, execution_next_attempt_at = now(), \
+             execution_attempt_count = 0, \
              execution_manual_review_required = FALSE, result_code = NULL, \
              last_execution_error_code = NULL, updated_at = now() \
          WHERE transfer_id = $1 AND execution_lease_token = $2",
@@ -1967,6 +1985,7 @@ pub async fn defer_execution_lease(
     let rows = sqlx::query(
         "UPDATE billing_transfer_intents SET execution_lease_token = NULL, \
              execution_lease_until = NULL, \
+             execution_attempt_count = 0, \
              execution_next_attempt_at = now() + ($3 * interval '1 second'), updated_at = now() \
          WHERE transfer_id = $1 AND execution_lease_token = $2",
     )
@@ -2367,12 +2386,13 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        offer_at_transfer_boundary, transfer_retry_delay_seconds, validate_offer_at_boundary,
-        validate_source_term, TransferError, TransferExecutionFailure, TransferPayer,
-        TransferRequest, TransferState, MAX_AUTOMATIC_TRANSFER_ATTEMPTS,
+        expected_transfer_period_end, offer_at_transfer_boundary, transfer_retry_delay_seconds,
+        validate_offer_at_boundary, validate_source_term, TransferError, TransferExecutionFailure,
+        TransferPayer, TransferRequest, TransferState, MAX_AUTOMATIC_TRANSFER_ATTEMPTS,
         MAX_TRANSFER_RETRY_DELAY_SECONDS,
     };
     use crate::billing_catalogue::BillingOffer;
+    use crate::founding_allocator::FoundingDate;
 
     fn request() -> TransferRequest {
         TransferRequest {
@@ -2415,6 +2435,31 @@ mod tests {
         let mut next_renewal = request();
         next_renewal.effective_from = 3_000;
         assert!(next_renewal.validate(1_000).is_ok());
+    }
+
+    #[test]
+    fn destination_invoice_end_must_match_the_quoted_billing_interval() {
+        let monthly_start = FoundingDate::new(2027, 2, 14).unwrap().to_unix_seconds() + 8 * 3_600;
+        let monthly_end = FoundingDate::new(2027, 3, 14).unwrap().to_unix_seconds() + 8 * 3_600;
+        assert_eq!(
+            expected_transfer_period_end(BillingOffer::StandardMonthly, monthly_start),
+            Some(monthly_end)
+        );
+        assert_eq!(
+            expected_transfer_period_end(BillingOffer::FoundingMonthly, monthly_start),
+            Some(monthly_end)
+        );
+
+        let annual_start = FoundingDate::new(2024, 2, 29).unwrap().to_unix_seconds() + 123;
+        let annual_end = FoundingDate::new(2025, 2, 28).unwrap().to_unix_seconds() + 123;
+        assert_eq!(
+            expected_transfer_period_end(BillingOffer::StandardAnnual, annual_start),
+            Some(annual_end)
+        );
+        assert_eq!(
+            expected_transfer_period_end(BillingOffer::FoundingAnnual, annual_start),
+            Some(annual_end)
+        );
     }
 
     #[test]
