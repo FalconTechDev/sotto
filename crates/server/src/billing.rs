@@ -5434,14 +5434,14 @@ async fn record_transfer_invoice_payment(
     period_end: i64,
 ) -> Result<()> {
     let restoration = sqlx::query(
-        "SELECT transfer_id, beneficiary_id, source_kind, source_organization_id, offer, \
+        "SELECT transfer_id, beneficiary_id, source_kind, source_organization_id, offer, state, \
                 source_restoration_provider_subscription_id, source_restoration_payment_reference, \
-                effective_from, EXISTS (SELECT 1 FROM billing_personal_accounts account \
+                effective_from, (SELECT account.offer FROM billing_personal_accounts account \
                   WHERE account.user_id = billing_transfer_intents.beneficiary_id \
                     AND account.operation_id = billing_transfer_intents.source_restoration_operation_id \
                     AND account.stripe_customer_id = $2 \
-                    AND account.stripe_subscription_id = billing_transfer_intents.source_restoration_provider_subscription_id \
-                    AND account.offer = billing_transfer_intents.offer) AS account_binding \
+                    AND account.stripe_subscription_id = billing_transfer_intents.source_restoration_provider_subscription_id) \
+                    AS account_offer \
          FROM billing_transfer_intents WHERE source_restoration_operation_id = $1 FOR UPDATE",
     )
     .bind(operation_id)
@@ -5456,19 +5456,31 @@ async fn record_transfer_invoice_payment(
             row.try_get("source_restoration_provider_subscription_id")?;
         let recorded_payment: Option<String> =
             row.try_get("source_restoration_payment_reference")?;
+        let state: String = row.try_get("state")?;
         let effective_from: i64 = row.try_get("effective_from")?;
         let restoration_offer: String = row.try_get("offer")?;
-        let account_binding: bool = row.try_get("account_binding")?;
+        let account_offer: Option<String> = row.try_get("account_offer")?;
         if row.try_get::<String, _>("beneficiary_id")? != beneficiary_id
             || source_kind != destination_kind.as_str()
             || source_organization_id.as_deref() != destination_organization_id
-            || restoration_offer != offer
-            || !account_binding
+            || account_offer.is_none()
             || restored_subscription.as_deref() != Some(subscription_id)
+        {
+            return Err(Error::Conflict(
+                "paid invoice does not match its source restoration".into(),
+            ));
+        }
+        // The restoration operation id remains attached to the account after recovery. Only
+        // its first paid invoice is transfer evidence; later renewals belong to normal billing.
+        if recorded_payment.is_some()
+            || !matches!(state.as_str(), "source_restoration_pending" | "unknown")
+        {
+            return Ok(());
+        }
+        if restoration_offer != offer
+            || account_offer.as_deref() != Some(offer)
             || period_start < effective_from
             || period_end <= period_start
-            || (recorded_payment.is_some()
-                && recorded_payment.as_deref() != Some(payment_reference))
         {
             return Err(Error::Conflict(
                 "paid invoice does not match its source restoration".into(),
@@ -5488,7 +5500,8 @@ async fn record_transfer_invoice_payment(
 
     let row = sqlx::query(
         "SELECT transfer_id, beneficiary_id, destination_kind, destination_organization_id, \
-                destination_customer_id, destination_provider_subscription_id, offer, effective_from \
+                destination_customer_id, destination_provider_subscription_id, offer, effective_from, \
+                state, destination_payment_reference \
          FROM billing_transfer_intents WHERE destination_operation_id = $1 FOR UPDATE",
     )
     .bind(operation_id)
@@ -5503,16 +5516,37 @@ async fn record_transfer_invoice_payment(
     let stored_customer: Option<String> = row.try_get("destination_customer_id")?;
     let stored_subscription: Option<String> =
         row.try_get("destination_provider_subscription_id")?;
-    let stored_offer: String = row.try_get("offer")?;
     let effective_from: i64 = row.try_get("effective_from")?;
+    let state: String = row.try_get("state")?;
+    let recorded_payment: Option<String> = row.try_get("destination_payment_reference")?;
     if row.try_get::<String, _>("beneficiary_id")? != beneficiary_id
         || stored_kind != destination_kind.as_str()
         || stored_organization.as_deref() != destination_organization_id
         || stored_customer.as_deref() != Some(customer_id)
         || stored_subscription.as_deref() != Some(subscription_id)
-        || stored_offer != offer
-        || effective_from != period_start
     {
+        return Err(Error::Conflict(
+            "paid invoice does not match its payer transfer".into(),
+        ));
+    }
+    // Destination operation ids stay on the account/seat after the transfer completes. Do
+    // not reinterpret later renewals as transfer evidence or compare them to the boundary
+    // invoice's payment reference.
+    if recorded_payment.is_some()
+        || !matches!(
+            state.as_str(),
+            "destination_prepared" | "source_adjustment_pending"
+        )
+    {
+        return Ok(());
+    }
+    // An invoice for the paid term ending at the transfer boundary is still the source term.
+    // A period that overlaps or follows the boundary is relevant: record_destination_paid
+    // will park a wrong start/end for operator review instead of aborting invoice settlement.
+    if period_end <= effective_from {
+        return Ok(());
+    }
+    if row.try_get::<String, _>("offer")? != offer {
         return Err(Error::Conflict(
             "paid invoice does not match its payer transfer".into(),
         ));
@@ -10068,6 +10102,258 @@ mod tests {
         assert!(body.contains("subscription=sub-preview"));
         drop(request);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn transfer_invoice_webhook_ignores_later_renewals_and_reviews_wrong_boundary_start() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+        let options =
+            sqlx::postgres::PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing to write test fixtures to non-local database: {}",
+            options.get_host()
+        );
+        let pool = crate::db::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+
+        let fixture = Uuid::new_v4().simple().to_string();
+        let user_id = format!("transfer_invoice_{fixture}");
+        let organization_id = format!("transfer_invoice_org_{fixture}");
+        let completed_id = format!("transfer_invoice_completed_{fixture}");
+        let prepared_id = format!("transfer_invoice_prepared_{fixture}");
+        let restoration_id = format!("transfer_invoice_restoration_{fixture}");
+        let completed_operation = format!("{completed_id}:destination");
+        let prepared_operation = format!("{prepared_id}:destination");
+        let restoration_operation = format!("{restoration_id}:source-restoration");
+        let boundary = 1_800_000_000_i64;
+        let expected_end = 1_802_592_000_i64;
+
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'transfer_invoice_test', $1)",
+        )
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert transfer invoice beneficiary");
+        sqlx::query(
+            "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)",
+        )
+        .bind(&organization_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert transfer invoice destination organisation");
+        sqlx::query(
+            "INSERT INTO billing_operations \
+             (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
+              offer, quote_version, quote_expires_at_epoch, provider_idempotency_key) \
+             VALUES ($1, $1, $1, $2, $2, $2, 'standard_monthly', 1, $3, $1)",
+        )
+        .bind(&restoration_operation)
+        .bind(&user_id)
+        .bind(boundary + 900)
+        .execute(&pool)
+        .await
+        .expect("insert restoration billing operation");
+        sqlx::query(
+            "INSERT INTO billing_personal_accounts \
+             (user_id, operation_id, offer, stripe_customer_id, stripe_subscription_id, state, pending_expires_at_epoch) \
+             VALUES ($1, $2, 'standard_monthly', 'cus_restored', 'sub_restored', 'active', $3)",
+        )
+        .bind(&user_id)
+        .bind(&restoration_operation)
+        .bind(boundary + 900)
+        .execute(&pool)
+        .await
+        .expect("insert restored personal account");
+        for (transfer_id, operation_id, state, result_code, payment, period_end) in [
+            (
+                &completed_id,
+                &completed_operation,
+                "completed",
+                Some("transfer_completed"),
+                Some("pi_transfer_boundary"),
+                Some(expected_end),
+            ),
+            (
+                &prepared_id,
+                &prepared_operation,
+                "destination_prepared",
+                None,
+                None,
+                None,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO billing_transfer_intents \
+                 (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+                  destination_kind, destination_organization_id, offer, quote_version, \
+                  quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+                  provider_idempotency_key, destination_operation_id, source_provider_subscription_id, \
+                  destination_provider_subscription_id, destination_customer_id, state, result_code, \
+                  destination_payment_reference, destination_period_end, destination_expected_period_end) \
+                 VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
+                         $4, $5, $6, $6, $6, $7, 'sub_source', 'sub_destination', 'cus_destination', \
+                         $8, $9, $10, $11, $12)",
+            )
+            .bind(transfer_id)
+            .bind(&user_id)
+            .bind(&organization_id)
+            .bind(boundary + 900)
+            .bind(boundary)
+            .bind(format!("key_{transfer_id}"))
+            .bind(operation_id)
+            .bind(state)
+            .bind(result_code)
+            .bind(payment)
+            .bind(period_end)
+            .bind(expected_end)
+            .execute(&pool)
+            .await
+            .expect("insert transfer invoice fixture");
+        }
+        sqlx::query(
+            "INSERT INTO billing_transfer_intents \
+             (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+              destination_kind, destination_organization_id, offer, quote_version, \
+              quote_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+              provider_idempotency_key, source_provider_subscription_id, state, result_code, \
+              source_restoration_operation_id, source_restoration_provider_subscription_id, \
+              source_restoration_payment_reference) \
+             VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
+                     $4, $5, $6, $6, $6, 'sub_source', 'failed', 'destination_initial_payment_failed', \
+                     $7, 'sub_restored', 'pi_restoration_boundary')",
+        )
+        .bind(&restoration_id)
+        .bind(&user_id)
+        .bind(&organization_id)
+        .bind(boundary + 900)
+        .bind(boundary)
+        .bind(format!("key_{restoration_id}"))
+        .bind(&restoration_operation)
+        .execute(&pool)
+        .await
+        .expect("insert restored transfer fixture");
+
+        let mut tx = pool.begin().await.expect("begin later renewal webhook");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &completed_operation,
+            &user_id,
+            TransferPayer::Sponsor,
+            Some(&organization_id),
+            "standard_monthly",
+            "cus_destination",
+            "sub_destination",
+            "pi_second_renewal",
+            expected_end,
+            expected_end + 2_678_400,
+        )
+        .await
+        .expect("a renewal after transfer completion is ordinary invoice billing");
+        tx.commit().await.expect("commit later renewal webhook");
+        let completed_payment: String = sqlx::query_scalar(
+            "SELECT destination_payment_reference FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&completed_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read completed transfer payment");
+        assert_eq!(completed_payment, "pi_transfer_boundary");
+
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin restored source renewal webhook");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &restoration_operation,
+            &user_id,
+            TransferPayer::Personal,
+            None,
+            "standard_monthly",
+            "cus_restored",
+            "sub_restored",
+            "pi_restoration_second_renewal",
+            expected_end,
+            expected_end + 2_678_400,
+        )
+        .await
+        .expect("a renewal after restoration settlement is ordinary invoice billing");
+        tx.commit()
+            .await
+            .expect("commit restored source renewal webhook");
+        let restoration_payment: String = sqlx::query_scalar(
+            "SELECT source_restoration_payment_reference FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&restoration_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read restoration boundary payment");
+        assert_eq!(restoration_payment, "pi_restoration_boundary");
+
+        let mut tx = pool.begin().await.expect("begin wrong-boundary webhook");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &prepared_operation,
+            &user_id,
+            TransferPayer::Sponsor,
+            Some(&organization_id),
+            "standard_monthly",
+            "cus_destination",
+            "sub_destination",
+            "pi_wrong_boundary",
+            boundary + 1,
+            expected_end + 1,
+        )
+        .await
+        .expect("a mismatched boundary start is retained for manual review");
+        tx.commit().await.expect("commit wrong-boundary webhook");
+        let review_code: Option<String> = sqlx::query_scalar(
+            "SELECT last_execution_error_code FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&prepared_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read mismatch review code");
+        assert_eq!(
+            review_code.as_deref(),
+            Some("destination_period_start_mismatch")
+        );
+
+        sqlx::query("DELETE FROM billing_transfer_intents WHERE transfer_id = ANY($1)")
+            .bind(vec![completed_id, prepared_id, restoration_id])
+            .execute(&pool)
+            .await
+            .expect("delete transfer invoice fixtures");
+        sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("delete restored personal account");
+        sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+            .bind(&restoration_operation)
+            .execute(&pool)
+            .await
+            .expect("delete restoration billing operation");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(&organization_id)
+            .execute(&pool)
+            .await
+            .expect("delete transfer invoice organisation");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("delete transfer invoice beneficiary");
     }
 
     #[tokio::test]
