@@ -161,7 +161,10 @@ enum Command {
     Unlock,
     /// Lock the store (clear the cached session).
     Lock,
-    /// Validate the current project's agent task declarations.
+    /// Manage project-declared tasks for local agent workflows.
+    #[command(
+        after_help = "Examples:\n  sotto task validate\n  sotto task approve test --env dev\n  sotto task approvals\n  sotto task run test --env dev\n  sotto task revoke test --env dev\n\nTask approval requires a local interactive terminal. Running a task requires a current approval and an unlocked Sotto session. Approved project code receives plaintext secrets from the selected environment; Sotto is not a sandbox."
+    )]
     Task {
         #[command(subcommand)]
         command: TaskCommand,
