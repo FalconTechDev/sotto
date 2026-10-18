@@ -357,9 +357,6 @@ async fn adjust_source(
     lease: &TransferLease,
 ) -> Result<(), ExecutionError> {
     let transfer = &lease.transfer;
-    if epoch_now() >= transfer.effective_from {
-        return Err(ExecutionError::Local("transfer_boundary_already_reached"));
-    }
     if transfer.source_kind == TransferPayer::Personal {
         let source_subscription = transfer
             .source_provider_subscription_id
@@ -375,9 +372,11 @@ async fn adjust_source(
         ) {
             return Err(ExecutionError::Local("source_period_changed"));
         }
-        if epoch_now() >= transfer.effective_from
-            && !personal_source_adjustment_is_applied(&source, transfer.effective_from)
-        {
+        if !personal_source_adjustment_retry_allowed(
+            epoch_now(),
+            transfer.effective_from,
+            personal_source_adjustment_is_applied(&source, transfer.effective_from),
+        ) {
             return Err(ExecutionError::Local("source_boundary_already_reached"));
         }
     }
@@ -714,6 +713,14 @@ fn personal_source_adjustment_is_applied(
     snapshot.status == SubscriptionStatus::Canceled
         || snapshot.cancel_at_period_end
         || snapshot.cancel_at == Some(boundary_epoch)
+}
+
+fn personal_source_adjustment_retry_allowed(
+    now_epoch: i64,
+    boundary_epoch: i64,
+    provider_adjustment_is_applied: bool,
+) -> bool {
+    now_epoch < boundary_epoch || provider_adjustment_is_applied
 }
 
 fn sponsored_phase_matches_snapshot(
@@ -2056,6 +2063,7 @@ mod tests {
 
         current.status = SubscriptionStatus::Canceled;
         assert!(personal_source_adjustment_is_applied(&current, 500));
+        assert!(personal_source_adjustment_retry_allowed(501, 500, true));
         assert!(personal_source_adjustment_preflight_matches(
             &current,
             "sub_source",
@@ -2066,6 +2074,8 @@ mod tests {
             "sub_source",
             501
         ));
+        assert!(personal_source_adjustment_retry_allowed(499, 500, false));
+        assert!(!personal_source_adjustment_retry_allowed(500, 500, false));
         assert!(!personal_source_adjustment_preflight_matches(
             &current,
             "other_subscription",
