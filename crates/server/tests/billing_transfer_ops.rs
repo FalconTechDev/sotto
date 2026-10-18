@@ -10,6 +10,10 @@ use sqlx::{
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use sotto_server::billing_transfers::{
+    list_manual_review_transfers, load_manual_review_transfer, mark_failed,
+    record_operator_review_decision, TransferError, TransferReviewAction,
+};
 use sotto_server::config::{DeploymentMode, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
 use sotto_server::state::AppState;
@@ -333,5 +337,45 @@ async fn operator_can_review_hold_and_resume_a_parked_transfer() {
         .unwrap()
         .iter()
         .all(|transfer| transfer["transfer_id"] != transfer_id));
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn terminal_transfer_is_removed_from_manual_review_and_cannot_be_resumed() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (fixture, transfer_id, _) = seed_manual_review(&pool).await;
+    let mut tx = pool.begin().await.expect("begin terminal transition");
+    let failed = mark_failed(&mut tx, &transfer_id, "destination_subscription_ended")
+        .await
+        .expect("a terminal provider event can end the parked transfer");
+    assert_eq!(failed.state.as_str(), "failed");
+    assert!(!failed.execution_manual_review_required);
+    tx.commit().await.expect("commit terminal transfer state");
+
+    assert!(load_manual_review_transfer(&pool, &transfer_id)
+        .await
+        .expect("load manual review details")
+        .is_none());
+    assert!(list_manual_review_transfers(&pool, None, 50)
+        .await
+        .expect("list manual review queue")
+        .iter()
+        .all(|transfer| transfer.transfer_id != transfer_id));
+    assert!(matches!(
+        record_operator_review_decision(
+            &pool,
+            &transfer_id,
+            "billing-operator-test",
+            TransferReviewAction::Resume,
+            "provider_checked",
+            1,
+            "terminal-resume-test",
+        )
+        .await,
+        Err(TransferError::InvalidTransition)
+    ));
+
     cleanup(&pool, &fixture).await;
 }

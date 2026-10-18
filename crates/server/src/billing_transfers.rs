@@ -1421,7 +1421,8 @@ pub async fn record_destination_paid(
                    AND destination_payment_reference = $2 \
                    AND destination_period_end IS NOT DISTINCT FROM $3 THEN 0 ELSE 1 END, \
              last_execution_error_code = $4, \
-             execution_next_attempt_at = 'infinity'::timestamptz, updated_at = now() \
+             execution_next_attempt_at = 'infinity'::timestamptz, \
+             execution_lease_token = NULL, execution_lease_until = NULL, updated_at = now() \
              WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
                AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
                AND (destination_period_end IS NULL OR destination_period_end = $3) \
@@ -1460,6 +1461,8 @@ pub async fn record_destination_paid(
              ELSE last_execution_error_code END, \
          execution_next_attempt_at = CASE WHEN state = 'unknown' THEN 'infinity'::timestamptz \
              ELSE execution_next_attempt_at END, \
+         execution_lease_token = CASE WHEN state = 'unknown' THEN NULL ELSE execution_lease_token END, \
+         execution_lease_until = CASE WHEN state = 'unknown' THEN NULL ELSE execution_lease_until END, \
          updated_at = now() \
          WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
            AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
@@ -1546,7 +1549,9 @@ pub async fn complete_source_adjustment(
         }
         return Err(TransferError::ResultConflict);
     }
-    if transfer.state != TransferState::SourceAdjustmentPending {
+    if transfer.state != TransferState::SourceAdjustmentPending
+        || transfer.execution_manual_review_required
+    {
         return Err(TransferError::InvalidTransition);
     }
     if transfer.destination_payment_reference.is_some() && transfer.destination_period_end.is_none()
@@ -1618,7 +1623,8 @@ pub async fn complete_source_adjustment(
     sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'completed', \
          source_adjustment_reference = $2, result_code = 'completed', updated_at = now() \
-         WHERE transfer_id = $1 AND state = 'source_adjustment_pending'",
+         WHERE transfer_id = $1 AND state = 'source_adjustment_pending' \
+           AND NOT execution_manual_review_required",
     )
     .bind(transfer_id)
     .bind(source_adjustment_reference)
@@ -1881,7 +1887,10 @@ pub async fn mark_failed(
     }
     founding_allocator::lock_capacity(tx).await?;
     let updated = sqlx::query(
-        "UPDATE billing_transfer_intents SET state = 'failed', result_code = $2, updated_at = now() \
+        "UPDATE billing_transfer_intents SET state = 'failed', result_code = $2, \
+         execution_manual_review_required = FALSE, execution_lease_token = NULL, \
+         execution_lease_until = NULL, execution_next_attempt_at = 'infinity'::timestamptz, \
+         updated_at = now() \
          WHERE transfer_id = $1 AND state IN ('awaiting_consent','pending','destination_prepared','unknown')",
     )
     .bind(transfer_id)
@@ -1981,6 +1990,7 @@ pub async fn list_manual_review_transfers(
         "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
          FROM billing_transfer_intents \
          WHERE execution_manual_review_required \
+           AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
            AND ($1::TEXT IS NULL OR transfer_id > $1) \
          ORDER BY transfer_id ASC LIMIT $2",
     )
@@ -1998,7 +2008,9 @@ pub async fn load_manual_review_transfer(
 ) -> Result<Option<(TransferIntent, Vec<TransferReviewDecision>)>, TransferError> {
     let row = sqlx::query(
         "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
-         FROM billing_transfer_intents WHERE transfer_id = $1",
+         FROM billing_transfer_intents WHERE transfer_id = $1 \
+           AND execution_manual_review_required \
+           AND state IN ('destination_prepared','source_adjustment_pending','unknown')",
     )
     .bind(transfer_id)
     .fetch_optional(pool)
@@ -2094,6 +2106,12 @@ pub async fn record_operator_review_decision(
 
     let active_lease: bool = row.try_get("active_lease")?;
     if !current.execution_manual_review_required
+        || !matches!(
+            current.state,
+            TransferState::DestinationPrepared
+                | TransferState::SourceAdjustmentPending
+                | TransferState::Unknown
+        )
         || current.execution_review_generation != review_generation
         || active_lease
     {
@@ -2124,6 +2142,7 @@ pub async fn record_operator_review_decision(
                  execution_attempt_count = 0, result_code = NULL, updated_at = now() \
              WHERE transfer_id = $1 AND execution_manual_review_required \
                AND execution_review_generation = $2 \
+               AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
                AND (execution_lease_until IS NULL OR execution_lease_until <= now()) \
              RETURNING transfer_id",
         )

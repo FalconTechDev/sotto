@@ -1701,8 +1701,12 @@ async fn lock_transfer_for_lease(
     .await
     .map_err(|_| ExecutionError::Local("transfer_lease_lookup_failed"))?
     .ok_or(ExecutionError::Local("transfer_lease_expired"))?;
-    billing_transfers::transfer_from_row(&row)
-        .map_err(|_| ExecutionError::Local("transfer_row_corrupt"))
+    let transfer = billing_transfers::transfer_from_row(&row)
+        .map_err(|_| ExecutionError::Local("transfer_row_corrupt"))?;
+    if transfer.execution_manual_review_required {
+        return Err(ExecutionError::Local("operator_review_required"));
+    }
+    Ok(transfer)
 }
 
 fn validate_sponsor_boundary(

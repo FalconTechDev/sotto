@@ -27,3 +27,8 @@ CREATE TABLE billing_transfer_review_decisions (
 
 CREATE INDEX billing_transfer_review_decisions_history_idx
     ON billing_transfer_review_decisions (transfer_id, decision_id DESC);
+
+CREATE INDEX billing_transfer_manual_review_queue_idx
+    ON billing_transfer_intents (transfer_id)
+    WHERE execution_manual_review_required
+      AND state IN ('destination_prepared', 'source_adjustment_pending', 'unknown');

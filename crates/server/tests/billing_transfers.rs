@@ -930,6 +930,10 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         parked.last_execution_error_code.as_deref(),
         Some("destination_period_end_mismatch")
     );
+    assert!(matches!(
+        complete_source_adjustment(&mut tx, &transfer.transfer_id, "credit_source").await,
+        Err(TransferError::InvalidTransition)
+    ));
     assert_eq!(
         parked.destination_period_end,
         Some(expected_destination_period_end + 1)
@@ -938,9 +942,9 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         .await
         .expect("commit the invoice period and review flag together");
     assert!(
-        defer_execution_lease(&pool, &transfer.transfer_id, "period-review-lease", 300,)
+        !defer_execution_lease(&pool, &transfer.transfer_id, "period-review-lease", 300,)
             .await
-            .expect("defer a worker that observed the invoice concurrently")
+            .expect("invoice evidence revokes the in-flight worker lease")
     );
     let remains_parked: bool = sqlx::query_scalar(
         "SELECT execution_manual_review_required AND \
@@ -957,19 +961,10 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         .expect("normal worker never claims a transfer parked for review")
         .is_none());
 
-    sqlx::query(
-        "UPDATE billing_transfer_intents SET execution_lease_token = 'period-review-finish', \
-             execution_lease_until = now() + interval '60 seconds' \
-         WHERE transfer_id = $1",
-    )
-    .bind(&transfer.transfer_id)
-    .execute(&pool)
-    .await
-    .expect("simulate a worker completing after the review flag was set");
     assert!(
-        finish_execution_lease(&pool, &transfer.transfer_id, "period-review-finish",)
+        !finish_execution_lease(&pool, &transfer.transfer_id, "period-review-lease",)
             .await
-            .expect("finish the concurrent worker lease")
+            .expect("invoice evidence revokes the in-flight worker lease")
     );
     let remains_parked: bool = sqlx::query_scalar(
         "SELECT execution_manual_review_required AND \
