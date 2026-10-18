@@ -69,6 +69,7 @@ const FOUNDING_SCHEDULE_PREFLIGHT_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_PREFLIGHT
 const BILLING_TRANSFERS_ENV: &str = "SOTTO_BILLING_TRANSFERS_ENABLED";
 const BILLING_TRANSFER_EXECUTION_ENV: &str = "SOTTO_BILLING_TRANSFER_EXECUTION_ENABLED";
 const BILLING_TRANSFER_SETUP_ENV: &str = "SOTTO_BILLING_TRANSFER_SETUP_ENABLED";
+const BILLING_TRANSFER_OPERATOR_TOKEN_ENV: &str = "SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -116,6 +117,8 @@ pub struct Config {
     pub billing_transfer_execution_enabled: bool,
     /// Whether beneficiaries may open the Stripe setup flow for a personal transfer. Defaults off.
     pub billing_transfer_setup_enabled: bool,
+    /// Enables protected operator review controls for parked payer transfers when configured.
+    pub billing_transfer_operator_token: Option<String>,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -214,6 +217,7 @@ impl Config {
         );
         let billing_transfer_setup_enabled =
             feature_flag_is_enabled(std::env::var(BILLING_TRANSFER_SETUP_ENV).ok().as_deref());
+        let billing_transfer_operator_token = env_nonempty(BILLING_TRANSFER_OPERATOR_TOKEN_ENV);
         let founding_schedule_preflight_verified = feature_flag_is_enabled(
             std::env::var(FOUNDING_SCHEDULE_PREFLIGHT_ENV)
                 .ok()
@@ -360,6 +364,11 @@ impl Config {
             deployment_mode,
             billing.as_ref(),
         )?;
+        validate_billing_transfer_operator_configuration(
+            billing_transfer_operator_token.as_deref(),
+            deployment_mode,
+            billing.as_ref(),
+        )?;
         let cloud_action_enforcement_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_ACTION_ENFORCEMENT_ENV).ok().as_deref());
         let machine_eligibility_enforcement_enabled = feature_flag_is_enabled(
@@ -390,6 +399,7 @@ impl Config {
             billing_transfers_enabled,
             billing_transfer_execution_enabled,
             billing_transfer_setup_enabled,
+            billing_transfer_operator_token,
         })
     }
 }
@@ -547,6 +557,27 @@ fn validate_billing_transfer_execution_configuration(
     Ok(())
 }
 
+fn validate_billing_transfer_operator_configuration(
+    token: Option<&str>,
+    deployment_mode: DeploymentMode,
+    billing: Option<&BillingConfig>,
+) -> Result<()> {
+    let Some(token) = token else {
+        return Ok(());
+    };
+    if deployment_mode != DeploymentMode::Cloud || billing.is_none() {
+        return Err(Error::Config(
+            "payer transfer operator controls require Cloud billing".into(),
+        ));
+    }
+    if token.len() < 32 {
+        return Err(Error::Config(
+            "SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN must contain at least 32 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn is_portal_configuration_id(value: &str) -> bool {
     value.starts_with("bpc_") && value.len() > 4 && value.trim() == value
 }
@@ -690,9 +721,10 @@ mod tests {
         is_portal_configuration_id, organisation_deletion_retention_from_env_result,
         organisation_deletion_worker_is_enabled, parse_organisation_deletion_retention_days,
         telemetry_ping_enabled, validate_billing_transfer_execution_configuration,
-        validate_billing_transfers_configuration, validate_cloud_sales_configuration,
-        validate_deployment_billing_boundary, validate_founding_schedule_worker_configuration,
-        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds, DeploymentMode,
+        validate_billing_transfer_operator_configuration, validate_billing_transfers_configuration,
+        validate_cloud_sales_configuration, validate_deployment_billing_boundary,
+        validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
+        BillingConfig, BillingPriceIds, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
@@ -879,6 +911,43 @@ mod tests {
                 cloud_sales_enabled: false,
                 return_url: "https://app.example.test".into(),
             }),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn payer_transfer_operator_route_requires_a_long_cloud_only_token() {
+        assert!(validate_billing_transfer_operator_configuration(
+            None,
+            DeploymentMode::SelfHosted,
+            None,
+        )
+        .is_ok());
+        assert!(validate_billing_transfer_operator_configuration(
+            Some("too-short"),
+            DeploymentMode::Cloud,
+            None,
+        )
+        .is_err());
+        assert!(validate_billing_transfer_operator_configuration(
+            Some("0123456789abcdef0123456789abcdef"),
+            DeploymentMode::SelfHosted,
+            None,
+        )
+        .is_err());
+        let billing = BillingConfig {
+            api_key: "rk_test_secret".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: None,
+            cloud_portal_configuration_id: None,
+            cloud_sales_enabled: false,
+            return_url: "https://app.example.test".into(),
+        };
+        assert!(validate_billing_transfer_operator_configuration(
+            Some("0123456789abcdef0123456789abcdef"),
+            DeploymentMode::Cloud,
+            Some(&billing),
         )
         .is_ok());
     }

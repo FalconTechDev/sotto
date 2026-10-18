@@ -169,6 +169,7 @@ async fn run() -> Result<()> {
 
     let repair_billing = billing.clone();
     let repair_runtime = personal_coverage_runtime.clone();
+    let billing_transfer_operator_review_enabled = config.billing_transfer_operator_token.is_some();
     let state = AppState {
         pool: pool.clone(),
         deployment_mode: config.deployment_mode,
@@ -182,6 +183,7 @@ async fn run() -> Result<()> {
         organisation_deletion_retention_days: config.organisation_deletion_retention_days,
         organisation_deletion_metrics_token: config.organisation_deletion_metrics_token,
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,
+        billing_transfer_operator_token: config.billing_transfer_operator_token,
         cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
         machine_eligibility_enforcement_enabled: config.machine_eligibility_enforcement_enabled,
         billing_transfers_enabled: config.billing_transfers_enabled,
@@ -213,6 +215,10 @@ async fn run() -> Result<()> {
     println!(
         "billing transfer setup: {}",
         config.billing_transfer_setup_enabled
+    );
+    println!(
+        "billing transfer operator review: {}",
+        billing_transfer_operator_review_enabled
     );
     println!(
         "founding schedule worker: {}",

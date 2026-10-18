@@ -721,6 +721,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     let app = Router::new()
         .merge(sotto_server::billing::router())

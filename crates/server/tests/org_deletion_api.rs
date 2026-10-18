@@ -91,6 +91,7 @@ fn state_with_retention(pool: PgPool, retention_days: i64) -> AppState {
         organisation_deletion_retention_days: retention_days,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     }
 }
 

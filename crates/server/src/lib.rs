@@ -30,6 +30,8 @@ pub mod billing_refunds;
 #[doc(hidden)]
 pub mod billing_transfer_api;
 #[doc(hidden)]
+pub mod billing_transfer_ops;
+#[doc(hidden)]
 pub mod billing_transfer_worker;
 #[doc(hidden)]
 pub mod billing_transfers;
@@ -152,6 +154,11 @@ pub fn app(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let billing_transfer_ops = if state.billing_transfer_operator_token.is_some() {
+        billing_transfer_ops::router()
+    } else {
+        Router::new()
+    };
     Router::new()
         .merge(health::router())
         .merge(auth::router())
@@ -164,6 +171,7 @@ pub fn app(state: AppState) -> Router {
         .merge(billing::router())
         .merge(billing_transfers)
         .merge(billing_transfer_setup)
+        .merge(billing_transfer_ops)
         .merge(machine::router())
         .merge(notifications::router())
         .merge(sync::router())
