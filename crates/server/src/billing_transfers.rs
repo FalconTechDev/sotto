@@ -244,6 +244,7 @@ pub struct TransferIntent {
     pub destination_provider_subscription_id: Option<String>,
     pub source_provider_subscription_id: Option<String>,
     pub destination_payment_reference: Option<String>,
+    pub destination_period_start: Option<i64>,
     pub destination_period_end: Option<i64>,
     pub destination_expected_period_end: Option<i64>,
     pub source_adjustment_reference: Option<String>,
@@ -324,6 +325,31 @@ pub enum TransferExecutionFailure {
     ProviderOutcomeUnknown,
     LocalEvidenceChanged,
     ProviderRejected,
+}
+
+/// Return the reason a recorded destination payment cannot yet justify completing a transfer.
+/// The invoice period is immutable evidence, so an operator resume must not turn a known mismatch
+/// into accepted payment evidence.
+pub(crate) fn destination_period_mismatch_code(transfer: &TransferIntent) -> Option<&'static str> {
+    transfer.destination_payment_reference.as_ref()?;
+    let Some(period_start) = transfer.destination_period_start else {
+        return Some("destination_period_start_missing");
+    };
+    if period_start != transfer.effective_from {
+        return Some("destination_period_start_mismatch");
+    }
+    let expected_period_end = transfer.destination_expected_period_end.or_else(|| {
+        (transfer.destination_kind == TransferPayer::Personal)
+            .then(|| expected_transfer_period_end(transfer.offer, transfer.effective_from))
+            .flatten()
+    });
+    if expected_period_end.is_none() {
+        return Some("destination_expected_period_end_missing");
+    }
+    if transfer.destination_period_end != expected_period_end {
+        return Some("destination_period_end_mismatch");
+    }
+    None
 }
 
 impl TransferExecutionFailure {
@@ -1392,8 +1418,11 @@ pub async fn record_destination_paid(
     founding_allocator::lock_capacity(tx).await?;
     let current = load_transfer(tx, transfer_id).await?;
     if current
-        .destination_period_end
-        .is_some_and(|recorded_end| recorded_end != invoice_period_end)
+        .destination_period_start
+        .is_some_and(|recorded_start| recorded_start != invoice_period_start)
+        || current
+            .destination_period_end
+            .is_some_and(|recorded_end| recorded_end != invoice_period_end)
     {
         return Err(TransferError::ResultConflict);
     }
@@ -1410,34 +1439,36 @@ pub async fn record_destination_paid(
         None
     };
     if let Some(period_mismatch_code) = period_mismatch_code {
-        let recorded_period_end =
-            (invoice_period_end > current.effective_from).then_some(invoice_period_end);
         let updated = sqlx::query(
             "UPDATE billing_transfer_intents SET \
-             destination_payment_reference = $2, destination_period_end = $3, \
+             destination_payment_reference = $2, destination_period_start = $3, destination_period_end = $4, \
              execution_manual_review_required = TRUE, \
              execution_review_generation = execution_review_generation + CASE \
-                 WHEN execution_manual_review_required AND last_execution_error_code = $4 \
+                 WHEN execution_manual_review_required AND last_execution_error_code = $5 \
                    AND destination_payment_reference = $2 \
-                   AND destination_period_end IS NOT DISTINCT FROM $3 THEN 0 ELSE 1 END, \
-             last_execution_error_code = $4, \
+                   AND destination_period_start IS NOT DISTINCT FROM $3 \
+                   AND destination_period_end IS NOT DISTINCT FROM $4 THEN 0 ELSE 1 END, \
+             last_execution_error_code = $5, \
              execution_next_attempt_at = 'infinity'::timestamptz, \
              execution_lease_token = NULL, execution_lease_until = NULL, updated_at = now() \
              WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
                AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
-               AND (destination_period_end IS NULL OR destination_period_end = $3) \
+               AND (destination_period_start IS NULL OR destination_period_start = $3) \
+               AND (destination_period_end IS NULL OR destination_period_end = $4) \
              RETURNING transfer_id",
         )
         .bind(transfer_id)
         .bind(payment_reference)
-        .bind(recorded_period_end)
+        .bind(invoice_period_start)
+        .bind(invoice_period_end)
         .bind(period_mismatch_code)
         .fetch_optional(&mut **tx)
         .await?;
         if updated.is_none() {
             let current = load_transfer(tx, transfer_id).await?;
             if current.destination_payment_reference.as_deref() != Some(payment_reference)
-                || current.destination_period_end != recorded_period_end
+                || current.destination_period_start != Some(invoice_period_start)
+                || current.destination_period_end != Some(invoice_period_end)
                 || current.last_execution_error_code.as_deref() != Some(period_mismatch_code)
             {
                 return Err(TransferError::ResultConflict);
@@ -1448,14 +1479,16 @@ pub async fn record_destination_paid(
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET \
          state = CASE WHEN state IN ('source_adjustment_pending','unknown') THEN state ELSE 'destination_paid' END, \
-         destination_payment_reference = $2, destination_period_end = $3, \
+         destination_payment_reference = $2, destination_period_start = $3, \
+         destination_period_end = $4, \
          execution_manual_review_required = CASE WHEN state = 'unknown' THEN TRUE \
              ELSE execution_manual_review_required END, \
          execution_review_generation = execution_review_generation + CASE \
              WHEN state = 'unknown' AND (NOT execution_manual_review_required \
                OR last_execution_error_code IS DISTINCT FROM 'destination_invoice_received_while_unknown' \
                OR destination_payment_reference IS DISTINCT FROM $2 \
-               OR destination_period_end IS DISTINCT FROM $3) THEN 1 ELSE 0 END, \
+               OR destination_period_start IS DISTINCT FROM $3 \
+               OR destination_period_end IS DISTINCT FROM $4) THEN 1 ELSE 0 END, \
          last_execution_error_code = CASE WHEN state = 'unknown' \
              THEN 'destination_invoice_received_while_unknown' \
              ELSE last_execution_error_code END, \
@@ -1466,11 +1499,13 @@ pub async fn record_destination_paid(
          updated_at = now() \
          WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
            AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
-           AND (destination_period_end IS NULL OR destination_period_end = $3) \
+           AND (destination_period_start IS NULL OR destination_period_start = $3) \
+           AND (destination_period_end IS NULL OR destination_period_end = $4) \
          RETURNING transfer_id",
     )
     .bind(transfer_id)
     .bind(payment_reference)
+    .bind(invoice_period_start)
     .bind(invoice_period_end)
     .fetch_optional(&mut **tx)
     .await?;
@@ -1482,6 +1517,7 @@ pub async fn record_destination_paid(
                 | TransferState::SourceAdjustmentPending
                 | TransferState::Completed
         ) && current.destination_payment_reference.as_deref() == Some(payment_reference)
+            && current.destination_period_start == Some(invoice_period_start)
             && current.destination_period_end == Some(invoice_period_end)
         {
             return Ok(current);
@@ -2258,6 +2294,60 @@ pub async fn release_execution_lease(
     Ok(row.is_some())
 }
 
+/// Restore the review fence when a resumed transfer still carries a mismatched destination invoice.
+/// This rechecks the row under lock and consumes only the current worker lease.
+pub async fn repark_mismatched_destination_invoice(
+    pool: &PgPool,
+    transfer_id: &str,
+    lease_token: &str,
+) -> Result<bool, TransferError> {
+    if transfer_id.trim().is_empty() || lease_token.trim().is_empty() {
+        return Err(TransferError::InvalidField("execution lease"));
+    }
+    let mut tx = pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx).await?;
+    let row = sqlx::query(
+        "SELECT *, EXTRACT(EPOCH FROM execution_lease_until)::BIGINT AS execution_lease_until_epoch \
+         FROM billing_transfer_intents WHERE transfer_id = $1 FOR UPDATE",
+    )
+    .bind(transfer_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let current = transfer_from_row(&row)?;
+    if current.execution_lease_token.as_deref() != Some(lease_token)
+        || current.execution_manual_review_required
+    {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let Some(reason) = destination_period_mismatch_code(&current) else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let rows = sqlx::query(
+        "UPDATE billing_transfer_intents SET \
+             execution_manual_review_required = TRUE, \
+             execution_review_generation = execution_review_generation + 1, \
+             last_execution_error_code = $3, result_code = 'manual_review_required', \
+             execution_next_attempt_at = 'infinity'::timestamptz, execution_attempt_count = 0, \
+             execution_lease_token = NULL, execution_lease_until = NULL, updated_at = now() \
+         WHERE transfer_id = $1 AND execution_lease_token = $2 \
+           AND NOT execution_manual_review_required",
+    )
+    .bind(transfer_id)
+    .bind(lease_token)
+    .bind(reason)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(rows == 1)
+}
+
 fn transfer_retry_delay_seconds(failure: TransferExecutionFailure, attempts: i32) -> i64 {
     if matches!(failure, TransferExecutionFailure::LocalEvidenceChanged) {
         return MAX_TRANSFER_RETRY_DELAY_SECONDS;
@@ -2616,6 +2706,7 @@ pub(crate) fn transfer_from_row(
             .try_get("destination_provider_subscription_id")?,
         source_provider_subscription_id: row.try_get("source_provider_subscription_id")?,
         destination_payment_reference: row.try_get("destination_payment_reference")?,
+        destination_period_start: row.try_get("destination_period_start")?,
         destination_period_end: row.try_get("destination_period_end")?,
         destination_expected_period_end: row.try_get("destination_expected_period_end")?,
         source_adjustment_reference: row.try_get("source_adjustment_reference")?,

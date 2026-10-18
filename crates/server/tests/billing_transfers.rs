@@ -14,9 +14,9 @@ use sotto_server::billing_transfers::{
     record_destination_paid, record_destination_prepared, record_destination_schedule,
     record_destination_setup_completion, record_operator_review_decision,
     record_source_restoration_payment, record_source_restoration_subscription,
-    release_execution_lease, request_source_restoration, withdraw_transfer, BeginTransfer,
-    TransferError, TransferExecutionFailure, TransferPayer, TransferRequest, TransferReviewAction,
-    TransferState,
+    release_execution_lease, repark_mismatched_destination_invoice, request_source_restoration,
+    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
+    TransferRequest, TransferReviewAction, TransferState,
 };
 use sotto_server::db;
 use sotto_server::founding_allocator::{FoundingDate, FoundingOffer};
@@ -623,7 +623,8 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         .expect("successful progress clears its lease");
     sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'pending', result_code = NULL, \
-         destination_payment_reference = NULL, destination_period_end = NULL, \
+         destination_payment_reference = NULL, destination_period_start = NULL, \
+         destination_period_end = NULL, \
          execution_manual_review_required = FALSE, execution_review_generation = 0, \
          execution_attempt_count = 0, last_execution_error_code = NULL, \
          execution_next_attempt_at = now() WHERE transfer_id = $1",
@@ -905,7 +906,8 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
 
     sqlx::query(
         "UPDATE billing_transfer_intents SET state = 'source_adjustment_pending', \
-             result_code = NULL, destination_payment_reference = NULL, destination_period_end = NULL, \
+             result_code = NULL, destination_payment_reference = NULL, \
+             destination_period_start = NULL, destination_period_end = NULL, \
              execution_manual_review_required = FALSE, last_execution_error_code = NULL, \
              execution_next_attempt_at = now(), execution_lease_token = 'period-review-lease', \
              execution_lease_until = now() + interval '60 seconds' \
@@ -937,6 +939,10 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
     assert_eq!(
         parked.destination_period_end,
         Some(expected_destination_period_end + 1)
+    );
+    assert_eq!(
+        parked.destination_period_start,
+        Some(transfer.effective_from)
     );
     tx.commit()
         .await
@@ -983,7 +989,8 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
 
     sqlx::query(
         "UPDATE billing_transfer_intents SET destination_payment_reference = NULL, \
-             destination_period_end = NULL, execution_manual_review_required = FALSE, \
+             destination_period_start = NULL, destination_period_end = NULL, \
+             execution_manual_review_required = FALSE, \
              last_execution_error_code = NULL, execution_next_attempt_at = now(), \
              execution_lease_token = NULL, execution_lease_until = NULL \
          WHERE transfer_id = $1",
@@ -1007,12 +1014,65 @@ async fn transfer_is_idempotent_and_moves_founding_payer_after_paid_destination(
         parked.last_execution_error_code.as_deref(),
         Some("destination_period_start_mismatch")
     );
+    assert_eq!(
+        parked.destination_period_start,
+        Some(transfer.effective_from + 1)
+    );
     tx.commit()
         .await
         .expect("commit the start mismatch for operator review");
     assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
         .await
         .expect("period-start mismatch also stays parked")
+        .is_none());
+
+    let review_generation = parked.execution_review_generation;
+    let (resumed, _) = record_operator_review_decision(
+        &pool,
+        &transfer.transfer_id,
+        "billing-operator-test",
+        TransferReviewAction::Resume,
+        "retry_period_check",
+        review_generation,
+        "resume-period-mismatch",
+    )
+    .await
+    .expect("resume retries verification without accepting invoice evidence");
+    assert!(!resumed.execution_manual_review_required);
+    let retry = claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("claim resumed mismatch for revalidation")
+        .expect("resumed mismatch is eligible for the ordinary worker");
+    assert_eq!(
+        retry.transfer.destination_period_start,
+        Some(transfer.effective_from + 1)
+    );
+    assert!(repark_mismatched_destination_invoice(
+        &pool,
+        &transfer.transfer_id,
+        &retry.lease_token,
+    )
+    .await
+    .expect("repark the still-mismatched invoice"));
+    let reparked = load_manual_review_transfer(&pool, &transfer.transfer_id)
+        .await
+        .expect("load reparked transfer")
+        .expect("mismatched payment remains in manual review");
+    assert_eq!(
+        reparked.0.execution_review_generation,
+        review_generation + 1
+    );
+    assert_eq!(
+        reparked.0.destination_payment_reference.as_deref(),
+        Some("pi_sponsor_start_mismatch")
+    );
+    assert_eq!(
+        reparked.0.last_execution_error_code.as_deref(),
+        Some("destination_period_start_mismatch")
+    );
+    assert!(claim_transfer_for_execution(&pool, &transfer.transfer_id)
+        .await
+        .expect("reparked invoice stays out of automatic claims")
         .is_none());
 
     cleanup(&pool, &fixture).await;

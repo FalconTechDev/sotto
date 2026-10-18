@@ -50,6 +50,7 @@ pub async fn run_once(
             .await
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
         }
+        Ok(Advance::ParkedForReview) => {}
         Ok(Advance::Advanced) => {
             billing_transfers::finish_execution_lease(
                 pool,
@@ -107,6 +108,7 @@ async fn run(pool: PgPool, provider: Arc<dyn SubscriptionProvider>, catalogue: B
 enum Advance {
     Advanced,
     WaitingForInvoice,
+    ParkedForReview,
 }
 
 #[derive(Debug)]
@@ -130,6 +132,16 @@ async fn advance(
     let transfer = &lease.transfer;
     if transfer.execution_manual_review_required {
         return Err(ExecutionError::Local("operator_review_required"));
+    }
+    if billing_transfers::destination_period_mismatch_code(transfer).is_some() {
+        billing_transfers::repark_mismatched_destination_invoice(
+            pool,
+            &transfer.transfer_id,
+            &lease.lease_token,
+        )
+        .await
+        .map_err(|_| ExecutionError::Local("destination_period_mismatch_review_failed"))?;
+        return Ok(Advance::ParkedForReview);
     }
     if transfer.state == TransferState::SourceRestorationPending {
         return restore_source(pool, provider, catalogue, lease).await;
@@ -1819,6 +1831,31 @@ mod tests {
         assert!(!sponsor_source_adjustment_is_before_boundary(501, 500));
     }
 
+    #[test]
+    fn a_resumed_transfer_does_not_accept_a_mismatched_destination_invoice() {
+        let mut transfer = transfer();
+        transfer.destination_payment_reference = Some("pi_paid".into());
+        transfer.destination_period_start = Some(transfer.effective_from + 1);
+        transfer.destination_period_end = Some(transfer.effective_from + 31 * 86_400);
+        transfer.destination_expected_period_end = Some(transfer.effective_from + 30 * 86_400);
+        assert_eq!(
+            billing_transfers::destination_period_mismatch_code(&transfer),
+            Some("destination_period_start_mismatch")
+        );
+
+        transfer.destination_period_start = Some(transfer.effective_from);
+        assert_eq!(
+            billing_transfers::destination_period_mismatch_code(&transfer),
+            Some("destination_period_end_mismatch")
+        );
+
+        transfer.destination_period_end = transfer.destination_expected_period_end;
+        assert_eq!(
+            billing_transfers::destination_period_mismatch_code(&transfer),
+            None
+        );
+    }
+
     struct TimeoutThenFoundProvider {
         searches: AtomicUsize,
         creates: AtomicUsize,
@@ -1923,6 +1960,7 @@ mod tests {
             destination_provider_subscription_id: Some("sub_destination".into()),
             source_provider_subscription_id: Some("sub_source".into()),
             destination_payment_reference: None,
+            destination_period_start: None,
             destination_period_end: None,
             destination_expected_period_end: None,
             source_adjustment_reference: None,

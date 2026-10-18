@@ -5,6 +5,22 @@ ALTER TABLE billing_transfer_intents
     ADD CONSTRAINT billing_transfer_review_generation_valid
         CHECK (execution_review_generation >= 0);
 
+-- Keep the exact destination invoice period that was accepted or parked for review. A resumed
+-- transfer must be able to re-check the same evidence before it retires the source payer.
+ALTER TABLE billing_transfer_intents
+    DROP CONSTRAINT billing_transfer_destination_period_end_valid,
+    ADD COLUMN destination_period_start BIGINT,
+    ADD CONSTRAINT billing_transfer_destination_period_start_valid CHECK (
+        destination_period_start IS NULL OR destination_period_start > 0
+    ),
+    ADD CONSTRAINT billing_transfer_destination_period_end_valid CHECK (
+        destination_period_end IS NULL OR destination_period_end > 0
+    ),
+    ADD CONSTRAINT billing_transfer_destination_period_order_valid CHECK (
+        destination_period_start IS NULL OR destination_period_end IS NULL
+        OR destination_period_end > destination_period_start
+    );
+
 CREATE TABLE billing_transfer_review_decisions (
     decision_id BIGSERIAL PRIMARY KEY,
     transfer_id TEXT NOT NULL REFERENCES billing_transfer_intents(transfer_id) ON DELETE RESTRICT,
