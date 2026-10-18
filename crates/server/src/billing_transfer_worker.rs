@@ -379,6 +379,8 @@ async fn adjust_source(
         ) {
             return Err(ExecutionError::Local("source_boundary_already_reached"));
         }
+    } else if !sponsor_source_adjustment_is_before_boundary(epoch_now(), transfer.effective_from) {
+        return Err(ExecutionError::Local("source_boundary_already_reached"));
     }
     let mut tx = pool
         .begin()
@@ -1773,6 +1775,10 @@ fn epoch_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn sponsor_source_adjustment_is_before_boundary(now: i64, boundary: i64) -> bool {
+    now < boundary
+}
+
 fn opaque_transfer_id(transfer_id: &str) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(transfer_id.as_bytes())[..8]
@@ -1786,6 +1792,13 @@ mod tests {
     use super::*;
     use crate::billing::{SponsoredSubscriptionItem, SponsoredSubscriptionSnapshot};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn sponsor_source_adjustment_stops_at_the_boundary() {
+        assert!(sponsor_source_adjustment_is_before_boundary(499, 500));
+        assert!(!sponsor_source_adjustment_is_before_boundary(500, 500));
+        assert!(!sponsor_source_adjustment_is_before_boundary(501, 500));
+    }
 
     struct TimeoutThenFoundProvider {
         searches: AtomicUsize,
