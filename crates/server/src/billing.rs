@@ -10331,7 +10331,7 @@ mod tests {
 
         sqlx::query(
             "UPDATE billing_transfer_intents SET state = 'unknown', result_code = 'provider_outcome_unknown', \
-                 destination_payment_reference = NULL, destination_period_end = NULL, \
+                 destination_payment_reference = NULL, destination_period_start = NULL, destination_period_end = NULL, \
                  execution_manual_review_required = FALSE, last_execution_error_code = 'provider_outcome_unknown', \
                  execution_next_attempt_at = now() WHERE transfer_id = $1",
         )
