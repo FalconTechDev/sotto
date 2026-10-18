@@ -5535,7 +5535,7 @@ async fn record_transfer_invoice_payment(
     if recorded_payment.is_some()
         || !matches!(
             state.as_str(),
-            "destination_prepared" | "source_adjustment_pending"
+            "destination_prepared" | "source_adjustment_pending" | "unknown"
         )
     {
         return Ok(());
@@ -10327,6 +10327,59 @@ mod tests {
         assert_eq!(
             review_code.as_deref(),
             Some("destination_period_start_mismatch")
+        );
+
+        sqlx::query(
+            "UPDATE billing_transfer_intents SET state = 'unknown', result_code = 'provider_outcome_unknown', \
+                 destination_payment_reference = NULL, destination_period_end = NULL, \
+                 execution_manual_review_required = FALSE, last_execution_error_code = 'provider_outcome_unknown', \
+                 execution_next_attempt_at = now() WHERE transfer_id = $1",
+        )
+        .bind(&prepared_id)
+        .execute(&pool)
+        .await
+        .expect("park the prepared transfer in unknown for provider review");
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin invoice for unknown transfer");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &prepared_operation,
+            &user_id,
+            TransferPayer::Sponsor,
+            Some(&organization_id),
+            "standard_monthly",
+            "cus_destination",
+            "sub_destination",
+            "pi_unknown_destination",
+            boundary,
+            expected_end,
+        )
+        .await
+        .expect("an invoice for an unknown transfer must be retained for review");
+        tx.commit()
+            .await
+            .expect("commit paid invoice evidence for unknown transfer");
+        let unknown: (String, bool, Option<String>, Option<String>, bool) = sqlx::query_as(
+            "SELECT state, execution_manual_review_required, last_execution_error_code, \
+                    destination_payment_reference, execution_next_attempt_at = 'infinity'::timestamptz \
+             FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&prepared_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read unknown transfer evidence");
+        assert_eq!(unknown.0, "unknown", "the evidence must not move the state");
+        assert!(unknown.1);
+        assert_eq!(
+            unknown.2.as_deref(),
+            Some("destination_invoice_received_while_unknown")
+        );
+        assert_eq!(unknown.3.as_deref(), Some("pi_unknown_destination"));
+        assert!(
+            unknown.4,
+            "manual review remains parked until an operator acts"
         );
 
         sqlx::query("DELETE FROM billing_transfer_intents WHERE transfer_id = ANY($1)")

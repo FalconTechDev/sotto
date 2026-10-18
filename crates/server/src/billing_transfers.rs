@@ -1381,7 +1381,7 @@ pub async fn record_destination_paid(
              execution_manual_review_required = TRUE, \
              last_execution_error_code = $4, \
              execution_next_attempt_at = 'infinity'::timestamptz, updated_at = now() \
-             WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending') \
+             WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
                AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
                AND (destination_period_end IS NULL OR destination_period_end = $3) \
              RETURNING transfer_id",
@@ -1405,9 +1405,17 @@ pub async fn record_destination_paid(
     }
     let updated = sqlx::query(
         "UPDATE billing_transfer_intents SET \
-         state = CASE WHEN state = 'source_adjustment_pending' THEN state ELSE 'destination_paid' END, \
-         destination_payment_reference = $2, destination_period_end = $3, updated_at = now() \
-         WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending') \
+         state = CASE WHEN state IN ('source_adjustment_pending','unknown') THEN state ELSE 'destination_paid' END, \
+         destination_payment_reference = $2, destination_period_end = $3, \
+         execution_manual_review_required = CASE WHEN state = 'unknown' THEN TRUE \
+             ELSE execution_manual_review_required END, \
+         last_execution_error_code = CASE WHEN state = 'unknown' \
+             THEN 'destination_invoice_received_while_unknown' \
+             ELSE last_execution_error_code END, \
+         execution_next_attempt_at = CASE WHEN state = 'unknown' THEN 'infinity'::timestamptz \
+             ELSE execution_next_attempt_at END, \
+         updated_at = now() \
+         WHERE transfer_id = $1 AND state IN ('destination_prepared','source_adjustment_pending','unknown') \
            AND (destination_payment_reference IS NULL OR destination_payment_reference = $2) \
            AND (destination_period_end IS NULL OR destination_period_end = $3) \
          RETURNING transfer_id",
