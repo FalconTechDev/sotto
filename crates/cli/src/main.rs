@@ -166,6 +166,11 @@ enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Start a local MCP server over stdio for project-declared agent tasks.
+    #[command(
+        after_help = "The server uses stdin/stdout for MCP messages. Configure your MCP host to launch `sotto mcp` from the project directory. Run `sotto unlock` separately before calling run_task."
+    )]
+    Mcp,
     /// Show identity, session, and project status.
     Status {
         /// Output as a JSON object.
@@ -585,6 +590,10 @@ fn run() -> Result<()> {
         std::process::exit(2);
     }
 
+    if matches!(&cli.command, Some(Command::Mcp)) {
+        return run_mcp_server();
+    }
+
     let store_path = sotto_cli::paths::store_path()?;
     if let Some(parent) = store_path.parent() {
         std::fs::create_dir_all(parent)
@@ -769,6 +778,9 @@ fn run() -> Result<()> {
                 })?,
             ),
         },
+        Command::Mcp => Err(Error::Input(
+            "MCP server must start before local command setup".into(),
+        )),
         Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -979,6 +991,39 @@ fn run_approved_task_cli(app: &App, cwd: &Path, task_name: &str, environment: &s
         }
         _ => Err(Error::Input(outcome.summary())),
     }
+}
+
+fn run_mcp_server() -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (_, discovered_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&discovered_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    // Fail startup before creating local Sotto state if the project's task declaration is
+    // missing or invalid. The server reloads it for listing and the runner revalidates on launch.
+    sotto_cli::agent_tasks::TaskManifest::load_from(&project_root)?;
+    let approvals = open_task_approval_store(&project_root)?;
+
+    let store_path = sotto_cli::paths::store_path()?;
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Error::Io(format!("creating {}: {error}", parent.display())))?;
+    }
+    let store = Store::open(&store_path)?;
+    let keychain = OsKeychain::new(KEYCHAIN_SERVICE);
+
+    // MCP does not need the machine token, unlock password, or secret key from its parent
+    // environment. Unlock must have happened separately and is read from the OS keychain.
+    for name in ["SOTTO_TOKEN", "SOTTO_PASSWORD", "SOTTO_SECRET_KEY"] {
+        std::env::remove_var(name);
+    }
+
+    let server =
+        sotto_cli::agent_mcp::SottoMcpServer::new(project_root, store, keychain, approvals);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Io(format!("starting MCP runtime: {error}")))?;
+    runtime.block_on(sotto_cli::agent_mcp::serve_stdio(server))
 }
 
 fn approve_task(name: &str, environment: &str) -> Result<()> {
