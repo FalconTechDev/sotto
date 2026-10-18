@@ -452,10 +452,30 @@ mod tests {
             )
             .unwrap();
         let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
-        session::lock(server.state.lock().unwrap().keychain.as_ref()).unwrap();
-        let locked = server
-            .execute_task("verify", "dev", std::future::pending())
+        let state = server.state.clone();
+        session::lock(state.lock().unwrap().keychain.as_ref()).unwrap();
+        let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let mut client = ().serve(client_transport).await.unwrap();
+        let locked = client
+            .call_tool(
+                CallToolRequestParams::new(RUN_TASK).with_arguments(
+                    json!({"task":"verify", "environment":"dev"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
             .await;
+        let locked = locked.unwrap();
         assert_eq!(locked.is_error, Some(true));
         assert_eq!(
             locked.structured_content.as_ref().unwrap()["task"],
@@ -472,7 +492,7 @@ mod tests {
         assert!(!marker.exists());
 
         {
-            let state = server.state.lock().unwrap();
+            let state = state.lock().unwrap();
             session::unlock(
                 &state.store,
                 state.keychain.as_ref(),
@@ -482,15 +502,25 @@ mod tests {
             .unwrap();
         }
         std::thread::sleep(Duration::from_millis(10));
-        let expired = server
-            .execute_task("verify", "dev", std::future::pending())
+        let expired = client
+            .call_tool(
+                CallToolRequestParams::new(RUN_TASK).with_arguments(
+                    json!({"task":"verify", "environment":"dev"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
             .await;
+        let expired = expired.unwrap();
         assert_eq!(expired.is_error, Some(true));
         assert!(expired.structured_content.as_ref().unwrap()["summary"]
             .as_str()
             .unwrap()
             .contains("sotto unlock"));
         assert!(!marker.exists());
+        client.close().await.unwrap();
+        server_task.await.unwrap();
     }
 
     #[cfg(unix)]
@@ -655,7 +685,7 @@ mod tests {
         let marker = root.path().join("should-not-finish");
         let manifest = format!(
             "version = 1\n\n[[task]]\nname = \"slow\"\ndescription = \"Cancellation test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", {:?}]\nenvironments = [\"dev\"]\n",
-            format!("touch {:?}; sleep 10; touch {:?}", started, marker)
+            format!("touch {:?}; sleep 1; touch {:?}", started, marker)
         );
         std::fs::write(root.path().join("sotto.tasks.toml"), manifest).unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
@@ -676,14 +706,30 @@ mod tests {
             )
             .unwrap();
         let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
-        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
-        let run = tokio::spawn(async move {
+        let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
             server
-                .execute_task("slow", "dev", async move {
-                    let _ = cancelled.await;
-                })
+                .serve(server_transport)
                 .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
         });
+        let mut client = ().serve(client_transport).await.unwrap();
+        let arguments = json!({"task":"slow", "environment":"dev"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let request =
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new(RUN_TASK).with_arguments(arguments),
+            ));
+        let handle = client
+            .peer()
+            .send_cancellable_request(request, rmcp::service::PeerRequestOptions::no_options())
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !started.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -691,15 +737,19 @@ mod tests {
         })
         .await
         .expect("task child should start before cancellation");
-        let _ = cancel.send(());
-
-        let result = run.await.unwrap();
-
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.structured_content.as_ref().unwrap()["status"],
-            "cancelled"
-        );
+        handle
+            .cancel(Some("test cancellation".into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect_err("cancelled task must not complete its post-sleep action");
         assert!(!marker.exists());
+        client.close().await.unwrap();
+        server_task.await.unwrap();
     }
 }
