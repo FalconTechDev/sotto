@@ -352,4 +352,24 @@ describe("CloudAccountPanel", () => {
     expect(await screen.findByText("Your Cloud renewal is up to date")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Update payment method" })).not.toBeInTheDocument();
   });
+
+  it("directs sponsored renewal actions to organisation admins instead of personal billing", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "renewal_recovery" });
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+      noticeId: "sponsored-notice-1", kind: "sponsored_renewal_action", channel: "in_app",
+      content: {
+        title: "Organisation Cloud renewal needs attention",
+        detail: "The organisation’s sponsored Cloud renewal payment was unsuccessful. Review the organisation billing panel before the recovery deadline.",
+        effectiveAtEpoch: 1_900_000_000, deadlineEpoch: 1_901_209_600, amountPence: null,
+      },
+      dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null,
+      deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
+    }]);
+
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByText(/Review the organisation billing panel/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update payment method" })).not.toBeInTheDocument();
+    expect(api.createPersonalPortal).not.toHaveBeenCalled();
+  });
 });
