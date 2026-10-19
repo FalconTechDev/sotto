@@ -219,9 +219,11 @@ impl StripeRefreshExecutor {
                     .map_err(|_| "refresh_sponsored_renewals")?,
                 );
             }
-            let collection = if event.subscription_id.as_deref()
-                == Some(anchor.subscription_id.as_str())
-            {
+            let collection = if use_triggering_sponsored_invoice(
+                &event.event_type,
+                event.subscription_id.as_deref(),
+                &anchor.subscription_id,
+            ) {
                 collect_sponsored_collection(
                     &self.pool,
                     &self.stripe,
@@ -273,6 +275,14 @@ impl StripeRefreshExecutor {
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
+}
+
+fn use_triggering_sponsored_invoice(
+    event_type: &str,
+    event_subscription_id: Option<&str>,
+    allocation_subscription_id: &str,
+) -> bool {
+    event_type == "invoice.paid" && event_subscription_id == Some(allocation_subscription_id)
 }
 
 fn refresh_input_matches_stripe(
@@ -497,6 +507,25 @@ mod tests {
             "invoice.paid",
             &personal_config(),
             &sponsored_config(),
+        ));
+    }
+
+    #[test]
+    fn only_paid_events_use_the_triggering_sponsored_invoice() {
+        assert!(use_triggering_sponsored_invoice(
+            "invoice.paid",
+            Some("sub_sponsor"),
+            "sub_sponsor"
+        ));
+        assert!(!use_triggering_sponsored_invoice(
+            "invoice.payment_failed",
+            Some("sub_sponsor"),
+            "sub_sponsor"
+        ));
+        assert!(!use_triggering_sponsored_invoice(
+            "invoice.paid",
+            Some("sub_other"),
+            "sub_sponsor"
         ));
     }
 }
