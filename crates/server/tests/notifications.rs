@@ -11,6 +11,7 @@ use sqlx::{PgPool, Row};
 use std::str::FromStr;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration, Instant};
 use tower::ServiceExt;
 
 use sotto_server::cloud_coverage::{evaluate, ConfirmedPaidInterval, PersonCoverage};
@@ -477,6 +478,126 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
     .expect("count pending export notices after missing projection");
     assert_eq!(preserved_count, 1);
 
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn concurrent_coverage_publication_rejects_a_stale_export_notice() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-export-concurrent";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    let ended_at = now_epoch - 24 * 60 * 60;
+    let old_intervals = vec![ConfirmedPaidInterval {
+        coverage_id: "concurrent-old-term".into(),
+        source_id: "concurrent-source".into(),
+        starts_at: ended_at - 30 * 24 * 60 * 60,
+        paid_until: ended_at,
+        failed_renewal_id: None,
+    }];
+    let old_revision = publish_coverage(
+        &pool,
+        USER_ID,
+        None,
+        "concurrent-export-old",
+        old_intervals.clone(),
+    )
+    .await;
+    let stale_view = eligibility_for(
+        PersonCoverage {
+            beneficiary_id: USER_ID.into(),
+            paid_intervals: old_intervals.clone(),
+        },
+        now_epoch,
+    );
+    assert_eq!(
+        stale_view.state,
+        sotto_server::person_eligibility::EligibilityState::ExportOnly
+    );
+
+    let mut writer = pool.begin().await.expect("begin concurrent publication");
+    let holder_pid: i32 = sqlx::query_scalar(
+        "SELECT pg_backend_pid() FROM cloud_coverage_heads \
+         WHERE beneficiary_id=$1 FOR UPDATE",
+    )
+    .bind(USER_ID)
+    .fetch_one(&mut *writer)
+    .await
+    .expect("lock coverage head for publication");
+    let reconcile_pool = pool.clone();
+    let reconcile = tokio::spawn(async move {
+        notifications::reconcile_export_deadline_notice(
+            &reconcile_pool,
+            USER_ID,
+            &stale_view,
+            Some(old_revision),
+            now_epoch,
+        )
+        .await
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiter_pid: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND $1=ANY(pg_blocking_pids(pid)) \
+               AND wait_event_type='Lock' AND query ILIKE '%cloud_coverage_heads%' \
+               AND query ILIKE '%FOR SHARE%' LIMIT 1",
+        )
+        .bind(holder_pid)
+        .fetch_optional(&pool)
+        .await
+        .expect("inspect export reconciliation lock wait");
+        if waiter_pid.is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "export reconciliation did not wait for the coverage head lock"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    let mut current_intervals = old_intervals;
+    current_intervals.push(ConfirmedPaidInterval {
+        coverage_id: "concurrent-new-term".into(),
+        source_id: "concurrent-new-source".into(),
+        starts_at: now_epoch - 60,
+        paid_until: now_epoch + 30 * 24 * 60 * 60,
+        failed_renewal_id: None,
+    });
+    cloud_coverage_store::publish(
+        &mut writer,
+        USER_ID,
+        Some(old_revision),
+        "concurrent-export-new",
+        "evidence-concurrent-export-new",
+        &CoverageProjection::Complete {
+            paid_intervals: current_intervals,
+        },
+    )
+    .await
+    .expect("publish new source while holding head lock");
+    writer
+        .commit()
+        .await
+        .expect("commit concurrent publication");
+
+    assert!(!reconcile
+        .await
+        .expect("join export notice reconciliation")
+        .expect("reconcile stale export view"));
+    assert!(notifications::list_for_user(&pool, USER_ID)
+        .await
+        .expect("no stale notice after concurrent publication")
+        .is_empty());
     cleanup(&pool, USER_ID).await;
 }
 
