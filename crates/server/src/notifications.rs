@@ -297,7 +297,7 @@ pub async fn reconcile_export_deadline_notice(
 
     // Unavailable means the source set cannot be trusted. Keep the last durable result intact;
     // an unavailable snapshot cannot prove that an earlier export notice is stale.
-    if view.state == EligibilityState::Unavailable || view.state == EligibilityState::Expired {
+    if view.state == EligibilityState::Unavailable {
         return Ok(true);
     }
     if coverage_revision.is_none() {
@@ -350,7 +350,7 @@ pub async fn reconcile_export_deadline_notice(
         // race into a failed eligibility request or create a notice after the deadline.
         if deadline <= now_epoch {
             tx.commit().await?;
-            return Ok(true);
+            return Ok(false);
         }
         if effective_at <= 0 || effective_at > now_epoch {
             return Err(NoticeError::InvalidContent(

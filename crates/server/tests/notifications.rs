@@ -243,6 +243,15 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
     )
     .await
     .expect("replay export notice"));
+    assert!(!notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &view,
+        Some(revision),
+        deadline,
+    )
+    .await
+    .expect("retry eligibility when the deadline passes during the read"));
 
     let notices = notifications::list_for_user(&pool, USER_ID)
         .await
@@ -482,6 +491,92 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
 }
 
 #[tokio::test]
+async fn expired_export_episode_cancels_its_pending_notice_with_an_audit_row() {
+    let _guard = notification_test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-export-expired";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&pool)
+        .await
+        .expect("read database time");
+    let paid_until = now_epoch - 3 * 24 * 60 * 60;
+    let intervals = vec![ConfirmedPaidInterval {
+        coverage_id: "expired-export-term".into(),
+        source_id: "expired-export-source".into(),
+        starts_at: paid_until - 30 * 24 * 60 * 60,
+        paid_until,
+        failed_renewal_id: None,
+    }];
+    let revision = publish_coverage(
+        &pool,
+        USER_ID,
+        None,
+        "expired-export-episode",
+        intervals.clone(),
+    )
+    .await;
+    let coverage = PersonCoverage {
+        beneficiary_id: USER_ID.into(),
+        paid_intervals: intervals,
+    };
+    let export_view = eligibility_for(coverage.clone(), now_epoch);
+    let deadline = paid_until + sotto_server::cloud_coverage::EXPORT_WINDOW_SECONDS;
+    assert_eq!(
+        export_view.state,
+        sotto_server::person_eligibility::EligibilityState::ExportOnly
+    );
+    assert!(notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &export_view,
+        Some(revision),
+        now_epoch,
+    )
+    .await
+    .expect("queue export notice while deadline is open"));
+    assert_eq!(
+        notifications::list_for_user(&pool, USER_ID)
+            .await
+            .expect("list export notice before deadline")
+            .len(),
+        1
+    );
+
+    let expired_view = eligibility_for(coverage, deadline);
+    assert_eq!(
+        expired_view.state,
+        sotto_server::person_eligibility::EligibilityState::Expired
+    );
+    assert!(notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &expired_view,
+        Some(revision),
+        deadline,
+    )
+    .await
+    .expect("cancel notice once the export deadline is reached"));
+    assert!(notifications::list_for_user(&pool, USER_ID)
+        .await
+        .expect("expired notice is no longer presented as current")
+        .is_empty());
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND kind='export_deadline' AND policy_key='cloud-export-deadline-v1'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("read expired notice audit row");
+    assert_eq!(status, "cancelled");
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
 async fn concurrent_coverage_publication_rejects_a_stale_export_notice() {
     let _guard = notification_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
@@ -609,10 +704,13 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
     };
     const USER_ID: &str = "notification-test-export-route";
     const OTHER_USER_ID: &str = "notification-test-export-other";
+    const CORRUPT_USER_ID: &str = "notification-test-export-corrupt";
     cleanup(&pool, USER_ID).await;
     cleanup(&pool, OTHER_USER_ID).await;
+    cleanup(&pool, CORRUPT_USER_ID).await;
     seed_user(&pool, USER_ID).await;
     seed_user(&pool, OTHER_USER_ID).await;
+    seed_user(&pool, CORRUPT_USER_ID).await;
     sqlx::query("UPDATE users SET public_key=$2 WHERE id=$1")
         .bind(USER_ID)
         .bind(vec![7_u8; 32])
@@ -666,6 +764,7 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             billing_transfer_setup_enabled: false,
         });
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -697,8 +796,53 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
         .expect("other recipient cannot see export notice")
         .is_empty());
 
+    let corrupt_paid_until = now_epoch - 24 * 60 * 60;
+    let corrupt_revision = publish_coverage(
+        &pool,
+        CORRUPT_USER_ID,
+        None,
+        "corrupt-export-route-episode",
+        vec![ConfirmedPaidInterval {
+            coverage_id: "corrupt-export-term".into(),
+            source_id: "corrupt-export-source".into(),
+            starts_at: corrupt_paid_until - 30 * 24 * 60 * 60,
+            paid_until: corrupt_paid_until,
+            failed_renewal_id: None,
+        }],
+    )
+    .await;
+    sqlx::query(
+        "UPDATE cloud_coverage_revisions SET fact_count=fact_count+1 \
+         WHERE beneficiary_id=$1 AND revision=$2",
+    )
+    .bind(CORRUPT_USER_ID)
+    .bind(corrupt_revision)
+    .execute(&pool)
+    .await
+    .expect("corrupt stored projection count");
+    let corrupt_token = sotto_server::auth::session::issue(&pool, CORRUPT_USER_ID)
+        .await
+        .expect("issue corrupt-evidence test session");
+    let corrupt_response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/account/eligibility")
+                .header("authorization", format!("Bearer {corrupt_token}"))
+                .body(Body::empty())
+                .expect("build corrupt eligibility request"),
+        )
+        .await
+        .expect("request eligibility with corrupt evidence");
+    assert_eq!(corrupt_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(notifications::list_for_user(&pool, CORRUPT_USER_ID)
+        .await
+        .expect("list notices for corrupt account")
+        .is_empty());
+
     cleanup(&pool, USER_ID).await;
     cleanup(&pool, OTHER_USER_ID).await;
+    cleanup(&pool, CORRUPT_USER_ID).await;
 }
 
 fn paid_view_coverage(previous: &PersonCoverage, live_until: i64) -> Vec<ConfirmedPaidInterval> {
