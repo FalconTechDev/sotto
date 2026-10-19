@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::cloud_coverage::{ConfirmedPaidInterval, PersonCoverage};
 use crate::cloud_coverage_reconciliation::SourceObservation;
 use crate::cloud_provider::{PayerKind, ProviderEnvironment};
+use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
 
 const SEMANTIC_DOMAIN: &[u8] = b"sotto-stripe-sponsored-coverage-v1\0";
 
@@ -133,6 +134,17 @@ impl SponsoredStripeCoverageConfig {
         ]
         .into_iter()
         .find_map(|(id, class)| (id == price_id).then_some(class))
+    }
+
+    pub(crate) fn stripe_interval_for_price(
+        &self,
+        price_id: &str,
+    ) -> Option<crate::cloud_provider_stripe::StripeInterval> {
+        self.price_class(price_id)
+            .map(|price_class| match price_class.interval() {
+                SponsoredInterval::Month => crate::cloud_provider_stripe::StripeInterval::Month,
+                SponsoredInterval::Year => crate::cloud_provider_stripe::StripeInterval::Year,
+            })
     }
 }
 
@@ -680,6 +692,18 @@ pub fn compose_sponsored_coverage(
     manifest: &SponsoredAllocationManifest,
     settlement: &SponsoredInvoiceSettlement,
 ) -> Result<SponsoredCoverageResult, SponsoredCoverageError> {
+    compose_sponsored_coverage_with_renewal_failures(config, manifest, settlement, &[])
+}
+
+/// Compose paid sponsored terms with only the renewal failures linked to that exact predecessor
+/// invoice and allocation. The failure never changes the paid interval itself; the shared
+/// eligibility policy derives the existing recovery window from its stable renewal identity.
+pub fn compose_sponsored_coverage_with_renewal_failures(
+    config: &SponsoredStripeCoverageConfig,
+    manifest: &SponsoredAllocationManifest,
+    settlement: &SponsoredInvoiceSettlement,
+    renewal_failures: &[StripeRenewalFailureEvidence],
+) -> Result<SponsoredCoverageResult, SponsoredCoverageError> {
     config.validate()?;
     settlement.validate()?;
     check_context(config, manifest, settlement)?;
@@ -765,12 +789,25 @@ pub fn compose_sponsored_coverage(
             }
             for allocation in active {
                 let coverage_id = coverage_id(settlement, allocation, price_class, start, end);
+                let failed_renewal_id = if end == line.period_end() {
+                    sponsored_failure_for_predecessor(
+                        config,
+                        manifest,
+                        renewal_failures,
+                        allocation,
+                        settlement,
+                        line,
+                    )?
+                    .map(|failure| failure.renewal_id().to_owned())
+                } else {
+                    None
+                };
                 let interval = ConfirmedPaidInterval {
                     coverage_id,
                     source_id: allocation.source_id().to_owned(),
                     starts_at: start,
                     paid_until: end,
-                    failed_renewal_id: None,
+                    failed_renewal_id,
                 };
                 let term = SponsoredBeneficiaryPaidTerm {
                     allocation_reference: allocation.allocation_reference().to_owned(),
@@ -820,6 +857,124 @@ pub fn compose_sponsored_coverage(
             beneficiaries,
         },
     ))
+}
+
+fn sponsored_failure_for_predecessor<'a>(
+    config: &SponsoredStripeCoverageConfig,
+    manifest: &SponsoredAllocationManifest,
+    failures: &'a [StripeRenewalFailureEvidence],
+    allocation: &SponsoredAllocationInterval,
+    settlement: &SponsoredInvoiceSettlement,
+    line: &SponsoredInvoiceLine,
+) -> Result<Option<&'a StripeRenewalFailureEvidence>, SponsoredCoverageError> {
+    let expected_interval = match config.price_class(line.price_id()) {
+        Some(SponsoredPriceClass::StandardMonthly | SponsoredPriceClass::FoundingMonthly) => {
+            crate::cloud_provider_stripe::StripeInterval::Month
+        }
+        Some(SponsoredPriceClass::StandardAnnual | SponsoredPriceClass::FoundingAnnual) => {
+            crate::cloud_provider_stripe::StripeInterval::Year
+        }
+        None => return Ok(None),
+    };
+    let expected_predecessor_reference =
+        sponsored_predecessor_evidence_reference(manifest, settlement);
+    let linked = failures
+        .iter()
+        .filter(|failure| {
+            failure.allocation_reference() == allocation.allocation_reference()
+                && failure.subscription_id() == settlement.subscription_id
+                && failure.customer_id() == settlement.customer_id
+                && failure.provider_item_id() == line.provider_item_id()
+                && failure.predecessor_invoice_id() == settlement.invoice_id
+                && failure.predecessor_period_start() == line.period_start()
+                && failure.predecessor_period_end() == line.period_end()
+                && failure.predecessor_evidence_reference() == expected_predecessor_reference
+                && failure.renewal_period_start() == line.period_end()
+                && failure.provider_price_id() == Some(line.price_id())
+                && failure.interval() == expected_interval
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = linked.first().copied() else {
+        return Ok(None);
+    };
+    if linked.iter().any(|failure| {
+        failure.renewal_id() != first.renewal_id()
+            || failure.invoice_line_id() != first.invoice_line_id()
+            || failure.predecessor_evidence_reference() != first.predecessor_evidence_reference()
+            || failure.renewal_period_end() != first.renewal_period_end()
+    }) {
+        return Err(SponsoredCoverageError::InvalidInput(
+            "sponsored renewal failures disagree for one predecessor allocation",
+        ));
+    }
+    Ok(linked
+        .into_iter()
+        .min_by_key(|failure| (failure.event_created_at(), failure.event_id())))
+}
+
+/// Stable identity for a verified paid invoice together with its exact dated allocation manifest.
+/// A renewal failure stores this value so a changed seat set, item price or interval cannot reuse
+/// yesterday's predecessor proof.
+pub(crate) fn sponsored_predecessor_evidence_reference(
+    manifest: &SponsoredAllocationManifest,
+    settlement: &SponsoredInvoiceSettlement,
+) -> String {
+    let mut allocations = manifest.allocations().iter().collect::<Vec<_>>();
+    allocations.sort_by(|left, right| {
+        (
+            left.allocation_reference(),
+            left.source_id(),
+            left.beneficiary_id(),
+            left.provider_item_id(),
+            left.price_id(),
+            left.effective_from(),
+            left.effective_until(),
+        )
+            .cmp(&(
+                right.allocation_reference(),
+                right.source_id(),
+                right.beneficiary_id(),
+                right.provider_item_id(),
+                right.price_id(),
+                right.effective_from(),
+                right.effective_until(),
+            ))
+    });
+    let mut bytes = SEMANTIC_DOMAIN.to_vec();
+    for value in [
+        manifest.account_id(),
+        manifest.customer_id(),
+        manifest.subscription_id(),
+        settlement.invoice_id(),
+        settlement.evidence_reference(),
+    ] {
+        bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    bytes.extend_from_slice(&settlement.period_start().to_be_bytes());
+    bytes.extend_from_slice(&settlement.period_end().to_be_bytes());
+    for allocation in allocations {
+        for value in [
+            allocation.allocation_reference(),
+            allocation.source_id(),
+            allocation.beneficiary_id(),
+            allocation.provider_item_id(),
+            allocation.price_id(),
+        ] {
+            bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        bytes.extend_from_slice(&allocation.effective_from().to_be_bytes());
+        match allocation.effective_until() {
+            Some(until) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&until.to_be_bytes());
+            }
+            None => bytes.push(0),
+        }
+    }
+    let digest = Sha256::digest(bytes);
+    format!("stripe-sponsored-predecessor-v1:{digest:x}")
 }
 
 fn check_context(
@@ -996,6 +1151,135 @@ mod tests {
         assert_eq!(coverages[0].beneficiary_id, "user_1");
         assert_eq!(coverages[0].paid_intervals.len(), 1);
         assert_eq!(candidate.source_observations().len(), 2);
+    }
+
+    #[test]
+    fn linked_grouped_renewal_failure_marks_only_the_matching_paid_interval() {
+        let cfg = config();
+        let predecessor_manifest = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![allocation(
+                "a_1",
+                "user_1",
+                "item_1",
+                "price_standard_month",
+                0,
+                None,
+            )],
+        )
+        .unwrap();
+        let predecessor = SponsoredInvoiceSettlement::new(
+            "in_previous",
+            "cus_1",
+            "sub_1",
+            0,
+            100,
+            "gbp",
+            1000,
+            1000,
+            "pi_previous",
+            "paid_previous",
+            vec![SponsoredInvoiceLine::new(
+                "il_previous",
+                "item_1",
+                "price_standard_month",
+                0,
+                100,
+                1,
+                false,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let predecessor_reference =
+            sponsored_predecessor_evidence_reference(&predecessor_manifest, &predecessor);
+        let failure = crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
+            "evt_failed", "in_failed", "il_failed", "in_previous", &predecessor_reference,
+            "acct_test", ProviderEnvironment::Test, "a_1", "cus_1", "sub_1", "item_1",
+            "price_standard_month", 0, 100, 100, 200, 150, crate::cloud_provider_stripe::StripeInterval::Month,
+        ).unwrap();
+        let result = compose_sponsored_coverage_with_renewal_failures(
+            &cfg,
+            &predecessor_manifest,
+            &predecessor,
+            std::slice::from_ref(&failure),
+        )
+        .unwrap();
+        let SponsoredCoverageResult::Candidate(candidate) = result else {
+            panic!("expected candidate")
+        };
+        assert_eq!(
+            candidate.person_coverages()[0].paid_intervals[0]
+                .failed_renewal_id
+                .as_deref(),
+            Some(failure.renewal_id())
+        );
+    }
+
+    #[test]
+    fn sponsored_renewal_failure_cannot_attach_to_a_different_predecessor() {
+        let cfg = config();
+        let manifest = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![allocation(
+                "a_1",
+                "user_1",
+                "item_1",
+                "price_standard_month",
+                0,
+                None,
+            )],
+        )
+        .unwrap();
+        let previous = SponsoredInvoiceSettlement::new(
+            "in_previous",
+            "cus_1",
+            "sub_1",
+            0,
+            100,
+            "gbp",
+            1000,
+            1000,
+            "pi_previous",
+            "paid_previous",
+            vec![SponsoredInvoiceLine::new(
+                "il_previous",
+                "item_1",
+                "price_standard_month",
+                0,
+                100,
+                1,
+                false,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let reference = sponsored_predecessor_evidence_reference(&manifest, &previous);
+        let failure = crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
+            "evt_failed", "in_failed", "il_failed", "in_other", &reference,
+            "acct_test", ProviderEnvironment::Test, "a_1", "cus_1", "sub_1", "item_1",
+            "price_standard_month", 0, 100, 100, 200, 150, crate::cloud_provider_stripe::StripeInterval::Month,
+        ).unwrap();
+        let result = compose_sponsored_coverage_with_renewal_failures(
+            &cfg,
+            &manifest,
+            &previous,
+            &[failure],
+        )
+        .unwrap();
+        let SponsoredCoverageResult::Candidate(candidate) = result else {
+            panic!("expected candidate")
+        };
+        assert_eq!(
+            candidate.person_coverages()[0].paid_intervals[0].failed_renewal_id,
+            None
+        );
     }
 
     #[test]

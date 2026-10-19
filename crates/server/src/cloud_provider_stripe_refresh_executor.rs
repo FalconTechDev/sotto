@@ -206,6 +206,19 @@ impl StripeRefreshExecutor {
                 group.iter().map(|detail| detail.binding.clone()).collect(),
             );
             let anchor = &group[0].allocation;
+            let mut renewal_failures = Vec::new();
+            for detail in group {
+                renewal_failures.extend(
+                    crate::cloud_provider_stripe_renewal_store::load_renewal_failures(
+                        &self.pool,
+                        context,
+                        &detail.allocation,
+                        Default::default(),
+                    )
+                    .await
+                    .map_err(|_| "refresh_sponsored_renewals")?,
+                );
+            }
             let collection = if event.subscription_id.as_deref()
                 == Some(anchor.subscription_id.as_str())
             {
@@ -218,6 +231,7 @@ impl StripeRefreshExecutor {
                     anchor,
                     &sponsor_ticket,
                     self.sponsored_limits,
+                    &renewal_failures,
                 )
                 .await
             } else {
@@ -229,6 +243,7 @@ impl StripeRefreshExecutor {
                     anchor,
                     &sponsor_ticket,
                     self.sponsored_limits,
+                    &renewal_failures,
                 )
                 .await
             }

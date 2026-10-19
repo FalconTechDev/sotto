@@ -1486,6 +1486,91 @@ impl StripeReadClient {
         )
     }
 
+    /// Read the current failed sponsored renewal invoice and its complete, bounded line list.
+    /// Only an open automatic cycle invoice is usable. A closed invoice returns `None` because a
+    /// late failure delivery must not create recovery evidence or trigger a webhook retry.
+    pub async fn sponsored_failure_invoice(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+        customer_id: &str,
+        subscription_id: &str,
+    ) -> Result<Option<(StripeInvoiceResource, Vec<StripeInvoiceLineResource>)>, StripeReadError>
+    {
+        let invoice = self.invoice(session, invoice_id).await?;
+        if invoice.parent_type.as_deref() != Some("subscription_details")
+            || invoice.customer_id.as_deref() != Some(customer_id)
+            || invoice.subscription_id.as_deref() != Some(subscription_id)
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::ContextMismatch,
+            ));
+        }
+        // A failed webhook can arrive after the same invoice was paid or otherwise closed. That
+        // is a stale delivery, not a reason to create recovery evidence or retry the webhook.
+        match invoice.status.as_deref() {
+            Some("open") => {}
+            Some("paid" | "void" | "uncollectible") => return Ok(None),
+            Some(_) => {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::UnsupportedSettlement(
+                        "sponsored renewal invoice is not open or closed",
+                    ),
+                ));
+            }
+            None => return Err(StripeReadError::MalformedResponse("invoice.status")),
+        }
+        if invoice.billing_reason.as_deref() != Some("subscription_cycle")
+            || invoice.collection_method.as_deref() != Some("charge_automatically")
+            || invoice.currency.as_deref() != Some("gbp")
+            || invoice.amount_due.is_none_or(|amount| amount <= 0)
+            || invoice.amount_remaining != invoice.amount_due
+            || invoice.amount_paid != Some(0)
+            || invoice.amount_overpaid != Some(0)
+            || invoice.amount_paid_off_stripe != Some(0)
+            || invoice.livemode != Some(matches!(self.environment, ProviderEnvironment::Live))
+        {
+            return Err(StripeReadError::Observation(
+                StripeContractError::UnsupportedSettlement(
+                    "sponsored renewal is not a complete open automatic cycle invoice",
+                ),
+            ));
+        }
+        let lines = self.invoice_lines(session, invoice_id).await?;
+        if lines.is_empty() {
+            return Err(StripeReadError::MalformedResponse("lines.data"));
+        }
+        for line in &lines {
+            if line.invoice_id.as_deref() != Some(invoice_id)
+                || line.parent_type.as_deref() != Some("subscription_item_details")
+                || line.pricing_type.as_deref() != Some("price_details")
+                || line.subscription_id.as_deref() != Some(subscription_id)
+                || line
+                    .subscription_item_id
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || line.price_id.as_deref().is_none_or(str::is_empty)
+                || line.livemode != Some(matches!(self.environment, ProviderEnvironment::Live))
+                || line.quantity.is_none_or(|quantity| quantity <= 0)
+                || line.period_start.is_none_or(|start| start < 0)
+                || line
+                    .period_end
+                    .zip(line.period_start)
+                    .is_none_or(|(end, start)| end <= start)
+            {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::ContextMismatch,
+                ));
+            }
+            if line.proration != Some(false) {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::UnsupportedRenewal("sponsored proration"),
+                ));
+            }
+        }
+        Ok(Some((invoice, lines)))
+    }
+
     async fn list_bounded<T, F>(
         &self,
         session: &mut StripeReadSession,
