@@ -1397,6 +1397,11 @@ async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoic
     .await
     .expect("load recovery resolved notice");
     assert_eq!(resolved_notice["title"], "Your Cloud renewal is up to date");
+    let visible_notices = sotto_server::notifications::list_for_user(&pool, &user_id)
+        .await
+        .expect("list renewal notices after payment");
+    assert_eq!(visible_notices.len(), 1);
+    assert_eq!(visible_notices[0].kind, "recovery_resolved");
     let failed_after_recovery: (String, serde_json::Value) = sqlx::query_as(
         "SELECT event_key, payload FROM cloud_notice_outbox \
          WHERE recipient_user_id=$1 AND kind='failed_renewal'",

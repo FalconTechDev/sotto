@@ -7504,6 +7504,19 @@ async fn enqueue_personal_renewal_recovered_notice(
     if !failed_notice_exists {
         return Ok(());
     }
+    // A successful retry makes the original warning obsolete. Retire it in the same transaction
+    // as the resolution notice so customers never see contradictory advice after this commits.
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled', cancelled_at=now(), \
+             lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
+         WHERE recipient_user_id=$1 AND event_key=$2 \
+           AND policy_key='personal-renewal-failure-v1' AND kind='failed_renewal' \
+           AND channel='in_app' AND status <> 'cancelled'",
+    )
+    .bind(&user_id)
+    .bind(&event_key)
+    .execute(&mut **tx)
+    .await?;
     let due_at_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(&mut **tx)
         .await?;

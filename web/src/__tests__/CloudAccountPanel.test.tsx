@@ -331,20 +331,25 @@ describe("CloudAccountPanel", () => {
       noticeId: "notice-1", kind: "failed_renewal", channel: "in_app",
       content: { title: "Action needed for your Cloud renewal", detail: "Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.", effectiveAtEpoch: 1_900_000_000, deadlineEpoch: 1_901_209_600, amountPence: null },
       dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
-    }, {
-      noticeId: "notice-2", kind: "recovery_resolved", channel: "in_app",
-      content: { title: "Your Cloud renewal is up to date", detail: "Your renewal payment was received. No further action is needed.", effectiveAtEpoch: 1_900_000_100, deadlineEpoch: null, amountPence: null },
-      dueAtEpoch: 1_900_000_100, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_100,
     }]);
 
-    render(<CloudAccountPanel />);
+    const { unmount } = render(<CloudAccountPanel />);
 
     expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
     expect(screen.getByText("Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.")).toBeInTheDocument();
-    expect(screen.getByText("Your Cloud renewal is up to date")).toBeInTheDocument();
     expect(screen.getByText(/Deadline:/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Update payment method" }));
     expect(await screen.findByText("The billing portal is not available yet.")).toBeInTheDocument();
     expect(api.createPersonalPortal).toHaveBeenCalledTimes(1);
+
+    unmount();
+    vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
+      noticeId: "notice-2", kind: "recovery_resolved", channel: "in_app",
+      content: { title: "Your Cloud renewal is up to date", detail: "Your renewal payment was received. No further action is needed.", effectiveAtEpoch: 1_900_000_100, deadlineEpoch: null, amountPence: null },
+      dueAtEpoch: 1_900_000_100, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_100,
+    }]);
+    render(<CloudAccountPanel />);
+    expect(await screen.findByText("Your Cloud renewal is up to date")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update payment method" })).not.toBeInTheDocument();
   });
 });
