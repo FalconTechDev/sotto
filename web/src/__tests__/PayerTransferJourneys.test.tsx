@@ -73,7 +73,7 @@ function member(userId: string, role: string): api.Member {
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: true, setupAvailable: true });
-  vi.mocked(api.fetchPayerTransfers).mockResolvedValue([]);
+  vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [], nextCursor: null });
   vi.mocked(api.fetchPayerTransfer).mockResolvedValue(transfer());
   vi.mocked(api.me).mockResolvedValue({ userId: "user-1" });
   vi.mocked(api.fetchOrgs).mockResolvedValue([org("org-a", "member"), org("org-b", "member")]);
@@ -96,20 +96,33 @@ describe("payer transfer journeys", () => {
 
   it("lets the named counterparty accept an incoming invitation without claiming it is complete", async () => {
     vi.mocked(api.fetchPayerTransfers)
-      .mockResolvedValueOnce([transfer()])
-      .mockResolvedValue([transfer({ state: "pending" })]);
+      .mockResolvedValueOnce({ transfers: [transfer()], nextCursor: null })
+      .mockResolvedValue({ transfers: [transfer({ state: "pending" })], nextCursor: null });
     render(<PayerTransferInbox />);
     fireEvent.click(await screen.findByRole("button", { name: "Accept transfer request" }));
     expect(api.acceptPayerTransfer).toHaveBeenCalledWith("transfer-1");
     expect(await screen.findByText(/Accepted\. The billing change is being prepared/)).toBeInTheDocument();
   });
 
+  it("loads older transfer pages using the server cursor", async () => {
+    const older = transfer({ transferId: "transfer-older", participantRole: "initiator", state: "completed" });
+    vi.mocked(api.fetchPayerTransfers)
+      .mockResolvedValueOnce({ transfers: [transfer()], nextCursor: "transfer-1" })
+      .mockResolvedValueOnce({ transfers: [older], nextCursor: null });
+    render(<PayerTransferInbox />);
+    expect(await screen.findByText("Incoming request")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Load older transfers" }));
+    expect(await screen.findByText("Outgoing request")).toBeInTheDocument();
+    expect(api.fetchPayerTransfers).toHaveBeenLastCalledWith("transfer-1");
+    expect(screen.queryByRole("button", { name: "Load older transfers" })).not.toBeInTheDocument();
+  });
+
   it("keeps personal payer invitations unaccepted until setup is available", async () => {
     vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: true, setupAvailable: false });
-    vi.mocked(api.fetchPayerTransfers).mockResolvedValue([transfer({
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [transfer({
       destinationKind: "personal",
       destinationOrganizationId: null,
-    })]);
+    })], nextCursor: null });
     render(<PayerTransferInbox />);
     expect(await screen.findByText(/Personal payment setup is not available/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Accept transfer request" })).not.toBeInTheDocument();
@@ -201,13 +214,13 @@ describe("payer transfer journeys", () => {
   });
 
   it("shows personal setup only while the beneficiary still needs it and setup is available", async () => {
-    vi.mocked(api.fetchPayerTransfers).mockResolvedValue([transfer({
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [transfer({
       state: "pending",
       destinationKind: "personal",
       destinationOrganizationId: null,
       beneficiaryId: "user-1",
       personalPaymentSetupNeeded: true,
-    })]);
+    })], nextCursor: null });
     vi.mocked(api.createPayerTransferPaymentSetup).mockResolvedValue({ checkoutUrl: null });
     render(<PayerTransferInbox />);
     fireEvent.click(await screen.findByRole("button", { name: "Set up payment method" }));
@@ -216,7 +229,7 @@ describe("payer transfer journeys", () => {
   });
 
   it("keeps manual-review transfers parked without customer resume actions", async () => {
-    vi.mocked(api.fetchPayerTransfers).mockResolvedValue([transfer({ state: "unknown" })]);
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [transfer({ state: "unknown" })], nextCursor: null });
     render(<PayerTransferInbox />);
     expect(await screen.findByText(/needs support review/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /resume|accept|withdraw/i })).not.toBeInTheDocument();

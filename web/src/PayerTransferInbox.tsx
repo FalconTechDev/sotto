@@ -48,12 +48,22 @@ function stateCopy(state: string): string {
   }
 }
 
+function withTransfer(transfers: PayerTransfer[], updated: PayerTransfer): PayerTransfer[] {
+  const existing = transfers.some((transfer) => transfer.transferId === updated.transferId);
+  const next = existing
+    ? transfers.map((transfer) => transfer.transferId === updated.transferId ? updated : transfer)
+    : [...transfers, updated];
+  return next.sort((left, right) => right.transferId.localeCompare(left.transferId));
+}
+
 export function PayerTransferInbox() {
   const [available, setAvailable] = useState(false);
   const [setupAvailable, setSetupAvailable] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<PayerTransfer[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -62,12 +72,31 @@ export function PayerTransferInbox() {
     setLoading(true);
     setError(null);
     try {
-      const rows = await fetchPayerTransfers();
-      setTransfers(rows);
+      const page = await fetchPayerTransfers();
+      setTransfers(page.transfers);
+      setNextCursor(page.nextCursor);
     } catch (e) {
       setError(message(e));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadMore() {
+    if (nextCursor === null || loadingMore) return;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const page = await fetchPayerTransfers(nextCursor);
+      setTransfers((current) => {
+        const known = new Set(current.map((transfer) => transfer.transferId));
+        return [...current, ...page.transfers.filter((transfer) => !known.has(transfer.transferId))];
+      });
+      setNextCursor(page.nextCursor);
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setLoadingMore(false);
     }
   }
 
@@ -96,6 +125,7 @@ export function PayerTransferInbox() {
   }, [available]);
 
   useEffect(() => {
+    if (loading) return;
     const params = new URLSearchParams(window.location.search);
     const returnId = params.get("transfer_id");
     const outcome = params.get("billing");
@@ -106,27 +136,24 @@ export function PayerTransferInbox() {
         : "Payment method setup was cancelled. The transfer has not completed.");
       if (available) {
         void fetchPayerTransfer(returnId)
-          .then((transfer) => setTransfers((current) => [
-            transfer,
-            ...current.filter((item) => item.transferId !== transfer.transferId),
-          ]))
-          .catch(() => {})
-          .finally(() => void refresh());
+          .then((transfer) => setTransfers((current) => withTransfer(current, transfer)))
+          .catch(() => {});
       }
     }
     params.delete("billing");
     params.delete("transfer_id");
     const query = params.toString();
     window.history.replaceState(null, "", window.location.pathname + (query ? `?${query}` : "") + window.location.hash);
-  }, [available]);
+  }, [available, loading]);
 
   async function act(transfer: PayerTransfer, action: "accept" | "withdraw" | "setup") {
     setBusyId(transfer.transferId);
     setError(null);
     setNotice(null);
     try {
-      if (action === "accept") await acceptPayerTransfer(transfer.transferId);
-      else if (action === "withdraw") await withdrawPayerTransfer(transfer.transferId);
+      let updated: PayerTransfer;
+      if (action === "accept") updated = await acceptPayerTransfer(transfer.transferId);
+      else if (action === "withdraw") updated = await withdrawPayerTransfer(transfer.transferId);
       else {
         const setup = await createPayerTransferPaymentSetup(transfer.transferId);
         if (setup.checkoutUrl !== null) {
@@ -134,11 +161,17 @@ export function PayerTransferInbox() {
           return;
         }
         setNotice("Payment method setup is pending. Refresh the transfer shortly.");
+        updated = await fetchPayerTransfer(transfer.transferId);
       }
-      await refresh();
+      setTransfers((current) => withTransfer(current, updated));
     } catch (e) {
       setError(message(e));
-      await refresh();
+      try {
+        const updated = await fetchPayerTransfer(transfer.transferId);
+        setTransfers((current) => withTransfer(current, updated));
+      } catch {
+        // Keep the last known state when the transfer itself cannot be refreshed.
+      }
     } finally {
       setBusyId(null);
     }
@@ -151,7 +184,7 @@ export function PayerTransferInbox() {
     <p className="muted">Transfers take effect at renewal. The current payer remains responsible through the paid term; no mid-term credit is issued.</p>
     {error !== null && <p role="alert">{error}</p>}
     {notice !== null && <p className="notice" role="status">{notice}</p>}
-    <button disabled={loading || busyId !== null} onClick={() => void refresh()}>{loading ? "Refreshing transfers…" : "Refresh transfers"}</button>
+    <button disabled={loading || loadingMore || busyId !== null} onClick={() => void refresh()}>{loading ? "Refreshing transfers…" : "Refresh transfers"}</button>
     {loading && <p className="muted" role="status">Loading transfer requests…</p>}
     {!loading && transfers.length === 0 && <p className="muted">There are no payer transfer requests for this account.</p>}
     <ul className="items">
@@ -181,5 +214,6 @@ export function PayerTransferInbox() {
         </li>;
       })}
     </ul>
+    {nextCursor !== null && <button disabled={loading || loadingMore || busyId !== null} onClick={() => void loadMore()}>{loadingMore ? "Loading older transfers…" : "Load older transfers"}</button>}
   </section>;
 }

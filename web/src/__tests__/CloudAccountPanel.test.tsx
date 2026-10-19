@@ -69,7 +69,7 @@ describe("CloudAccountPanel", () => {
 
   beforeEach(() => {
     vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
-    vi.mocked(api.fetchPayerTransfers).mockResolvedValue([]);
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [], nextCursor: null });
     vi.mocked(api.me).mockResolvedValue(null);
     vi.mocked(api.fetchOrgs).mockResolvedValue([]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);

@@ -276,12 +276,20 @@ function parsePayerTransfer(body: {
   };
 }
 
-export async function fetchPayerTransfers(): Promise<PayerTransfer[]> {
+export async function fetchPayerTransfers(before?: string): Promise<{
+  transfers: PayerTransfer[];
+  nextCursor: string | null;
+}> {
+  const query = new URLSearchParams({ limit: "50" });
+  if (before !== undefined) query.set("before", before);
   const body = await authedJson<{
     transfers: Parameters<typeof parsePayerTransfer>[0][];
     next_cursor: string | null;
-  }>("/billing/transfers?limit=50");
-  return body.transfers.map(parsePayerTransfer);
+  }>(`/billing/transfers?${query.toString()}`);
+  return {
+    transfers: body.transfers.map(parsePayerTransfer),
+    nextCursor: body.next_cursor,
+  };
 }
 
 export async function fetchPayerTransfer(transferId: string): Promise<PayerTransfer> {
