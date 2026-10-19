@@ -5249,9 +5249,6 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         }
         if let Some(failure) = personal_renewal_failure.as_ref() {
             accept_prepared_personal_renewal_failure(&mut tx, failure).await?;
-            if let Some(subscription_id) = subscription_id {
-                update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
-            }
             mark_webhook_event_processed(&mut tx, &event.id).await?;
             tx.commit().await?;
             return Ok(());
@@ -5263,9 +5260,6 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                 crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
             )
             .await?;
-            if let Some(subscription_id) = subscription_id {
-                update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
-            }
             mark_webhook_event_processed(&mut tx, &event.id).await?;
             tx.commit().await?;
             return Ok(());
@@ -5407,8 +5401,10 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             return Err(Error::Config("invalid webhook disposition".into()));
         }
     }
-    if let Some(subscription_id) = subscription_id {
-        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+    if event_updates_subscription_watermark(&event) {
+        if let Some(subscription_id) = subscription_id {
+            update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+        }
     }
     mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
@@ -8498,7 +8494,8 @@ async fn resolve_sponsored_renewal_failures(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventDisposition {
-    /// The event is newer than the stored watermark and can apply its payload normally.
+    /// The event can apply normally: either it is newer than the watermark or it is a
+    /// payment fact whose ordering is guarded by the subscription lock instead.
     Apply,
     /// The event ties the watermark timestamp and must reconcile against Stripe's current state.
     Reconcile,
@@ -8534,6 +8531,12 @@ async fn record_webhook_event(
         return Ok(EventDisposition::Apply);
     }
     if event.kind == "invoice.paid" {
+        return Ok(EventDisposition::Apply);
+    }
+    // A failed invoice is a payment fact, not a subscription-state observation. Keep it under
+    // the subscription lock for paid-versus-failed ordering, but let the corresponding
+    // customer.subscription.updated event own the watermark and status transition.
+    if event.kind == "invoice.payment_failed" {
         return Ok(EventDisposition::Apply);
     }
 
@@ -8663,10 +8666,16 @@ async fn complete_repaired_invoice_event(
     tx: &mut Transaction<'_, Postgres>,
     event: &Event,
 ) -> Result<()> {
-    if let Some(subscription_id) = event_subscription_id(event) {
-        update_subscription_watermark(tx, event, &subscription_id).await?;
+    if event_updates_subscription_watermark(event) {
+        if let Some(subscription_id) = event_subscription_id(event) {
+            update_subscription_watermark(tx, event, &subscription_id).await?;
+        }
     }
     mark_webhook_event_processed(tx, &event.id).await
+}
+
+fn event_updates_subscription_watermark(event: &Event) -> bool {
+    event.kind != "invoice.payment_failed"
 }
 
 fn event_subscription_id(event: &Event) -> Option<String> {
@@ -13312,6 +13321,7 @@ mod tests {
             event_subscription_id(&event).as_deref(),
             Some("sub_failed_1")
         );
+        assert!(!event_updates_subscription_watermark(&event));
     }
 
     #[test]
