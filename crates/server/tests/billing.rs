@@ -1510,23 +1510,28 @@ async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoic
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE subscription_id=$1")
-        .bind(&subscription_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let webhook_event_ids = vec![
+        first_failure_event,
+        retry_failure_event,
+        mismatch_failure_event,
+        unbound_failure_event,
+        unrelated_paid_event,
+        recovered_paid_event,
+        paid_before_failure_event,
+        late_failure_event,
+        format!("evt_paid_after_cancel_{fixture}"),
+    ];
+    sqlx::query(
+        "DELETE FROM stripe_subscription_watermarks \
+         WHERE subscription_id=$1 OR event_id = ANY($2)",
+    )
+    .bind(&subscription_id)
+    .bind(&webhook_event_ids)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
-        .bind(vec![
-            first_failure_event,
-            retry_failure_event,
-            mismatch_failure_event,
-            unbound_failure_event,
-            unrelated_paid_event,
-            recovered_paid_event,
-            paid_before_failure_event,
-            late_failure_event,
-            format!("evt_paid_after_cancel_{fixture}"),
-        ])
+        .bind(&webhook_event_ids)
         .execute(&pool)
         .await
         .unwrap();
