@@ -197,9 +197,10 @@ describe("CloudAccountPanel", () => {
 
       if (outcome === "failure") {
         view.unmount();
+        const exportDeadline = 1_900_000_000;
         vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
           noticeId: "notice-current", kind: "export_deadline", channel: "in_app",
-          content: { title: "Current export notice", detail: "Keep your encrypted recovery materials.", effectiveAtEpoch: null, deadlineEpoch: null, amountPence: null },
+          content: { title: "Current export notice", detail: "Keep your encrypted recovery materials.", effectiveAtEpoch: 1_800_000_000, deadlineEpoch: exportDeadline, amountPence: null },
           dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null,
           deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
         }]);
@@ -207,6 +208,7 @@ describe("CloudAccountPanel", () => {
         expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
         expect(screen.getByText("Current export notice")).toBeInTheDocument();
         expect(screen.getByText("Keep your encrypted recovery materials.")).toBeInTheDocument();
+        expect(screen.getByText(`Deadline: ${new Date(exportDeadline * 1000).toLocaleDateString("en-GB")}`)).toBeInTheDocument();
         expect(api.fetchCloudNotices).toHaveBeenCalledTimes(2);
         expect(screen.getByRole("button", { name: "Download encrypted export" })).toBeEnabled();
         expect(screen.queryByRole("alert")).not.toBeInTheDocument();
