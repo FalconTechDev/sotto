@@ -48,6 +48,7 @@ pub enum NoticeKind {
     PayerTransferInvitation,
     FoundingExpiry,
     PriceChange,
+    RecoveryResolved,
 }
 
 impl NoticeKind {
@@ -62,6 +63,7 @@ impl NoticeKind {
             Self::PayerTransferInvitation => "payer_transfer_invitation",
             Self::FoundingExpiry => "founding_expiry",
             Self::PriceChange => "price_change",
+            Self::RecoveryResolved => "recovery_resolved",
         }
     }
 }
@@ -342,7 +344,7 @@ pub async fn list_for_user(pool: &PgPool, user_id: &str) -> NoticeResult<Vec<Not
                 status, last_error_code, extract(epoch from delivered_at)::bigint AS delivered_at, \
                 extract(epoch from created_at)::bigint AS created_at \
          FROM cloud_notice_outbox \
-         WHERE recipient_user_id=$1 AND status <> 'cancelled' \
+         WHERE recipient_user_id=$1 AND status <> 'cancelled' AND due_at <= now() \
          ORDER BY created_at DESC, notice_id DESC LIMIT $2",
     )
     .bind(user_id)

@@ -5040,6 +5040,15 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         )));
     }
 
+    // Make the signed billing fact visible even if the separate coverage-evidence read below
+    // needs Stripe to retry. The receipt stays unprocessed until the ordinary webhook path has
+    // applied all billing and coverage work; this transaction only records the customer notice.
+    if event.kind == "invoice.payment_failed"
+        && record_personal_renewal_failure_notice(&state.pool, &event).await?
+    {
+        return Ok(());
+    }
+
     let processed_duplicate =
         if event.kind == "invoice.paid" && billing.personal_coverage_ingest_enabled() {
             sqlx::query_scalar::<_, bool>(
@@ -7331,6 +7340,195 @@ fn opaque_provider_id(prefix: &str, parts: &[&str]) -> String {
     )
 }
 
+fn personal_renewal_notice_event_key(
+    user_id: &str,
+    subscription_id: &str,
+    invoice_id: &str,
+) -> String {
+    opaque_provider_id(
+        "personal-renewal-v1",
+        &[user_id, subscription_id, invoice_id],
+    )
+}
+
+/// Persist the customer-facing failure notice before any optional Stripe history read. The
+/// webhook receipt and notice commit together, but the receipt remains pending until the regular
+/// webhook transaction accepts the billing and coverage work.
+async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) -> Result<bool> {
+    let invoice = &event.data.object;
+    let Some(subscription_id) = invoice_subscription_id_claim(invoice) else {
+        return Ok(false);
+    };
+    let Some(invoice_id) = invoice["id"].as_str().filter(|value| !value.is_empty()) else {
+        return Ok(false);
+    };
+    let Some(customer_id) = stripe_reference(&invoice["customer"]) else {
+        return Ok(false);
+    };
+    let Some(period_start) = invoice_period_start(invoice)
+        .and_then(|value| FoundingDate::from_unix_seconds(value).ok())
+        .map(|value| value.to_unix_seconds())
+    else {
+        return Ok(false);
+    };
+    if invoice["object"].as_str() != Some("invoice")
+        || invoice["billing_reason"].as_str() != Some("subscription_cycle")
+        || invoice["collection_method"].as_str() != Some("charge_automatically")
+        || invoice["status"].as_str() != Some("open")
+        || invoice["amount_remaining"]
+            .as_i64()
+            .is_none_or(|amount| amount <= 0)
+    {
+        return Ok(false);
+    }
+
+    let mut tx = pool.begin().await?;
+    prune_webhook_events(&mut tx).await?;
+    let disposition = record_webhook_event(&mut tx, event).await?;
+    if disposition == EventDisposition::Ignore {
+        tx.commit().await?;
+        return Ok(true);
+    }
+
+    let account = sqlx::query(
+        "SELECT user_id, paid_through_epoch FROM billing_personal_accounts \
+         WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
+           AND state IN ('active','past_due','unpaid') FOR UPDATE",
+    )
+    .bind(&subscription_id)
+    .bind(&customer_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(account) = account {
+        let user_id: String = account.try_get("user_id")?;
+        let paid_through: Option<i64> = account.try_get("paid_through_epoch")?;
+        if let Some(paid_through) =
+            paid_through.filter(|paid_through| period_start >= *paid_through)
+        {
+            let deadline = paid_through
+                .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
+                .ok_or_else(|| Error::Internal("personal recovery deadline overflowed".into()))?;
+            let due_at_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+                .fetch_one(&mut *tx)
+                .await?;
+            let intent = crate::notifications::NoticeIntent {
+                recipient_user_id: user_id.clone(),
+                event_key: personal_renewal_notice_event_key(
+                    &user_id,
+                    &subscription_id,
+                    invoice_id,
+                ),
+                policy_key: "personal-renewal-failure-v1".into(),
+                kind: crate::notifications::NoticeKind::FailedRenewal,
+                channel: crate::notifications::NoticeChannel::InApp,
+                contact_id: None,
+                due_at_epoch,
+                content: crate::notifications::NoticeContent {
+                    title: "Action needed for your Cloud renewal".into(),
+                    detail: "Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.".into(),
+                    effective_at_epoch: Some(paid_through),
+                    deadline_epoch: Some(deadline),
+                    amount_pence: None,
+                },
+            };
+            crate::notifications::enqueue_in_tx(&mut tx, &intent)
+                .await
+                .map_err(notification_error)?;
+        }
+    }
+    tx.commit().await?;
+    Ok(false)
+}
+
+fn notification_error(error: crate::notifications::NoticeError) -> Error {
+    match error {
+        crate::notifications::NoticeError::Database(error) => Error::Db(error),
+        other => Error::Internal(other.to_string()),
+    }
+}
+
+/// A verified payment only resolves the matching invoice's failure. The invoice identity is
+/// hashed before it enters the outbox; the raw provider identifiers never reach the account API.
+async fn enqueue_personal_renewal_recovered_notice(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice: &serde_json::Value,
+    subscription_id: &str,
+    event_created: i64,
+) -> Result<()> {
+    if invoice["object"].as_str() != Some("invoice")
+        || invoice["billing_reason"].as_str() != Some("subscription_cycle")
+        || invoice["status"].as_str() != Some("paid")
+    {
+        return Ok(());
+    }
+    let Some(invoice_id) = invoice["id"].as_str().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(customer_id) = stripe_reference(&invoice["customer"]) else {
+        return Ok(());
+    };
+    let Some(period_end) = invoice_period_end(invoice)
+        .and_then(|value| FoundingDate::from_unix_seconds(value).ok())
+        .map(|value| value.to_unix_seconds())
+    else {
+        return Ok(());
+    };
+    let account = sqlx::query(
+        "SELECT user_id, paid_through_epoch FROM billing_personal_accounts \
+         WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
+           AND state IN ('active','past_due','unpaid') FOR UPDATE",
+    )
+    .bind(subscription_id)
+    .bind(customer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(account) = account else {
+        return Ok(());
+    };
+    let user_id: String = account.try_get("user_id")?;
+    let paid_through: Option<i64> = account.try_get("paid_through_epoch")?;
+    if paid_through.is_none_or(|paid_through| paid_through < period_end) {
+        return Ok(());
+    }
+    let event_key = personal_renewal_notice_event_key(&user_id, subscription_id, invoice_id);
+    let failed_notice_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND event_key=$2 \
+           AND policy_key='personal-renewal-failure-v1' AND kind='failed_renewal' \
+           AND channel='in_app')",
+    )
+    .bind(&user_id)
+    .bind(&event_key)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !failed_notice_exists {
+        return Ok(());
+    }
+    let due_at_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let intent = crate::notifications::NoticeIntent {
+        recipient_user_id: user_id,
+        event_key,
+        policy_key: "personal-renewal-recovered-v1".into(),
+        kind: crate::notifications::NoticeKind::RecoveryResolved,
+        channel: crate::notifications::NoticeChannel::InApp,
+        contact_id: None,
+        due_at_epoch,
+        content: crate::notifications::NoticeContent {
+            title: "Your Cloud renewal is up to date".into(),
+            detail: "Your renewal payment was received. No further action is needed.".into(),
+            effective_at_epoch: (event_created > 0).then_some(event_created),
+            deadline_epoch: None,
+            amount_pence: None,
+        },
+    };
+    crate::notifications::enqueue_in_tx(tx, &intent)
+        .await
+        .map_err(notification_error)?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventDisposition {
     /// The event is newer than the stored watermark and can apply its payload normally.
@@ -8569,6 +8767,7 @@ async fn invoice_paid(
         .map_err(personal_billing_error)?;
     }
     reconcile_personal_founding_invoice(tx, object, subscription_id, catalogue).await?;
+    enqueue_personal_renewal_recovered_notice(tx, object, subscription_id, event_created).await?;
     Ok(())
 }
 
