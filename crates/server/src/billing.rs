@@ -7408,9 +7408,10 @@ async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) ->
             let deadline = paid_through
                 .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
                 .ok_or_else(|| Error::Internal("personal recovery deadline overflowed".into()))?;
-            let due_at_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
-                .fetch_one(&mut *tx)
-                .await?;
+            let due_at_epoch: i64 =
+                sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+                    .fetch_one(&mut *tx)
+                    .await?;
             let intent = crate::notifications::NoticeIntent {
                 recipient_user_id: user_id.clone(),
                 event_key: personal_renewal_notice_event_key(
@@ -7523,7 +7524,7 @@ async fn enqueue_personal_renewal_recovered_notice(
     if account_state == "canceled" {
         return Ok(());
     }
-    let due_at_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+    let due_at_epoch: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
         .fetch_one(&mut **tx)
         .await?;
     let intent = crate::notifications::NoticeIntent {
