@@ -262,6 +262,43 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
     assert_eq!(notices[0].content.effective_at_epoch, Some(latest_end));
     assert_eq!(notices[0].due_at_epoch, latest_end);
 
+    let pending_checkout_view = sotto_server::person_eligibility::evaluate_input(
+        &sotto_server::person_eligibility::EligibilityInput {
+            deployment_mode: DeploymentMode::Cloud,
+            billing_available: true,
+            account_initialized: true,
+            personal_billing_state: Some(
+                sotto_server::personal_billing::PersonalBillingState::Pending,
+            ),
+            coverage: sotto_server::person_eligibility::CoverageInput::Decision(
+                evaluate(&coverage, now_epoch).expect("evaluate current export episode"),
+            ),
+        },
+    );
+    assert_eq!(
+        pending_checkout_view.state,
+        sotto_server::person_eligibility::EligibilityState::PendingInitialPayment
+    );
+    assert_eq!(pending_checkout_view.export_until_epoch, Some(deadline));
+    assert!(notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &pending_checkout_view,
+        Some(revision),
+        now_epoch + 2
+    )
+    .await
+    .expect("pending checkout preserves the open export episode"));
+    let retained_notice: (String, i64) = sqlx::query_as(
+        "SELECT status, (payload->>'deadline_epoch')::bigint FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND kind='export_deadline'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load notice while checkout is pending");
+    assert_eq!(retained_notice, ("pending".into(), deadline));
+
     let unavailable_revision =
         publish_unavailable_coverage(&pool, USER_ID, revision, "export-episode-unavailable").await;
     let unavailable_view = sotto_server::person_eligibility::evaluate_input(

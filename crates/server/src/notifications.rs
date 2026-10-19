@@ -335,7 +335,16 @@ pub async fn reconcile_export_deadline_notice(
         return Ok(false);
     }
 
-    let intent = if view.state == EligibilityState::ExportOnly {
+    // A pending personal checkout takes precedence in the public eligibility state, but its
+    // coverage decision can still carry the beneficiary's current export deadline. Keep the
+    // notice tied to that complete projection until its deadline passes; pending billing alone
+    // does not prove that the export episode has ended.
+    let export_window_is_open = view.state == EligibilityState::ExportOnly
+        || (view.state == EligibilityState::PendingInitialPayment
+            && view
+                .export_until_epoch
+                .is_some_and(|deadline| deadline > now_epoch));
+    let intent = if export_window_is_open {
         let deadline = view
             .export_until_epoch
             .ok_or(NoticeError::InvalidContent("export deadline is missing"))?;
