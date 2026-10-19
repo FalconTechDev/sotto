@@ -6144,6 +6144,30 @@ struct SponsoredFailurePredecessor {
     manifest: SponsoredAllocationManifest,
 }
 
+fn sponsored_invoice_lines_can_be_predecessors(
+    predecessor_lines: &[crate::cloud_provider_stripe_http::StripeInvoiceLineResource],
+    failed_lines: &[crate::cloud_provider_stripe_http::StripeInvoiceLineResource],
+) -> bool {
+    failed_lines.iter().any(|failed_line| {
+        let (Some(item_id), Some(price_id), Some(start)) = (
+            failed_line.subscription_item_id.as_deref(),
+            failed_line.price_id.as_deref(),
+            failed_line.period_start,
+        ) else {
+            return false;
+        };
+        predecessor_lines.iter().any(|line| {
+            (line
+                .subscription_item_id
+                .as_deref()
+                .or(line.legacy_subscription_item_id.as_deref())
+                == Some(item_id))
+                && line.price_id.as_deref() == Some(price_id)
+                && line.period_end == Some(start)
+        })
+    })
+}
+
 async fn prepare_signed_personal_renewal_failure(
     pool: &sqlx::PgPool,
     billing: &BillingState,
@@ -6389,6 +6413,39 @@ async fn prepare_sponsored_renewal_failure(
         .iter()
         .filter(|invoice| invoice.status.as_deref() == Some("paid"))
     {
+        let predecessor_lines = if paid_invoice.lines_complete {
+            paid_invoice.line_summaries.clone()
+        } else {
+            match stripe.invoice_lines(&mut session, &paid_invoice.id).await {
+                Ok(lines) => lines,
+                Err(error) if error.is_evidence_rejection() => {
+                    return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                        context,
+                        event: Box::new(sponsored_verified_event(
+                            event,
+                            raw_event,
+                            &subscription_id,
+                            &invoice_id,
+                        )?),
+                        organization_id,
+                        subscription_id: subscription_id.clone(),
+                        invoice_id,
+                        period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                        reason: "sponsored_renewal_history_unusable",
+                    });
+                }
+                Err(_) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal history read failed".into(),
+                    ));
+                }
+            }
+        };
+        let could_be_predecessor =
+            sponsored_invoice_lines_can_be_predecessors(&predecessor_lines, &failed_lines);
+        if !could_be_predecessor {
+            continue;
+        }
         let settlement = match stripe
             .sponsored_invoice_settlement(
                 &mut session,
@@ -6400,7 +6457,7 @@ async fn prepare_sponsored_renewal_failure(
             .await
         {
             Ok(settlement) => settlement,
-            Err(_) => {
+            Err(error) if error.is_evidence_rejection() => {
                 return Ok(SponsoredRenewalFailurePreparation::Rejected {
                     context,
                     event: Box::new(sponsored_verified_event(
@@ -6415,6 +6472,11 @@ async fn prepare_sponsored_renewal_failure(
                     period_start: invoice_period_start(invoice).unwrap_or(event.created),
                     reason: "sponsored_renewal_history_unusable",
                 });
+            }
+            Err(_) => {
+                return Err(Error::Internal(
+                    "sponsored renewal settlement read failed".into(),
+                ));
             }
         };
         let manifest =
@@ -6431,6 +6493,11 @@ async fn prepare_sponsored_renewal_failure(
             .await
             {
                 Ok(manifest) => manifest,
+                Err(crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadError::Database(_)) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal manifest read failed".into(),
+                    ));
+                }
                 Err(_) => {
                     return Ok(SponsoredRenewalFailurePreparation::Rejected {
                         context,
@@ -6533,6 +6600,11 @@ async fn prepare_sponsored_renewal_failure(
             .await
             {
                 Ok(manifest) => manifest,
+                Err(crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadError::Database(_)) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal manifest read failed".into(),
+                    ));
+                }
                 Err(_) => {
                     rejected_reason = Some("sponsored_renewal_manifest_unusable");
                     break;
@@ -6590,10 +6662,11 @@ async fn prepare_sponsored_renewal_failure(
             .await
             {
                 Ok(Some(allocation)) => allocation,
-                _ => {
+                Ok(None) => {
                     rejected_reason = Some("sponsored_renewal_allocation_unusable");
                     break;
                 }
+                Err(error) => return Err(error),
             };
             if !used.insert((allocation.allocation_id.clone(), line_id.to_owned())) {
                 rejected_reason = Some("sponsored_renewal_line_ambiguous");
@@ -13216,5 +13289,78 @@ mod tests {
             sponsored_invoice_items(&invoice),
             vec![("si-sponsored".into(), "price-sponsored".into(), 3)]
         );
+    }
+
+    #[test]
+    fn sponsored_history_reads_only_invoices_with_a_contiguous_item_price_line() {
+        let line = |item: &str, price: &str, start, end| {
+            crate::cloud_provider_stripe_http::StripeInvoiceLineResource {
+                id: "il_test".into(),
+                quantity: Some(1),
+                subscription_id: Some("sub_test".into()),
+                subscription_item_id: Some(item.into()),
+                legacy_subscription_id: None,
+                legacy_subscription_item_id: None,
+                price_id: Some(price.into()),
+                allocation_reference: None,
+                parent_type: Some("subscription_item_details".into()),
+                pricing_type: Some("price_details".into()),
+                livemode: Some(false),
+                period_start: Some(start),
+                period_end: Some(end),
+                invoice_id: Some("in_test".into()),
+                proration: Some(false),
+            }
+        };
+        let failed = [line("si_month", "price_month", 200, 300)];
+        assert!(sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_month", "price_month", 100, 200)],
+            &failed,
+        ));
+        assert!(!sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_year", "price_year", 100, 200)],
+            &failed,
+        ));
+        assert!(!sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_month", "price_month", 100, 199)],
+            &failed,
+        ));
+    }
+
+    #[test]
+    fn sponsored_failure_only_rejects_permanent_evidence_errors() {
+        use crate::cloud_provider_stripe_http::StripeReadError;
+
+        assert!(StripeReadError::MalformedResponse("invoice.status").is_evidence_rejection());
+        assert!(StripeReadError::Observation(
+            crate::cloud_provider_stripe::StripeContractError::ContextMismatch
+        )
+        .is_evidence_rejection());
+        assert!(StripeReadError::Settlement(
+            crate::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(
+                "ambiguous payment"
+            )
+        )
+        .is_evidence_rejection());
+
+        let operational = [
+            StripeReadError::Authentication { status: 401 },
+            StripeReadError::Permission { status: 403 },
+            StripeReadError::ContextMismatch,
+            StripeReadError::SessionClientMismatch,
+            StripeReadError::Transport,
+            StripeReadError::Timeout,
+            StripeReadError::RateLimited {
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            },
+            StripeReadError::Retryable { status: 503 },
+            StripeReadError::RequestBoundExceeded,
+            StripeReadError::PageBoundExceeded,
+            StripeReadError::RecordBoundExceeded,
+            StripeReadError::SessionBytesExceeded,
+        ];
+        assert!(operational
+            .iter()
+            .all(|error| !error.is_evidence_rejection()));
     }
 }

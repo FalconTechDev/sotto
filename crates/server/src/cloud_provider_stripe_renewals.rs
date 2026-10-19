@@ -997,7 +997,16 @@ fn evidence_reference(evidence: &StripeRenewalFailureEvidence) -> String {
     );
     encoder.integer("predecessor_period_end", evidence.predecessor_period_end);
     if let Some(price_id) = evidence.provider_price_id.as_deref() {
+        // Sponsored failures share one invoice-wide provider event, so the event hash omits
+        // per-seat details. Bind every per-allocation field here or a stored row could be altered
+        // to point at another invoice line or term while retaining the same evidence reference.
+        encoder.string("allocation", &evidence.allocation_reference);
+        encoder.string("provider_item", &evidence.provider_item_id);
         encoder.string("provider_price", price_id);
+        encoder.string("invoice_line", &evidence.invoice_line_id);
+        encoder.integer("renewal_period_start", evidence.renewal_period_start);
+        encoder.integer("renewal_period_end", evidence.renewal_period_end);
+        encoder.string("interval", evidence.interval.to_string().as_str());
     }
     format!(
         "stripe:renewal-failure:v{}:{}",
@@ -1206,6 +1215,70 @@ mod identity_tests {
         assert_eq!(first_event.allocation_reference, None);
         assert_ne!(first.renewal_id(), second.renewal_id());
         assert_ne!(first.evidence_reference(), second.evidence_reference());
+    }
+
+    #[test]
+    fn sponsored_stored_evidence_reference_binds_each_allocation_term_field() {
+        let original = StripeRenewalFailureEvidence::from_sponsored_parts(
+            "evt_grouped_failure",
+            "in_grouped_failure",
+            "il_grouped_failure",
+            "in_grouped_paid",
+            "stripe:sponsored-predecessor:test",
+            "acct_test",
+            ProviderEnvironment::Test,
+            "alloc_grouped",
+            "cus_sponsor",
+            "sub_sponsor",
+            "si_monthly",
+            "price_month",
+            100,
+            200,
+            200,
+            300,
+            210,
+            StripeInterval::Month,
+        )
+        .unwrap();
+        let stored = || StoredStripeRenewalFailure {
+            version: SPONSORED_RENEWAL_EVIDENCE_VERSION,
+            evidence_reference: original.evidence_reference.clone(),
+            renewal_id: original.renewal_id.clone(),
+            event_id: original.event_id.clone(),
+            invoice_id: original.invoice_id.clone(),
+            invoice_line_id: original.invoice_line_id.clone(),
+            predecessor_invoice_id: original.predecessor_invoice_id.clone(),
+            predecessor_evidence_reference: original.predecessor_evidence_reference.clone(),
+            provider_account_id: original.provider_account_id.clone(),
+            environment: original.environment,
+            allocation_reference: original.allocation_reference.clone(),
+            customer_id: original.customer_id.clone(),
+            subscription_id: original.subscription_id.clone(),
+            provider_item_id: original.provider_item_id.clone(),
+            provider_price_id: original.provider_price_id.clone(),
+            predecessor_period_start: original.predecessor_period_start,
+            predecessor_period_end: original.predecessor_period_end,
+            renewal_period_start: original.renewal_period_start,
+            renewal_period_end: original.renewal_period_end,
+            event_created_at: original.event_created_at,
+            interval: original.interval.to_string(),
+        };
+        assert_eq!(
+            StripeRenewalFailureEvidence::from_stored(stored()).unwrap(),
+            original
+        );
+
+        let mut changed_line = stored();
+        changed_line.invoice_line_id = "il_other".into();
+        assert!(StripeRenewalFailureEvidence::from_stored(changed_line).is_err());
+
+        let mut changed_end = stored();
+        changed_end.renewal_period_end = 301;
+        assert!(StripeRenewalFailureEvidence::from_stored(changed_end).is_err());
+
+        let mut changed_interval = stored();
+        changed_interval.interval = "year".into();
+        assert!(StripeRenewalFailureEvidence::from_stored(changed_interval).is_err());
     }
 
     #[test]

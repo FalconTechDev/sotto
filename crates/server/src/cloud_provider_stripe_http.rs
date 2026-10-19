@@ -1931,6 +1931,10 @@ pub struct StripeInvoiceResource {
     pub amount_paid_off_stripe: Option<i64>,
     pub allocation_reference: Option<String>,
     pub livemode: Option<bool>,
+    /// Line summaries included in the Invoice response. When `lines_complete` is false, callers
+    /// must fetch the invoice's line collection before using these as a negative match.
+    pub line_summaries: Vec<StripeInvoiceLineResource>,
+    pub lines_complete: bool,
     billing_reason_present: bool,
     collection_method_present: bool,
 }
@@ -2823,6 +2827,23 @@ fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, Strip
 }
 
 fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError> {
+    let (line_summaries, lines_complete) = match value.get("lines") {
+        None | Some(Value::Null) => (Vec::new(), false),
+        Some(lines) => {
+            let lines = optional_object(Some(lines), "invoice.lines")?
+                .ok_or(StripeReadError::MalformedResponse("invoice.lines"))?;
+            let data = lines
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or(StripeReadError::MalformedResponse("invoice.lines.data"))?;
+            let has_more = optional_bool(lines.get("has_more"), "invoice.lines.has_more")?;
+            let parsed = data
+                .iter()
+                .map(parse_invoice_line)
+                .collect::<Result<Vec<_>, _>>()?;
+            (parsed, has_more == Some(false))
+        }
+    };
     let parent = optional_object(value.get("parent"), "invoice.parent")?;
     let parent_type = parent
         .map(|parent| optional_string(parent.get("type"), "invoice.parent.type"))
@@ -2887,6 +2908,8 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         )?,
         allocation_reference: parent_allocation_reference.or(invoice_allocation_reference),
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
+        line_summaries,
+        lines_complete,
         billing_reason_present: value.get("billing_reason").is_some(),
         collection_method_present: value.get("collection_method").is_some(),
     })
@@ -3345,5 +3368,63 @@ fn map_request_error(error: reqwest::Error) -> StripeReadError {
         StripeReadError::RedirectRejected
     } else {
         StripeReadError::Transport
+    }
+}
+
+#[cfg(test)]
+mod invoice_summary_tests {
+    use super::parse_invoice;
+
+    #[test]
+    fn invoice_list_summary_marks_complete_line_data_for_candidate_filtering() {
+        let invoice = parse_invoice(&serde_json::json!({
+            "id": "in_summary",
+            "lines": {
+                "has_more": false,
+                "data": [{
+                    "id": "il_summary",
+                    "parent": {
+                        "type": "subscription_item_details",
+                        "subscription_item_details": {
+                            "subscription": "sub_summary",
+                            "subscription_item": "si_summary"
+                        }
+                    },
+                    "pricing": {
+                        "type": "price_details",
+                        "price_details": {"price": "price_summary"}
+                    },
+                    "period": {"start": 100, "end": 200},
+                    "invoice": "in_summary"
+                }]
+            }
+        }))
+        .expect("valid invoice list summary");
+
+        assert!(invoice.lines_complete);
+        assert_eq!(invoice.line_summaries.len(), 1);
+        assert_eq!(
+            invoice.line_summaries[0].subscription_item_id.as_deref(),
+            Some("si_summary")
+        );
+        assert_eq!(invoice.line_summaries[0].period_end, Some(200));
+    }
+
+    #[test]
+    fn invoice_without_embedded_lines_requires_a_full_line_read() {
+        let invoice = parse_invoice(&serde_json::json!({"id": "in_summary"}))
+            .expect("valid invoice without expanded line summaries");
+        assert!(!invoice.lines_complete);
+        assert!(invoice.line_summaries.is_empty());
+    }
+
+    #[test]
+    fn invoice_summary_without_has_more_is_not_treated_as_complete() {
+        let invoice = parse_invoice(&serde_json::json!({
+            "id": "in_partial_summary",
+            "lines": {"data": []}
+        }))
+        .expect("partial line summary can be completed from its endpoint");
+        assert!(!invoice.lines_complete);
     }
 }
