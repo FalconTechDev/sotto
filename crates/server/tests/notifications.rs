@@ -78,6 +78,29 @@ async fn publish_coverage(
     receipt.revision
 }
 
+async fn publish_unavailable_coverage(
+    pool: &PgPool,
+    user_id: &str,
+    expected_revision: i64,
+    operation_id: &str,
+) -> i64 {
+    let mut tx = pool.begin().await.expect("begin unavailable publication");
+    let receipt = cloud_coverage_store::publish(
+        &mut tx,
+        user_id,
+        Some(expected_revision),
+        operation_id,
+        &format!("evidence-{operation_id}"),
+        &CoverageProjection::Unavailable {
+            reason: sotto_server::cloud_coverage_store::UnavailableReason::NeedsReconciliation,
+        },
+    )
+    .await
+    .expect("publish unavailable coverage");
+    tx.commit().await.expect("commit unavailable publication");
+    receipt.revision
+}
+
 fn eligibility_for(
     coverage: PersonCoverage,
     now_epoch: i64,
@@ -229,8 +252,89 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
     assert_eq!(notices[0].content.effective_at_epoch, Some(latest_end));
     assert_eq!(notices[0].due_at_epoch, latest_end);
 
+    let unavailable_revision =
+        publish_unavailable_coverage(&pool, USER_ID, revision, "export-episode-unavailable").await;
+    let unavailable_view = sotto_server::person_eligibility::evaluate_input(
+        &sotto_server::person_eligibility::EligibilityInput {
+            deployment_mode: DeploymentMode::Cloud,
+            billing_available: false,
+            account_initialized: true,
+            personal_billing_state: None,
+            coverage: sotto_server::person_eligibility::CoverageInput::Unavailable,
+        },
+    );
+    assert!(notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &unavailable_view,
+        Some(unavailable_revision),
+        now_epoch,
+    )
+    .await
+    .expect("unavailable evidence leaves notice unchanged"));
+    let unchanged_notice: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND kind='export_deadline' AND status='pending'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("pending notice survives unavailable evidence");
+    assert_eq!(unchanged_notice, "pending");
+
+    let mut recovery_intervals = coverage.paid_intervals.clone();
+    recovery_intervals.push(ConfirmedPaidInterval {
+        coverage_id: "renewal-recovery-term".into(),
+        source_id: "transferred-source".into(),
+        starts_at: now_epoch - 30 * 24 * 60 * 60,
+        paid_until: now_epoch - 24 * 60 * 60,
+        failed_renewal_id: Some("renewal-failed".into()),
+    });
+    let recovery_revision = publish_coverage(
+        &pool,
+        USER_ID,
+        Some(unavailable_revision),
+        "export-episode-renewal-recovery",
+        recovery_intervals.clone(),
+    )
+    .await;
+    let recovery_view = eligibility_for(
+        PersonCoverage {
+            beneficiary_id: USER_ID.into(),
+            paid_intervals: recovery_intervals.clone(),
+        },
+        now_epoch,
+    );
+    assert_eq!(
+        recovery_view.state,
+        sotto_server::person_eligibility::EligibilityState::RenewalRecovery
+    );
+    assert!(notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &recovery_view,
+        Some(recovery_revision),
+        now_epoch,
+    )
+    .await
+    .expect("supersede export notice during renewal recovery"));
+    assert!(notifications::list_for_user(&pool, USER_ID)
+        .await
+        .expect("list notices during renewal recovery")
+        .is_empty());
+    let superseded_status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND event_key=$2 AND policy_key='cloud-export-deadline-v1'",
+    )
+    .bind(USER_ID)
+    .bind(format!("cloud-export-window:{latest_end}:{deadline}"))
+    .fetch_one(&pool)
+    .await
+    .expect("load superseded export notice");
+    assert_eq!(superseded_status, "cancelled");
+
     let live_until = now_epoch + 10 * 24 * 60 * 60;
-    let mut extended_intervals = coverage.paid_intervals.clone();
+    let mut extended_intervals = recovery_intervals;
     extended_intervals.push(ConfirmedPaidInterval {
         coverage_id: "transfer-term-live".into(),
         source_id: "transferred-source".into(),
@@ -241,7 +345,7 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
     let next_revision = publish_coverage(
         &pool,
         USER_ID,
-        Some(revision),
+        Some(recovery_revision),
         "export-episode-extended",
         extended_intervals.clone(),
     )
@@ -315,10 +419,63 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
     assert_eq!(later_notice.0, "pending");
     assert_eq!(later_notice.1, live_until);
     assert_eq!(later_notice.2, live_until + 30 * 24 * 60 * 60);
+    let episode_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND kind='export_deadline' AND policy_key='cloud-export-deadline-v1'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count durable export episodes");
+    assert_eq!(episode_count, 2);
     assert!(notifications::list_for_user(&pool, USER_ID)
         .await
         .expect("future export notice is hidden")
         .is_empty());
+
+    // A missing projection is not evidence that the prior export episode was superseded.
+    sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id=$1")
+        .bind(USER_ID)
+        .execute(&pool)
+        .await
+        .expect("remove projection head for missing-evidence case");
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id=$1")
+        .bind(USER_ID)
+        .execute(&pool)
+        .await
+        .expect("remove projection facts for missing-evidence case");
+    sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id=$1")
+        .bind(USER_ID)
+        .execute(&pool)
+        .await
+        .expect("remove revisions for missing-evidence case");
+    let missing_view = sotto_server::person_eligibility::evaluate_input(
+        &sotto_server::person_eligibility::EligibilityInput {
+            deployment_mode: DeploymentMode::Cloud,
+            billing_available: false,
+            account_initialized: true,
+            personal_billing_state: None,
+            coverage: sotto_server::person_eligibility::CoverageInput::Missing,
+        },
+    );
+    assert!(notifications::reconcile_export_deadline_notice(
+        &pool,
+        USER_ID,
+        &missing_view,
+        None,
+        live_until + 1,
+    )
+    .await
+    .expect("missing projection preserves notice"));
+    let preserved_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+         AND kind='export_deadline' AND status='pending'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count pending export notices after missing projection");
+    assert_eq!(preserved_count, 1);
 
     cleanup(&pool, USER_ID).await;
 }
@@ -330,8 +487,11 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
         return;
     };
     const USER_ID: &str = "notification-test-export-route";
+    const OTHER_USER_ID: &str = "notification-test-export-other";
     cleanup(&pool, USER_ID).await;
+    cleanup(&pool, OTHER_USER_ID).await;
     seed_user(&pool, USER_ID).await;
+    seed_user(&pool, OTHER_USER_ID).await;
     sqlx::query("UPDATE users SET public_key=$2 WHERE id=$1")
         .bind(USER_ID)
         .bind(vec![7_u8; 32])
@@ -411,8 +571,13 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].kind, "export_deadline");
     assert_eq!(notices[0].content.deadline_epoch, Some(deadline));
+    assert!(notifications::list_for_user(&pool, OTHER_USER_ID)
+        .await
+        .expect("other recipient cannot see export notice")
+        .is_empty());
 
     cleanup(&pool, USER_ID).await;
+    cleanup(&pool, OTHER_USER_ID).await;
 }
 
 fn paid_view_coverage(previous: &PersonCoverage, live_until: i64) -> Vec<ConfirmedPaidInterval> {

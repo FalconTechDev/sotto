@@ -300,6 +300,17 @@ pub async fn reconcile_export_deadline_notice(
     if view.state == EligibilityState::Unavailable || view.state == EligibilityState::Expired {
         return Ok(true);
     }
+    if coverage_revision.is_none() {
+        // A missing projection cannot show that an earlier export episode was superseded. This
+        // is the normal first-read shape for a free account, so preserve existing notice state
+        // without treating the absence as an error or as proof that coverage ended.
+        if view.state == EligibilityState::Free {
+            return Ok(true);
+        }
+        return Err(NoticeError::InvalidContent(
+            "this eligibility state requires a complete coverage revision",
+        ));
+    }
 
     let mut tx = pool.begin().await?;
     let lock_key = format!("cloud-export-notice:{recipient_user_id}");
@@ -325,11 +336,6 @@ pub async fn reconcile_export_deadline_notice(
     }
 
     let intent = if view.state == EligibilityState::ExportOnly {
-        if coverage_revision.is_none() {
-            return Err(NoticeError::InvalidContent(
-                "export-only eligibility requires a complete coverage revision",
-            ));
-        }
         let deadline = view
             .export_until_epoch
             .ok_or(NoticeError::InvalidContent("export deadline is missing"))?;
