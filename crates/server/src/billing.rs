@@ -6812,6 +6812,25 @@ async fn apply_sponsored_renewal_failure(
     preparation: &SponsoredRenewalFailurePreparation,
     provenance: crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance,
 ) -> Result<()> {
+    // Callers hold the subscription advisory lock before reaching this point. A paid invoice may
+    // have committed after Stripe preparation observed the failed invoice as open; its durable
+    // processed receipt is authoritative and prevents late failure evidence from reviving it.
+    let paid_invoice = match preparation {
+        SponsoredRenewalFailurePreparation::Prepared(prepared) => {
+            Some((&prepared.subscription_id, &prepared.invoice_id))
+        }
+        SponsoredRenewalFailurePreparation::Rejected {
+            subscription_id,
+            invoice_id,
+            ..
+        } => Some((subscription_id, invoice_id)),
+        SponsoredRenewalFailurePreparation::NotApplicable => None,
+    };
+    if let Some((subscription_id, invoice_id)) = paid_invoice {
+        if sponsored_renewal_paid_receipt_exists(tx, subscription_id, invoice_id).await? {
+            return Ok(());
+        }
+    }
     match preparation {
         SponsoredRenewalFailurePreparation::NotApplicable => {}
         SponsoredRenewalFailurePreparation::Prepared(prepared) => {
@@ -6843,9 +6862,24 @@ async fn apply_sponsored_renewal_failure(
                     &prepared.invoice_id,
                     &allocation.beneficiary_id,
                     evidence.predecessor_period_end(),
+                    false,
                 )
                 .await?;
             }
+            let period_start = prepared
+                .affected
+                .first()
+                .map(|(_, evidence)| evidence.predecessor_period_end())
+                .ok_or_else(|| Error::Internal("sponsored renewal has no affected seats".into()))?;
+            enqueue_sponsored_renewal_failure_notices(
+                tx,
+                &prepared.organization_id,
+                &prepared.invoice_id,
+                "",
+                period_start,
+                true,
+            )
+            .await?;
         }
         SponsoredRenewalFailurePreparation::Rejected {
             context,
@@ -6875,11 +6909,31 @@ async fn apply_sponsored_renewal_failure(
                 invoice_id,
                 "",
                 *period_start,
+                true,
             )
             .await?;
         }
     }
     Ok(())
+}
+
+async fn sponsored_renewal_paid_receipt_exists(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+    invoice_id: &str,
+) -> Result<bool> {
+    if subscription_id.is_empty() || invoice_id.trim().is_empty() {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events \
+         WHERE event_type = 'invoice.paid' AND subscription_id = $1 \
+           AND provider_object_id = $2 AND processed_at IS NOT NULL)",
+    )
+    .bind(subscription_id)
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 
 struct PreparedSponsoredInvoiceSeat {
@@ -8277,6 +8331,7 @@ async fn enqueue_sponsored_renewal_failure_notices(
     invoice_id: &str,
     beneficiary_id: &str,
     period_start: i64,
+    include_administrators: bool,
 ) -> Result<()> {
     let deadline = period_start
         .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
@@ -8305,6 +8360,9 @@ async fn enqueue_sponsored_renewal_failure_notices(
         crate::notifications::enqueue_in_tx(tx, &intent)
             .await
             .map_err(notification_error)?;
+    }
+    if !include_administrators {
+        return Ok(());
     }
     let administrators: Vec<String> = sqlx::query_scalar(
         "SELECT membership.user_id FROM organization_memberships membership \
@@ -8354,10 +8412,13 @@ async fn resolve_sponsored_renewal_failures(
     invoice_id: &str,
     event_created: i64,
 ) -> Result<()> {
-    let rows = sqlx::query(
-        "SELECT failure.provider_namespace, failure.provider_account_id, \
+    sqlx::query(
+        "INSERT INTO cloud_provider_stripe_renewal_resolutions \
+         (provider_namespace, provider_account_id, provider_environment, event_id, \
+          beneficiary_id, allocation_id, resolution_invoice_id) \
+         SELECT failure.provider_namespace, failure.provider_account_id, \
                 failure.provider_environment, failure.event_id, failure.beneficiary_id, \
-                failure.allocation_id \
+                failure.allocation_id, $2 \
          FROM cloud_provider_stripe_renewal_failures failure \
          JOIN cloud_provider_allocations allocation ON allocation.allocation_id = failure.allocation_id \
          JOIN cloud_provider_payers payer ON payer.payer_id = allocation.payer_id \
@@ -8370,56 +8431,27 @@ async fn resolve_sponsored_renewal_failures(
                              AND resolution.event_id = failure.event_id \
                              AND resolution.beneficiary_id = failure.beneficiary_id \
                              AND resolution.allocation_id = failure.allocation_id) \
-         ORDER BY failure.event_id COLLATE \"C\", failure.beneficiary_id COLLATE \"C\", \
-                  failure.allocation_id COLLATE \"C\" LIMIT 129",
+         ON CONFLICT DO NOTHING",
     )
     .bind(subscription_id)
     .bind(invoice_id)
-    .fetch_all(&mut **tx)
+    .execute(&mut **tx)
     .await?;
-    if rows.len() > 128 {
-        return Err(Error::Internal(
-            "sponsored renewal resolution scope exceeded".into(),
-        ));
-    }
     let event_key = opaque_provider_id("sponsored-renewal-v1", &[organization_id, invoice_id]);
     let due_at_epoch: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
         .fetch_one(&mut **tx)
         .await?;
-    for row in rows {
-        let namespace: String = row.try_get("provider_namespace")?;
-        let account: String = row.try_get("provider_account_id")?;
-        let environment: String = row.try_get("provider_environment")?;
-        let event_id: String = row.try_get("event_id")?;
-        let beneficiary: String = row.try_get("beneficiary_id")?;
-        let allocation_id: String = row.try_get("allocation_id")?;
-        sqlx::query(
-            "INSERT INTO cloud_provider_stripe_renewal_resolutions \
-             (provider_namespace, provider_account_id, provider_environment, event_id, \
-              beneficiary_id, allocation_id, resolution_invoice_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
-        )
-        .bind(namespace)
-        .bind(account)
-        .bind(environment)
-        .bind(&event_id)
-        .bind(&beneficiary)
-        .bind(&allocation_id)
-        .bind(invoice_id)
-        .execute(&mut **tx)
-        .await?;
-    }
     let notices = sqlx::query(
         "SELECT DISTINCT recipient_user_id COLLATE \"C\" AS recipient_user_id, kind \
          FROM cloud_notice_outbox \
          WHERE event_key = $1 AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action') \
            AND policy_key IN ('sponsored-renewal-failure-v1','sponsored-renewal-action-v1') \
-         ORDER BY recipient_user_id COLLATE \"C\" LIMIT 129",
+         ORDER BY recipient_user_id COLLATE \"C\" LIMIT 257",
     )
     .bind(&event_key)
     .fetch_all(&mut **tx)
     .await?;
-    if notices.len() > 128 {
+    if notices.len() > 256 {
         return Err(Error::Internal(
             "sponsored renewal notice scope exceeded".into(),
         ));
@@ -8536,14 +8568,19 @@ async fn record_webhook_receipt(
 ) -> Result<bool> {
     let inserted = sqlx::query(
         "INSERT INTO stripe_webhook_events \
-         (event_id, event_type, api_version, stripe_created, subscription_id) \
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+         (event_id, event_type, api_version, stripe_created, subscription_id, provider_object_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (event_id) DO NOTHING",
     )
     .bind(&event.id)
     .bind(&event.kind)
     .bind(event.api_version.as_deref().unwrap_or("missing"))
     .bind(event.created)
     .bind(subscription_id)
+    .bind(
+        event.data.object["id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty()),
+    )
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -11247,7 +11284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sponsored_failure_fanout_records_one_event_and_notifies_each_beneficiary() {
+    async fn sponsored_failure_fanout_and_resolution_cover_bounded_recipients() {
         if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
             return;
         }
@@ -11272,17 +11309,25 @@ mod tests {
         let subscription_id = format!("sub_sponsor_failure_{fixture}");
         let organization_id = format!("sponsor_failure_org_{fixture}");
         let administrator_id = format!("sponsor_failure_admin_{fixture}");
-        let beneficiary_ids = [
-            format!("sponsor_failure_beneficiary_a_{fixture}"),
-            format!("sponsor_failure_beneficiary_b_{fixture}"),
+        let additional_administrator_ids = (0..127)
+            .map(|index| format!("sponsor_failure_admin_{fixture}_{index}"))
+            .collect::<Vec<_>>();
+        let beneficiary_ids = (0..128)
+            .map(|index| format!("sponsor_failure_beneficiary_{fixture}_{index}"))
+            .collect::<Vec<_>>();
+        let event_ids = [
+            format!("evt_sponsor_failure_a_{fixture}"),
+            format!("evt_sponsor_failure_b_{fixture}"),
         ];
-        let event_id = format!("evt_sponsor_failure_{fixture}");
         let invoice_id = format!("in_sponsor_failure_{fixture}");
         let payer_id = format!("payer_sponsor_failure_{fixture}");
         let context = ProviderContext::new("stripe", &account_id, ProviderEnvironment::Test)
             .expect("valid sponsor provider context");
 
-        for user_id in std::iter::once(&administrator_id).chain(beneficiary_ids.iter()) {
+        for user_id in std::iter::once(&administrator_id)
+            .chain(additional_administrator_ids.iter())
+            .chain(beneficiary_ids.iter())
+        {
             sqlx::query(
                 "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, $2, $1)",
             )
@@ -11298,14 +11343,19 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert sponsor organisation");
-        sqlx::query(
-            "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'owner')",
-        )
-        .bind(&organization_id)
-        .bind(&administrator_id)
-        .execute(&pool)
-        .await
-        .expect("insert sponsor administrator");
+        for (administrator, role) in std::iter::once((&administrator_id, "owner"))
+            .chain(additional_administrator_ids.iter().map(|id| (id, "admin")))
+        {
+            sqlx::query(
+                "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3)",
+            )
+            .bind(&organization_id)
+            .bind(administrator)
+            .bind(role)
+            .execute(&pool)
+            .await
+            .expect("insert sponsor administrator");
+        }
         sqlx::query(
             "INSERT INTO billing_sponsored_subscriptions \
              (organization_id, provider_customer_id, provider_subscription_id, status) \
@@ -11319,7 +11369,7 @@ mod tests {
         .expect("insert sponsored subscription");
 
         let mut allocations = Vec::new();
-        let mut evidence = Vec::new();
+        let mut evidence_by_event = [Vec::new(), Vec::new()];
         for (index, beneficiary_id) in beneficiary_ids.iter().enumerate() {
             let allocation_reference = format!("alloc_sponsor_failure_{fixture}_{index}");
             let allocation = VerifiedAllocation::new(
@@ -11339,29 +11389,31 @@ mod tests {
             )
             .expect("valid sponsored allocation");
             allocations.push(allocation);
-            evidence.push(
-                crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
-                    &event_id,
-                    &invoice_id,
-                    &format!("il_sponsor_failure_{fixture}_{index}"),
-                    &format!("in_sponsor_paid_{fixture}"),
-                    &format!("stripe:sponsor-predecessor:{fixture}"),
-                    &account_id,
-                    ProviderEnvironment::Test,
-                    &allocation_reference,
-                    &customer_id,
-                    &subscription_id,
-                    "si_sponsor_monthly",
-                    "price_sponsor_monthly",
-                    1_000,
-                    2_000,
-                    2_000,
-                    3_000,
-                    2_100,
-                    crate::cloud_provider_stripe::StripeInterval::Month,
-                )
-                .expect("valid sponsored failure evidence"),
-            );
+            for event_index in 0..event_ids.len() {
+                evidence_by_event[event_index].push(
+                    crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
+                        &event_ids[event_index],
+                        &invoice_id,
+                        &format!("il_sponsor_failure_{fixture}_{event_index}_{index}"),
+                        &format!("in_sponsor_paid_{fixture}"),
+                        &format!("stripe:sponsor-predecessor:{fixture}"),
+                        &account_id,
+                        ProviderEnvironment::Test,
+                        &allocation_reference,
+                        &customer_id,
+                        &subscription_id,
+                        "si_sponsor_monthly",
+                        "price_sponsor_monthly",
+                        1_000,
+                        2_000,
+                        2_000,
+                        3_000,
+                        2_100 + event_index as i64,
+                        crate::cloud_provider_stripe::StripeInterval::Month,
+                    )
+                    .expect("valid sponsored failure evidence"),
+                );
+            }
         }
         let mut registration = pool.begin().await.expect("begin allocation registration");
         for allocation in &allocations {
@@ -11374,12 +11426,12 @@ mod tests {
             .await
             .expect("commit allocation registration");
 
-        let event = evidence[0]
+        let event = evidence_by_event[0][0]
             .verified_event()
             .expect("invoice wide event identity");
         assert_eq!(
             event.normalized_payload_hash,
-            evidence[1]
+            evidence_by_event[0][127]
                 .verified_event()
                 .expect("second invoice wide event identity")
                 .normalized_payload_hash
@@ -11391,33 +11443,55 @@ mod tests {
                 organization_id: organization_id.clone(),
                 subscription_id: subscription_id.clone(),
                 invoice_id: invoice_id.clone(),
-                affected: allocations.into_iter().zip(evidence).collect(),
+                affected: allocations
+                    .iter()
+                    .cloned()
+                    .zip(evidence_by_event[0].clone())
+                    .collect(),
             },
         ));
-        let mut tx = pool
-            .begin()
+        let second_preparation = SponsoredRenewalFailurePreparation::Prepared(Box::new(
+            PreparedSponsoredRenewalFailure {
+                context: context.clone(),
+                event: evidence_by_event[1][0]
+                    .verified_event()
+                    .expect("second shared invoice event identity"),
+                organization_id: organization_id.clone(),
+                subscription_id: subscription_id.clone(),
+                invoice_id: invoice_id.clone(),
+                affected: allocations
+                    .iter()
+                    .cloned()
+                    .zip(evidence_by_event[1].clone())
+                    .collect(),
+            },
+        ));
+        for preparation in [&preparation, &second_preparation] {
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin grouped failure transaction");
+            apply_sponsored_renewal_failure(
+                &mut tx,
+                preparation,
+                crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+            )
             .await
-            .expect("begin grouped failure transaction");
-        apply_sponsored_renewal_failure(
-            &mut tx,
-            &preparation,
-            crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
-        )
-        .await
-        .expect("accept all beneficiary failures atomically");
-        tx.commit().await.expect("commit grouped failure");
+            .expect("accept every beneficiary failure atomically");
+            tx.commit().await.expect("commit grouped failure");
+        }
 
         let failures: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cloud_provider_stripe_renewal_failures WHERE event_id = $1",
+            "SELECT count(*) FROM cloud_provider_stripe_renewal_failures WHERE event_id = ANY($1)",
         )
-        .bind(&event_id)
+        .bind(event_ids.to_vec())
         .fetch_one(&pool)
         .await
         .expect("count per allocation failures");
         let receipts: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+            "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = ANY($1)",
         )
-        .bind(&event_id)
+        .bind(event_ids.to_vec())
         .fetch_one(&pool)
         .await
         .expect("count shared event receipts");
@@ -11439,9 +11513,9 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("sponsored subscription status");
-        assert_eq!(failures, 2);
-        assert_eq!(receipts, 1);
-        assert_eq!(notice_count, 3);
+        assert_eq!(failures, 256);
+        assert_eq!(receipts, 2);
+        assert_eq!(notice_count, 256);
         assert_eq!(status, "past_due");
 
         let event_key =
@@ -11464,9 +11538,9 @@ mod tests {
             .await
             .expect("commit matching invoice resolution");
         let resolutions: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = $1",
+            "SELECT count(*) FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = ANY($1)",
         )
-        .bind(&event_id)
+        .bind(event_ids.to_vec())
         .fetch_one(&pool)
         .await
         .expect("count resolved beneficiary evidence");
@@ -11487,36 +11561,99 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count retired failure notices");
-        assert_eq!(resolutions, 2);
-        assert_eq!(recovered_notices, 3);
-        assert_eq!(failure_notices, 3);
+        assert_eq!(resolutions, 256);
+        assert_eq!(recovered_notices, 256);
+        assert_eq!(failure_notices, 256);
+
+        let paid_event = Event {
+            id: format!("evt_sponsor_paid_{fixture}"),
+            created: 2_600,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.paid".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": invoice_id,
+                    "subscription": subscription_id,
+                }),
+            },
+        };
+        let mut paid_receipt = pool.begin().await.expect("begin paid invoice receipt");
+        record_webhook_receipt(&mut paid_receipt, &paid_event, Some(&subscription_id))
+            .await
+            .expect("record exact paid invoice identity");
+        mark_webhook_event_processed(&mut paid_receipt, &paid_event.id)
+            .await
+            .expect("mark paid invoice receipt complete");
+        paid_receipt
+            .commit()
+            .await
+            .expect("commit paid invoice receipt");
+        sqlx::query(
+            "UPDATE billing_sponsored_subscriptions SET status = 'active' WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("reflect the later paid invoice");
+        let mut late_failure = pool.begin().await.expect("begin late failure replay");
+        lock_subscription(&mut late_failure, &subscription_id)
+            .await
+            .expect("serialize the late failure behind payment");
+        apply_sponsored_renewal_failure(
+            &mut late_failure,
+            &preparation,
+            crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+        )
+        .await
+        .expect("processed paid invoice suppresses stale failure");
+        late_failure
+            .commit()
+            .await
+            .expect("commit ignored late failure");
+        let status_after_late_failure: String = sqlx::query_scalar(
+            "SELECT status FROM billing_sponsored_subscriptions WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .expect("subscription remains current after late failure");
+        assert_eq!(status_after_late_failure, "active");
 
         sqlx::query("DELETE FROM cloud_notice_outbox WHERE event_key = $1")
             .bind(event_key)
             .execute(&pool)
             .await
             .expect("remove test notices");
-        sqlx::query("DELETE FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = $1")
-            .bind(&event_id)
-            .execute(&pool)
-            .await
-            .expect("remove test resolutions");
-        sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE event_id = $1")
-            .bind(&event_id)
+        sqlx::query(
+            "DELETE FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .execute(&pool)
+        .await
+        .expect("remove test resolutions");
+        sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE event_id = ANY($1)")
+            .bind(event_ids.to_vec())
             .execute(&pool)
             .await
             .expect("remove test evidence");
-        sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
-            .bind(&event_id)
-            .execute(&pool)
-            .await
-            .expect("remove test invalidations");
-        sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
-            .bind(&event_id)
+        sqlx::query(
+            "DELETE FROM cloud_provider_invalidation_associations WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .execute(&pool)
+        .await
+        .expect("remove test invalidations");
+        sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = ANY($1)")
+            .bind(event_ids.to_vec())
             .execute(&pool)
             .await
             .expect("remove test event receipt");
-        for allocation_index in 0..2 {
+        sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(&paid_event.id)
+            .execute(&pool)
+            .await
+            .expect("remove paid webhook receipt");
+        for allocation_index in 0..beneficiary_ids.len() {
             let allocation_id = format!("allocation_sponsor_failure_{fixture}_{allocation_index}");
             let source_id = format!("source_sponsor_failure_{fixture}_{allocation_index}");
             sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
@@ -11563,7 +11700,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("remove test organisation");
-        for user_id in std::iter::once(&administrator_id).chain(beneficiary_ids.iter()) {
+        for user_id in std::iter::once(&administrator_id)
+            .chain(additional_administrator_ids.iter())
+            .chain(beneficiary_ids.iter())
+        {
             sqlx::query("DELETE FROM users WHERE id = $1")
                 .bind(user_id)
                 .execute(&pool)
