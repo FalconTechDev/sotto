@@ -49,6 +49,8 @@ pub enum NoticeKind {
     FoundingExpiry,
     PriceChange,
     RecoveryResolved,
+    SponsoredRenewalFailure,
+    SponsoredRenewalAction,
 }
 
 impl NoticeKind {
@@ -64,6 +66,8 @@ impl NoticeKind {
             Self::FoundingExpiry => "founding_expiry",
             Self::PriceChange => "price_change",
             Self::RecoveryResolved => "recovery_resolved",
+            Self::SponsoredRenewalFailure => "sponsored_renewal_failure",
+            Self::SponsoredRenewalAction => "sponsored_renewal_action",
         }
     }
 }
@@ -625,6 +629,14 @@ mod tests {
     #[test]
     fn kind_and_channel_names_are_stable() {
         assert_eq!(NoticeKind::PriceChange.as_str(), "price_change");
+        assert_eq!(
+            NoticeKind::SponsoredRenewalFailure.as_str(),
+            "sponsored_renewal_failure"
+        );
+        assert_eq!(
+            NoticeKind::SponsoredRenewalAction.as_str(),
+            "sponsored_renewal_action"
+        );
         assert_eq!(
             NoticeKind::PayerTransferInvitation.as_str(),
             "payer_transfer_invitation"
