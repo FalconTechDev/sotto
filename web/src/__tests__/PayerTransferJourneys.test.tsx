@@ -117,6 +117,17 @@ describe("payer transfer journeys", () => {
     expect(screen.queryByRole("button", { name: "Load older transfers" })).not.toBeInTheDocument();
   });
 
+  it("shows invitations as expired once their renewal boundary has passed", async () => {
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [transfer({ effectiveFrom: 1 })],
+      nextCursor: null,
+    });
+    render(<PayerTransferInbox />);
+    expect(await screen.findByText(/expired at the renewal boundary/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Accept transfer request" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Decline request" })).not.toBeInTheDocument();
+  });
+
   it("keeps personal payer invitations unaccepted until setup is available", async () => {
     vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: true, setupAvailable: false });
     vi.mocked(api.fetchPayerTransfers).mockResolvedValue({ transfers: [transfer({

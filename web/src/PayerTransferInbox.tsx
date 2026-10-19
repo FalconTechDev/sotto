@@ -32,9 +32,11 @@ function payer(kind: string, organizationId: string | null): string {
   return kind === "personal" ? "personal billing" : `organisation ${organizationId ?? "billing"}`;
 }
 
-function stateCopy(state: string): string {
+function stateCopy(state: string, expiredInvitation = false): string {
   switch (state) {
-    case "awaiting_consent": return "Waiting for the other payer to respond.";
+    case "awaiting_consent": return expiredInvitation
+      ? "This invitation expired at the renewal boundary. Ask the initiator to start a new request."
+      : "Waiting for the other payer to respond.";
     case "pending": return "Accepted. The billing change is being prepared; it is not complete yet.";
     case "destination_prepared": return "The change is being prepared for the renewal date.";
     case "destination_paid":
@@ -190,7 +192,9 @@ export function PayerTransferInbox() {
     <ul className="items">
       {transfers.map((transfer) => {
         const incoming = transfer.participantRole === "counterparty";
-        const actionable = transfer.state === "awaiting_consent";
+        const invitationExpired = transfer.state === "awaiting_consent"
+          && Math.floor(Date.now() / 1000) >= Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom);
+        const actionable = transfer.state === "awaiting_consent" && !invitationExpired;
         const setupRequired = transfer.state === "pending"
           && transfer.destinationKind === "personal"
           && transfer.beneficiaryId === userId
@@ -200,8 +204,8 @@ export function PayerTransferInbox() {
           <strong>{incoming ? "Incoming request" : "Outgoing request"}</strong>
           <span className="meta">{payer(transfer.sourceKind, transfer.sourceOrganizationId)} → {payer(transfer.destinationKind, transfer.destinationOrganizationId)}</span>
           <p>{pounds(transfer.amountPence)} per {transfer.interval}; renewal {date(transfer.effectiveFrom)}.</p>
-          {actionable && <p className="muted">Respond by {date(transfer.consentExpiresAtEpoch)}.</p>}
-          <p className="muted">{stateCopy(transfer.state)}</p>
+          {actionable && <p className="muted">Respond by {date(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
+          <p className="muted">{stateCopy(transfer.state, invitationExpired)}</p>
           {transfer.state === "unknown" && <p className="muted">Contact Sotto support before making another billing change.</p>}
           {actionable && incoming && transfer.destinationKind === "personal" && !setupAvailable
             && <p className="muted">Personal payment setup is not available on this server yet. The request has not been accepted.</p>}
