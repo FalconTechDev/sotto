@@ -390,7 +390,6 @@ impl StripeRenewalFailureEvidence {
     }
 }
 
-pub(crate) const RENEWAL_EVIDENCE_VERSION: i16 = 1;
 pub(crate) const PERSONAL_RENEWAL_EVIDENCE_VERSION: i16 = 1;
 pub(crate) const SPONSORED_RENEWAL_EVIDENCE_VERSION: i16 = 2;
 
@@ -976,14 +975,12 @@ fn canonical_event_encoding(evidence: &StripeRenewalFailureEvidence) -> Vec<u8> 
 }
 
 fn evidence_reference(evidence: &StripeRenewalFailureEvidence) -> String {
-    let mut encoder = CanonicalEncoder::new(
-        "stripe renewal failure evidence",
-        if evidence.provider_price_id.is_some() {
-            SPONSORED_RENEWAL_EVIDENCE_VERSION as u16
-        } else {
-            PERSONAL_RENEWAL_EVIDENCE_VERSION as u16
-        },
-    );
+    let version = if evidence.provider_price_id.is_some() {
+        SPONSORED_RENEWAL_EVIDENCE_VERSION
+    } else {
+        PERSONAL_RENEWAL_EVIDENCE_VERSION
+    };
+    let mut encoder = CanonicalEncoder::new("stripe renewal failure evidence", version as u16);
     encoder.string("renewal_id", &evidence.renewal_id);
     encoder.field_bytes("event", &canonical_event_encoding(evidence));
     encoder.string("predecessor_invoice", &evidence.predecessor_invoice_id);
@@ -1010,7 +1007,7 @@ fn evidence_reference(evidence: &StripeRenewalFailureEvidence) -> String {
     }
     format!(
         "stripe:renewal-failure:v{}:{}",
-        RENEWAL_EVIDENCE_VERSION,
+        version,
         hex_lower(&Sha256::digest(encoder.finish()))
     )
 }
@@ -1240,6 +1237,9 @@ mod identity_tests {
             StripeInterval::Month,
         )
         .unwrap();
+        assert!(original
+            .evidence_reference
+            .starts_with("stripe:renewal-failure:v2:"));
         let stored = || StoredStripeRenewalFailure {
             version: SPONSORED_RENEWAL_EVIDENCE_VERSION,
             evidence_reference: original.evidence_reference.clone(),
@@ -1284,8 +1284,11 @@ mod identity_tests {
     #[test]
     fn stored_reconstruction_rejects_reference_tampering() {
         let original = evidence();
+        assert!(original
+            .evidence_reference
+            .starts_with("stripe:renewal-failure:v1:"));
         let mut stored = StoredStripeRenewalFailure {
-            version: RENEWAL_EVIDENCE_VERSION,
+            version: PERSONAL_RENEWAL_EVIDENCE_VERSION,
             evidence_reference: original.evidence_reference.clone(),
             renewal_id: original.renewal_id.clone(),
             event_id: original.event_id.clone(),
