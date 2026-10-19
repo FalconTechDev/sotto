@@ -8677,6 +8677,7 @@ fn event_subscription_id(event: &Event) -> Option<String> {
                 .map(str::to_string)
         }
         "invoice.paid" => invoice_subscription_id(&event.data.object).map(str::to_string),
+        "invoice.payment_failed" => invoice_subscription_id_claim(&event.data.object),
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
         }
@@ -11596,9 +11597,24 @@ mod tests {
         .await
         .expect("reflect the later paid invoice");
         let mut late_failure = pool.begin().await.expect("begin late failure replay");
-        lock_subscription(&mut late_failure, &subscription_id)
-            .await
-            .expect("serialize the late failure behind payment");
+        let late_failure_event = Event {
+            id: event_ids[0].clone(),
+            created: 2_100,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": invoice_id,
+                    "subscription": subscription_id,
+                }),
+            },
+        };
+        assert_eq!(
+            record_webhook_event(&mut late_failure, &late_failure_event)
+                .await
+                .expect("failure receipt takes the subscription lock"),
+            EventDisposition::Apply
+        );
         apply_sponsored_renewal_failure(
             &mut late_failure,
             &preparation,
@@ -11610,6 +11626,15 @@ mod tests {
             .commit()
             .await
             .expect("commit ignored late failure");
+        let failure_receipt: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT subscription_id, provider_object_id FROM stripe_webhook_events WHERE event_id = $1",
+        )
+        .bind(&late_failure_event.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load failure receipt identity");
+        assert_eq!(failure_receipt.0.as_deref(), Some(subscription_id.as_str()));
+        assert_eq!(failure_receipt.1.as_deref(), Some(invoice_id.as_str()));
         let status_after_late_failure: String = sqlx::query_scalar(
             "SELECT status FROM billing_sponsored_subscriptions WHERE organization_id = $1",
         )
@@ -13263,6 +13288,30 @@ mod tests {
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
         assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
+    }
+
+    #[test]
+    fn invoice_payment_failed_events_use_the_subscription_from_the_invoice_parent() {
+        let event = Event {
+            id: "evt_failed_1".into(),
+            created: 1_800_000_000,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": "in_failed_1",
+                    "parent": {
+                        "type": "subscription_details",
+                        "subscription_details": {"subscription": {"id": "sub_failed_1"}}
+                    }
+                }),
+            },
+        };
+
+        assert_eq!(
+            event_subscription_id(&event).as_deref(),
+            Some("sub_failed_1")
+        );
     }
 
     #[test]
