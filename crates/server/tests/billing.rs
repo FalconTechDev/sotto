@@ -1440,6 +1440,47 @@ async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoic
     .unwrap();
     assert_eq!(failure_notice_count, 1);
 
+    // A late payment can arrive after the subscription itself was cancelled. It should retire
+    // the stale failure warning without presenting the cancelled subscription as active again.
+    sqlx::query("UPDATE billing_personal_accounts SET state='canceled' WHERE user_id=$1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='pending', cancelled_at=NULL \
+         WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let late_paid_after_cancel = make_paid(
+        &format!("evt_paid_after_cancel_{fixture}"),
+        108,
+        &invoice_id,
+        paid_through,
+    );
+    assert_eq!(send(late_paid_after_cancel).await, StatusCode::OK);
+    let (account_state, failed_notice_status): (String, String) = sqlx::query_as(
+        "SELECT (SELECT state FROM billing_personal_accounts WHERE user_id=$1), \
+                (SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 \
+                   AND kind='failed_renewal')",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(account_state, "canceled");
+    assert_eq!(failed_notice_status, "cancelled");
+    let visible_after_cancelled_payment =
+        sotto_server::notifications::list_for_user(&pool, &user_id)
+            .await
+            .expect("list notices after late cancelled payment");
+    assert!(visible_after_cancelled_payment
+        .iter()
+        .all(|notice| notice.kind != "failed_renewal"));
+
     // Notices contain only fixed copy and dates, never the payment, invoice, customer or
     // subscription references used to derive their opaque identity.
     let payload_text: String = sqlx::query_scalar(
@@ -1484,6 +1525,7 @@ async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoic
             recovered_paid_event,
             paid_before_failure_event,
             late_failure_event,
+            format!("evt_paid_after_cancel_{fixture}"),
         ])
         .execute(&pool)
         .await

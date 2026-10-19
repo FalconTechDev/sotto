@@ -7391,7 +7391,7 @@ async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) ->
     }
 
     let account = sqlx::query(
-        "SELECT user_id, paid_through_epoch FROM billing_personal_accounts \
+        "SELECT user_id, paid_through_epoch, state FROM billing_personal_accounts \
          WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
            AND state IN ('active','past_due','unpaid') FOR UPDATE",
     )
@@ -7474,9 +7474,9 @@ async fn enqueue_personal_renewal_recovered_notice(
         return Ok(());
     };
     let account = sqlx::query(
-        "SELECT user_id, paid_through_epoch FROM billing_personal_accounts \
+        "SELECT user_id, paid_through_epoch, state FROM billing_personal_accounts \
          WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
-           AND state IN ('active','past_due','unpaid') FOR UPDATE",
+           AND state IN ('active','past_due','unpaid','canceled') FOR UPDATE",
     )
     .bind(subscription_id)
     .bind(customer_id)
@@ -7487,6 +7487,7 @@ async fn enqueue_personal_renewal_recovered_notice(
     };
     let user_id: String = account.try_get("user_id")?;
     let paid_through: Option<i64> = account.try_get("paid_through_epoch")?;
+    let account_state: String = account.try_get("state")?;
     if paid_through.is_none_or(|paid_through| paid_through < period_end) {
         return Ok(());
     }
@@ -7517,6 +7518,11 @@ async fn enqueue_personal_renewal_recovered_notice(
     .bind(&event_key)
     .execute(&mut **tx)
     .await?;
+    // A late paid invoice can arrive after cancellation. It clears the stale payment warning,
+    // but must not imply that the cancelled subscription has resumed.
+    if account_state == "canceled" {
+        return Ok(());
+    }
     let due_at_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
         .fetch_one(&mut **tx)
         .await?;
