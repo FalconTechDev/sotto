@@ -321,16 +321,30 @@ describe("CloudAccountPanel", () => {
   });
 
   it("shows durable account notices without unlocking the vault", async () => {
-    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "export_only", actions: { ...base.actions, export: true } });
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "renewal_recovery", payer: "personal" });
+    vi.mocked(api.createPersonalPortal).mockResolvedValue({
+      state: "past_due", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
+      foundingPriceEndEpoch: null, standardRenewalAmountPence: null,
+      foundingTransitionStatus: null, foundingTransitionReason: null,
+    });
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([{
-      noticeId: "notice-1", kind: "export_deadline", channel: "in_app",
-      content: { title: "Export window", detail: "Download your encrypted export.", effectiveAtEpoch: null, deadlineEpoch: 2_000_000_000, amountPence: null },
+      noticeId: "notice-1", kind: "failed_renewal", channel: "in_app",
+      content: { title: "Action needed for your Cloud renewal", detail: "Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.", effectiveAtEpoch: 1_900_000_000, deadlineEpoch: 1_901_209_600, amountPence: null },
       dueAtEpoch: 1_900_000_000, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_000,
+    }, {
+      noticeId: "notice-2", kind: "recovery_resolved", channel: "in_app",
+      content: { title: "Your Cloud renewal is up to date", detail: "Your renewal payment was received. No further action is needed.", effectiveAtEpoch: 1_900_000_100, deadlineEpoch: null, amountPence: null },
+      dueAtEpoch: 1_900_000_100, status: "pending", lastErrorCode: null, deliveredAtEpoch: null, createdAtEpoch: 1_900_000_100,
     }]);
 
     render(<CloudAccountPanel />);
 
     expect(await screen.findByRole("heading", { name: "Account notices" })).toBeInTheDocument();
-    expect(screen.getByText("Download your encrypted export.")).toBeInTheDocument();
+    expect(screen.getByText("Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.")).toBeInTheDocument();
+    expect(screen.getByText("Your Cloud renewal is up to date")).toBeInTheDocument();
+    expect(screen.getByText(/Deadline:/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Update payment method" }));
+    expect(await screen.findByText("The billing portal is not available yet.")).toBeInTheDocument();
+    expect(api.createPersonalPortal).toHaveBeenCalledTimes(1);
   });
 });
