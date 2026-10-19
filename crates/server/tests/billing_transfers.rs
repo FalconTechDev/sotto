@@ -10,13 +10,14 @@ use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_source_restoration_payment, begin_transfer,
     claim_transfer_for_execution, complete_source_adjustment, complete_source_restoration,
     defer_execution_lease, finish_execution_lease, list_manual_review_transfers,
-    load_manual_review_transfer, lock_and_check_no_live_transfer, mark_failed,
-    record_destination_paid, record_destination_prepared, record_destination_schedule,
-    record_destination_setup_completion, record_operator_review_decision,
-    record_source_restoration_payment, record_source_restoration_subscription,
-    release_execution_lease, repark_mismatched_destination_invoice, request_source_restoration,
-    withdraw_transfer, BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer,
-    TransferRequest, TransferReviewAction, TransferState,
+    load_manual_review_transfer, lock_and_check_no_live_transfer,
+    lock_and_check_no_provider_transfer_except, mark_failed, record_destination_paid,
+    record_destination_prepared, record_destination_schedule, record_destination_setup_completion,
+    record_operator_review_decision, record_source_restoration_payment,
+    record_source_restoration_subscription, release_execution_lease,
+    repark_mismatched_destination_invoice, request_source_restoration, withdraw_transfer,
+    BeginTransfer, TransferError, TransferExecutionFailure, TransferPayer, TransferRequest,
+    TransferReviewAction, TransferState,
 };
 use sotto_server::db;
 use sotto_server::founding_allocator::{FoundingDate, FoundingOffer};
@@ -1184,6 +1185,13 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
         accept_transfer(&mut tx, &first_id, &user, 1_800_000_000).await,
         Err(TransferError::Unauthorised)
     ));
+    assert!(matches!(
+        lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_000).await,
+        Err(TransferError::InvitationPending)
+    ));
+    lock_and_check_no_provider_transfer_except(&mut tx, &[&user], &[], 1_800_000_000)
+        .await
+        .expect("provider webhooks must continue during consent");
     accept_transfer(&mut tx, &first_id, &other, 1_800_000_000)
         .await
         .expect("counterparty accepts first transfer");
@@ -1192,6 +1200,10 @@ async fn concurrent_live_transfer_is_rejected_and_personal_actor_is_required() {
     let mut tx = pool.begin().await.expect("begin mutation fence check");
     assert!(matches!(
         lock_and_check_no_live_transfer(&mut tx, &[&user], 1_800_000_000).await,
+        Err(TransferError::AlreadyInProgress)
+    ));
+    assert!(matches!(
+        lock_and_check_no_provider_transfer_except(&mut tx, &[&user], &[], 1_800_000_000).await,
         Err(TransferError::AlreadyInProgress)
     ));
     tx.rollback().await.expect("rollback mutation fence check");

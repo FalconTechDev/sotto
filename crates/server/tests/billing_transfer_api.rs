@@ -347,9 +347,17 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     assert_eq!(created["state"], "awaiting_consent");
     assert_eq!(created["participant_role"], "initiator");
     let transfer_id = created["transfer_id"].as_str().expect("transfer id");
+    let consent_expires_at = created["consent_expires_at_epoch"]
+        .as_i64()
+        .expect("consent deadline");
+    let effective_from = created["effective_from"]
+        .as_i64()
+        .expect("renewal boundary");
+    assert!(consent_expires_at <= effective_from);
     assert!(
-        created["consent_expires_at_epoch"].as_i64().unwrap() >= now_epoch() + 7 * 24 * 60 * 60 - 5,
-        "consent should have a seven-day deadline independent of the quote"
+        consent_expires_at >= now_epoch() + 7 * 24 * 60 * 60 - 5
+            || consent_expires_at == effective_from,
+        "consent lasts up to seven days, but never past the renewal boundary"
     );
     assert!(created.get("provider_idempotency_key").is_none());
     assert!(created.get("destination_payment_reference").is_none());
@@ -388,6 +396,20 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     assert_eq!(
         replay_notice_count, 1,
         "replay must not duplicate the notice"
+    );
+
+    let (status, pending_body) = request(
+        &app,
+        "POST",
+        "/billing/transfers/quote",
+        &beneficiary_token,
+        Some(draft.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{pending_body}");
+    assert!(
+        pending_body.contains("the person who started it or the invited payer can withdraw it"),
+        "blocked billing changes should identify who can clear an invitation"
     );
 
     let (status, stranger_body) = request(

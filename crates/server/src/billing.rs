@@ -8101,7 +8101,7 @@ async fn lock_sponsored_subscription_beneficiaries_except(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    billing_transfers::lock_and_check_no_live_transfer_except(
+    billing_transfers::lock_and_check_no_provider_transfer_except(
         tx,
         &beneficiary_refs,
         allowed_transfer_ids,
@@ -8171,7 +8171,7 @@ async fn subscription_updated(
             Error::Config("personal subscription event has no subscription id".into())
         })?;
         let transfer_ids = live_transfer_ids_for_subscription(tx, subscription_id).await?;
-        billing_transfers::lock_and_check_no_live_transfer_except(
+        billing_transfers::lock_and_check_no_provider_transfer_except(
             tx,
             &[user_id.as_str()],
             &transfer_ids,
@@ -8495,7 +8495,7 @@ async fn invoice_paid(
     } else {
         Vec::new()
     };
-    billing_transfers::lock_and_check_no_live_transfer_except(
+    billing_transfers::lock_and_check_no_provider_transfer_except(
         tx,
         &[personal_user_id.as_str()],
         &allowed_transfer_ids,
@@ -9031,7 +9031,7 @@ async fn subscription_deleted(
             Error::Config("personal subscription event has no subscription id".into())
         })?;
         let transfer_ids = live_transfer_ids_for_subscription(tx, subscription_id).await?;
-        billing_transfers::lock_and_check_no_live_transfer_except(
+        billing_transfers::lock_and_check_no_provider_transfer_except(
             tx,
             &[user_id.as_str()],
             &transfer_ids,
