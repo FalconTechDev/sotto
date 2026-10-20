@@ -763,6 +763,16 @@ pub async fn accept_provider_invalidation(
     if updated.rows_affected() != 1 {
         return Err(ProviderAdapterError::InvalidationConflict);
     }
+    sqlx::query(
+        "INSERT INTO cloud_coverage_revalidation_jobs (beneficiary_id) \
+         VALUES ($1) ON CONFLICT (beneficiary_id) DO UPDATE \
+         SET status = 'pending', next_attempt_at = now(), attempt_count = 0, \
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+             last_error_code = NULL, updated_at = now()",
+    )
+    .bind(&allocation.beneficiary_id)
+    .execute(&mut **tx)
+    .await?;
     ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
     if ingest_enabled {
         enqueue_refresh_job(tx, context, event, allocation).await?;

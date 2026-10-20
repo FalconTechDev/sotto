@@ -21,9 +21,9 @@ use uuid::Uuid;
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::SourceBinding;
 use sotto_server::cloud_provider::{
-    accept_provider_invalidation, AllocationState, CollectionLimits, InvalidationDisposition,
-    ProviderCollectionError, ProviderContext, ProviderEnvironment, ProviderHistoryClient,
-    ProviderHistoryPage, VerifiedAllocation, VerifiedProviderEvent,
+    accept_provider_invalidation, register_verified_allocation, AllocationState, CollectionLimits,
+    InvalidationDisposition, ProviderCollectionError, ProviderContext, ProviderEnvironment,
+    ProviderHistoryClient, ProviderHistoryPage, VerifiedAllocation, VerifiedProviderEvent,
 };
 use sotto_server::cloud_provider_refresh::{refresh_verified_event, ProviderRefreshError};
 use sotto_server::db;
@@ -411,6 +411,72 @@ async fn accepted_invalidation_during_fetch_rejects_refresh_completion() {
             .await
             .expect("read pending receipt");
     assert_eq!(status, "pending");
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn accepted_invalidation_requeues_authority_without_event_refresh_worker() {
+    let Some(pool) = pool_or_skip(8).await else {
+        return;
+    };
+    let (fixture, event, allocation) = fixture(&pool).await;
+    let context = context();
+    let mut register = pool.begin().await.expect("begin provider registration");
+    register_verified_allocation(&mut register, &context, &allocation)
+        .await
+        .expect("register allocation and source");
+    register
+        .commit()
+        .await
+        .expect("commit provider registration");
+    record_event(&pool, &event).await;
+    sqlx::query(
+        "UPDATE cloud_coverage_revalidation_jobs \
+         SET status = 'leased', next_attempt_at = now() + interval '1 day', \
+             attempt_count = 4, lease_owner = 'stale-worker', lease_token = 'stale-token', \
+             lease_expires_at = now() + interval '1 hour' \
+         WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .execute(&pool)
+    .await
+    .expect("park future revalidation job");
+
+    let mut tx = pool.begin().await.expect("begin provider invalidation");
+    assert_eq!(
+        accept_provider_invalidation(&mut tx, &context, &event, &allocation, false)
+            .await
+            .expect("accept invalidation without event refresh"),
+        InvalidationDisposition::Accepted { generation: 1 }
+    );
+    tx.commit().await.expect("commit provider invalidation");
+
+    let job = sqlx::query(
+        "SELECT status, next_attempt_at <= now() AS due, attempt_count, lease_owner, \
+                lease_token, lease_expires_at IS NULL AS lease_cleared, last_error_code \
+         FROM cloud_coverage_revalidation_jobs WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read revalidation job");
+    assert_eq!(job.try_get::<String, _>("status").unwrap(), "pending");
+    assert!(job.try_get::<bool, _>("due").unwrap());
+    assert_eq!(job.try_get::<i32, _>("attempt_count").unwrap(), 0);
+    assert_eq!(
+        job.try_get::<Option<String>, _>("lease_owner").unwrap(),
+        None
+    );
+    assert_eq!(
+        job.try_get::<Option<String>, _>("lease_token").unwrap(),
+        None
+    );
+    assert!(job.try_get::<bool, _>("lease_cleared").unwrap());
+    assert_eq!(
+        job.try_get::<Option<String>, _>("last_error_code").unwrap(),
+        None
+    );
+
     cleanup(&pool, &fixture).await;
 }
 
