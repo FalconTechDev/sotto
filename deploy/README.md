@@ -136,6 +136,20 @@ Changing it never shortens an existing operation's stored `purge_after` deadline
 Choose a value that covers the managed-backup and export lifecycle: backups taken before purge can
 retain ciphertext after the recovery window, and self-hosted operators must remove unmanaged copies.
 
+Personal Cloud expiry review is separately disabled by default. `SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED=1`
+starts a bounded reconciler that snapshots only explicitly personal resources and validates them
+after the person's existing export deadline. It never deletes resources, writes deletion receipts or
+tombstones, or enables the retention purge path. Keep it off until a current-candidate backup and
+tombstone restore has been verified and the customer-notice evidence has been reviewed.
+
+The protected `/ops/cloud/retention` inspection and action routes are mounted only when
+`SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN` is configured. Use a dedicated value of at least 32
+characters; do not reuse a billing, deployment, or metrics token. The surface returns fixed reason
+codes, counts, deadlines, and opaque job fingerprints. `hold`, `cancel`, and `retry_dry_run` never
+enable purge; an operator-supplied label is audit text, not an authenticated identity. A successful
+dry run is review evidence, not permission to delete data. This slice deliberately has no purge
+route or purge-worker switch.
+
 On a 1 GB host, give the kernel some headroom before the first start:
 
 ```sh
