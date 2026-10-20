@@ -36,15 +36,18 @@ pub async fn enqueue(
     }
     let job_id = format!("founding-schedule:{}", award.award_id);
     let idempotency_key = format!("founding-transition:{}:1", award.award_id);
+    let price_notice_eligible = award
+        .original_end_epoch
+        .is_some_and(|transition_epoch| transition_epoch > 0);
     sqlx::query(
         "INSERT INTO billing_founding_schedule_jobs \
          (job_id, award_id, beneficiary_id, payer_kind, payer_id, provider_subscription_id, \
           provider_idempotency_key, price_notice_eligible) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
          ON CONFLICT (award_id) DO UPDATE SET \
            beneficiary_id = EXCLUDED.beneficiary_id, payer_kind = EXCLUDED.payer_kind, \
            payer_id = EXCLUDED.payer_id, provider_subscription_id = EXCLUDED.provider_subscription_id, \
-           price_notice_eligible = TRUE, \
+           price_notice_eligible = EXCLUDED.price_notice_eligible, \
            state = 'pending', provider_schedule_id = NULL, attempt_count = 0, last_error_code = NULL, \
            next_attempt_at = now(), \
            version = billing_founding_schedule_jobs.version + 1, \
@@ -63,6 +66,7 @@ pub async fn enqueue(
     .bind(&award.payer_id)
     .bind(subscription_id)
     .bind(idempotency_key)
+    .bind(price_notice_eligible)
     .execute(&mut **tx)
     .await?;
     Ok(())
