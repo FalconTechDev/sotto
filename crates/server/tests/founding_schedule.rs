@@ -217,6 +217,16 @@ async fn founding_schedule_retargets_and_cancellation_wins_provider_races() {
     db::migrate(pool)
         .await
         .expect("apply founding schedule migration");
+    let legacy_notice_eligible: bool = sqlx::query_scalar(
+        "SELECT price_notice_eligible FROM billing_founding_schedule_jobs WHERE award_id='founding-schedule-award'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read migrated legacy notice eligibility");
+    assert!(
+        !legacy_notice_eligible,
+        "migration must not backfill notices for pre-existing awards"
+    );
     assert!(sqlx::query(
         "UPDATE billing_founding_awards SET original_start_epoch = NULL, original_end_epoch = 1 \
          WHERE award_id = 'founding-schedule-award'",
