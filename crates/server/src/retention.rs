@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use crate::cloud_coverage::{self, CoverageState, EXPORT_WINDOW_SECONDS};
-use crate::cloud_coverage_store::{self, StoreError};
+use crate::cloud_coverage_store::StoreError;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
@@ -661,18 +661,20 @@ async fn run_once_with_scope(
     let Some(lease) = claim_due(pool, worker_id, mode, personal_only).await? else {
         return Ok(None);
     };
-    let coverage_snapshot = if mode == RetentionMode::DryRun {
-        match lease.subject_user_id.as_deref() {
-            Some(user_id) => Some(cloud_coverage_store::load(pool, user_id).await),
-            None => None,
-        }
-    } else {
-        None
-    };
     let mut tx = pool.begin().await?;
-    // Production retention takes the coverage head before the job row. Candidate reconciliation
-    // uses the same order, so a payment projection and a dry run cannot deadlock or observe a
-    // half-updated episode.
+    // Collection completion locks the coordinator before publishing the coverage head. Keep
+    // that order here, then retain the existing head-before-job order used by candidate
+    // reconciliation.
+    if mode == RetentionMode::DryRun && personal_only {
+        if let Some(subject) = lease.subject_user_id.as_deref() {
+            sqlx::query_scalar::<_, String>(
+                "SELECT beneficiary_id FROM cloud_coverage_coordinators WHERE beneficiary_id=$1 FOR SHARE",
+            )
+            .bind(subject)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
+    }
     let locked_coverage_revision = if mode == RetentionMode::DryRun && personal_only {
         match lease.subject_user_id.as_deref() {
             Some(subject) => sqlx::query_scalar::<_, Option<i64>>(
@@ -734,10 +736,32 @@ async fn run_once_with_scope(
         return Err(RetentionError::LeaseLost);
     }
     if mode == RetentionMode::DryRun && personal_only {
+        let authority_snapshot = match lease.subject_user_id.as_deref() {
+            Some(subject) => {
+                let now_epoch: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                Some(
+                    match crate::cloud_coverage_authority::load_current_in_transaction(
+                        &mut tx, subject, now_epoch,
+                    )
+                    .await
+                    {
+                        Ok(state) => state,
+                        Err(crate::cloud_coverage_authority::AuthorityError::Database(error))
+                        | Err(crate::cloud_coverage_authority::AuthorityError::Store(
+                            StoreError::Database(error),
+                        )) => return Err(RetentionError::Database(error)),
+                        Err(_) => crate::cloud_coverage_authority::AuthorityState::Stale,
+                    },
+                )
+            }
+            None => None,
+        };
         if let Some(reason) = validate_dry_run_evidence(
             &mut tx,
             &lease,
-            coverage_snapshot,
+            authority_snapshot,
             locked_coverage_revision,
             notice_available,
             owner_exists,
@@ -1227,9 +1251,7 @@ async fn validate_scope_inventory(
 async fn validate_dry_run_evidence(
     tx: &mut Transaction<'_, Postgres>,
     lease: &RetentionLease,
-    coverage_snapshot: Option<
-        std::result::Result<cloud_coverage_store::LoadedCoverage, StoreError>,
-    >,
+    authority_snapshot: Option<crate::cloud_coverage_authority::AuthorityState>,
     locked_coverage_revision: Option<i64>,
     notice_available: bool,
     owner_exists: bool,
@@ -1246,13 +1268,15 @@ async fn validate_dry_run_evidence(
     let Some(expected_revision) = lease.expected_coverage_revision else {
         return Ok(Some("coverage_revision_missing"));
     };
-    let Some(coverage_snapshot) = coverage_snapshot else {
+    let Some(authority_snapshot) = authority_snapshot else {
         return Ok(Some("coverage_unavailable"));
     };
-    let coverage = match coverage_snapshot {
-        Ok(loaded) => loaded,
-        Err(StoreError::Database(error)) => return Err(RetentionError::Database(error)),
-        Err(_) => return Ok(Some("coverage_unavailable")),
+    let coverage = match authority_snapshot {
+        crate::cloud_coverage_authority::AuthorityState::Current { loaded, .. } => loaded,
+        crate::cloud_coverage_authority::AuthorityState::Missing
+        | crate::cloud_coverage_authority::AuthorityState::Stale => {
+            return Ok(Some("coverage_authority_unavailable"))
+        }
     };
     if locked_coverage_revision != Some(expected_revision) || coverage.revision != expected_revision
     {

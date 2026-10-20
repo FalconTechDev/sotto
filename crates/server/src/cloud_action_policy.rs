@@ -209,7 +209,7 @@ pub async fn shadow(State(state): State<AppState>, mut request: Request, next: N
                     request.extensions_mut().insert(AuthUser {
                         user_id: user_id.clone(),
                     });
-                    match person_eligibility::load_view(&state, &user_id).await {
+                    match person_eligibility::load_view_for_policy(&state, &user_id).await {
                         Ok(view) if decide(action, view.state) == ShadowDecision::WouldDeny => {
                             eprintln!(
                                 "cloud action shadow denial: action={action:?} state={:?}",

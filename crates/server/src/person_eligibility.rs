@@ -229,8 +229,33 @@ pub(crate) async fn load_view_with_revision(
         })?;
     tx.commit().await?;
 
-    let (coverage, coverage_revision) = match cloud_coverage_store::load(&state.pool, user_id).await
-    {
+    let require_current_authority = state.cloud_coverage_authority_enforcement_enabled;
+    let authority_loaded = if require_current_authority {
+        match crate::cloud_coverage_authority::load_current(&state.pool, user_id, epoch_now()).await
+        {
+            Ok(crate::cloud_coverage_authority::AuthorityState::Current { loaded, .. }) => {
+                Some(loaded)
+            }
+            Ok(
+                crate::cloud_coverage_authority::AuthorityState::Missing
+                | crate::cloud_coverage_authority::AuthorityState::Stale,
+            ) => None,
+            Err(crate::cloud_coverage_authority::AuthorityError::Database(error)) => {
+                return Err(Error::Db(error))
+            }
+            Err(error) => return Err(Error::Internal(error.to_string())),
+        }
+    } else {
+        None
+    };
+    let loaded_coverage = match authority_loaded {
+        Some(loaded) => Ok(loaded),
+        None if require_current_authority => Err(StoreError::ProjectionUnavailable(
+            crate::cloud_coverage_store::UnavailableReason::NeedsReconciliation,
+        )),
+        None => cloud_coverage_store::load(&state.pool, user_id).await,
+    };
+    let (coverage, coverage_revision) = match loaded_coverage {
         Ok(loaded) => (
             CoverageInput::Decision(evaluate(&loaded.coverage, epoch_now()).map_err(|error| {
                 Error::Internal(format!("stored coverage failed validation: {error}"))
@@ -255,6 +280,30 @@ pub(crate) async fn load_view_with_revision(
         }),
         coverage_revision,
     ))
+}
+
+pub(crate) async fn load_view_with_authority_requirement(
+    state: &AppState,
+    user_id: &str,
+    require_current_authority: bool,
+) -> Result<(EligibilityView, Option<i64>)> {
+    if require_current_authority && !state.cloud_coverage_authority_enforcement_enabled {
+        let mut strict_state = state.clone();
+        strict_state.cloud_coverage_authority_enforcement_enabled = true;
+        return load_view_with_revision(&strict_state, user_id).await;
+    }
+    load_view_with_revision(state, user_id).await
+}
+
+pub(crate) async fn load_view_for_policy(
+    state: &AppState,
+    user_id: &str,
+) -> Result<EligibilityView> {
+    let require_authority = state.cloud_coverage_authority_enforcement_enabled
+        || state.cloud_coverage_authority_shadow_enabled;
+    load_view_with_authority_requirement(state, user_id, require_authority)
+        .await
+        .map(|(view, _)| view)
 }
 
 async fn get_eligibility(

@@ -135,7 +135,11 @@ pub async fn reconcile_user(state: &AppState, user_id: &str) -> Result<()> {
 }
 
 async fn reconcile_user_at(state: &AppState, user_id: &str, now_epoch: i64) -> Result<()> {
-    let (view, revision) = match person_eligibility::load_view_with_revision(state, user_id).await {
+    let (view, revision) = match person_eligibility::load_view_with_authority_requirement(
+        state, user_id, true,
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         // Corrupt billing or coverage evidence is not a reason to stop the bounded scan for every
         // later user. Preserve the candidate as held; database failures still propagate and retry.
