@@ -39,7 +39,6 @@ function transfer(overrides: Partial<api.PayerTransfer> = {}): api.PayerTransfer
   };
 }
 
-
 const NOW_MS = 1_900_000_000_000;
 const PATH = "/cloud";
 const UNRELATED = "?view=transfers&tag=a";
@@ -89,7 +88,8 @@ describe.each([
 
     expect(await screen.findByText(notice)).toBeInTheDocument();
     expect(await screen.findByText(PENDING_COPY)).toBeInTheDocument();
-    expect(api.fetchPayerTransfer).toHaveBeenCalledWith("transfer-1");
+    // StrictMode replays effects; the return must still be handled once.
+    expect(api.fetchPayerTransfer).toHaveBeenCalledExactlyOnceWith("transfer-1");
     expect(screen.queryByText(/Payer change completed/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Accept transfer request" })).not.toBeInTheDocument();
     expect(window.location.pathname).toBe(PATH);
