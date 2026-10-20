@@ -168,13 +168,13 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
         .expect("dry run should claim a job");
     assert_eq!(dry_run.state, RetentionState::DryRun);
     assert_eq!(dry_run.processed_items, 1);
-    let repeated_dry_run =
+    assert!(
         retention::run_once(&pool, "retention-test-dry-run-again", RetentionMode::DryRun)
             .await
             .expect("repeat retention dry run")
-            .expect("repeat dry run should claim the same job");
-    assert_eq!(repeated_dry_run.state, RetentionState::DryRun);
-    assert_eq!(repeated_dry_run.processed_items, 1);
+            .is_none(),
+        "a completed dry run is not claimed again until an operator retries it"
+    );
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
             .bind(PROJECT_ID)
