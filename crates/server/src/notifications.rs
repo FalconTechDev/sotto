@@ -100,7 +100,7 @@ pub struct NoticeContent {
     pub effective_at_epoch: Option<i64>,
     pub deadline_epoch: Option<i64>,
     pub amount_pence: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_interval: Option<String>,
 }
 
@@ -792,6 +792,17 @@ mod tests {
                 "amount_pence must not be negative"
             ))
         ));
+    }
+
+    #[test]
+    fn absent_price_interval_keeps_legacy_notice_payload_shape() {
+        let value = serde_json::to_value(content()).expect("serialise legacy notice content");
+        assert!(value.get("price_interval").is_none());
+
+        let mut price_change = content();
+        price_change.price_interval = Some("year".into());
+        let value = serde_json::to_value(price_change).expect("serialise price change content");
+        assert_eq!(value["price_interval"], "year");
     }
 
     #[test]
