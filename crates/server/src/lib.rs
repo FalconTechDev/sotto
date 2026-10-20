@@ -38,7 +38,9 @@ pub mod billing_transfers;
 #[doc(hidden)]
 pub mod cloud_action_policy;
 pub mod cloud_coverage;
+pub mod cloud_coverage_authority;
 pub mod cloud_coverage_reconciliation;
+pub mod cloud_coverage_revalidation;
 pub mod cloud_coverage_store;
 pub mod cloud_provider;
 pub mod cloud_provider_refresh;

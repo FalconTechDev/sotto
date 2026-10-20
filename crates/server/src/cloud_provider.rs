@@ -16,8 +16,8 @@ use tokio::time::timeout;
 
 use crate::cloud_coverage::{normalise_confirmed_intervals, ConfirmedPaidInterval, PersonCoverage};
 use crate::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
-    SourceBinding, SourceObservation,
+    begin_collection, finish_collection, finish_collection_with_authority, register_source,
+    AuthorityReceiptInput, CollectionStatus, ReconciliationError, SourceBinding, SourceObservation,
 };
 use crate::cloud_coverage_store::PublicationOutcome;
 use crate::cloud_provider_refresh_jobs::{self, RefreshJobError};
@@ -1158,6 +1158,27 @@ pub async fn complete_verified_event(
     preparation: &CollectionPreparation,
     collection: &VerifiedCollection,
 ) -> Result<ApplyReceipt, ProviderAdapterError> {
+    complete_verified_event_with_authority(
+        tx,
+        context,
+        event,
+        allocation,
+        preparation,
+        collection,
+        None,
+    )
+    .await
+}
+
+pub async fn complete_verified_event_with_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    preparation: &CollectionPreparation,
+    collection: &VerifiedCollection,
+    authority: Option<&AuthorityReceiptInput>,
+) -> Result<ApplyReceipt, ProviderAdapterError> {
     context.validate()?;
     event.validate()?;
     allocation.validate()?;
@@ -1217,11 +1238,12 @@ pub async fn complete_verified_event(
     ensure_allocation(tx, context, allocation).await?;
     validate_provider_bindings(tx, context, &preparation.ticket.source_bindings).await?;
     validate_collection_sources(collection, &preparation.ticket.source_bindings)?;
-    let completed = finish_collection(
+    let completed = finish_collection_with_authority(
         tx,
         &preparation.ticket,
         &collection.aggregate_evidence_reference,
         &collection.observations,
+        authority,
     )
     .await
     .map_err(|error| match error {

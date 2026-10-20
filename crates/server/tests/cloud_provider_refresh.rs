@@ -10,6 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sha2::Digest;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
     PgPool, Row,
@@ -264,6 +265,11 @@ fn page_with_cursor(
 
 async fn cleanup(pool: &PgPool, fixture: &Fixture) {
     cleanup_event_and_allocation(pool, &fixture.event_id, &fixture.allocation_id).await;
+    sqlx::query("DELETE FROM cloud_coverage_authority_receipts WHERE beneficiary_id = $1")
+        .bind(&fixture.beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete fixture authority receipt");
     sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(pool)
@@ -279,7 +285,6 @@ async fn cleanup(pool: &PgPool, fixture: &Fixture) {
     for table in [
         "cloud_coverage_collection_attempts",
         "cloud_coverage_sources",
-        "cloud_coverage_coordinators",
     ] {
         sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
             .bind(&fixture.beneficiary_id)
@@ -287,6 +292,16 @@ async fn cleanup(pool: &PgPool, fixture: &Fixture) {
             .await
             .expect("delete fixture coordination row");
     }
+    sqlx::query("DELETE FROM cloud_coverage_revalidation_jobs WHERE beneficiary_id = $1")
+        .bind(&fixture.beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete fixture revalidation job");
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
+        .bind(&fixture.beneficiary_id)
+        .execute(pool)
+        .await
+        .expect("delete fixture coordinator");
     sqlx::query(
         "UPDATE cloud_coverage_heads SET current_revision = NULL WHERE beneficiary_id = $1",
     )
@@ -396,6 +411,109 @@ async fn accepted_invalidation_during_fetch_rejects_refresh_completion() {
             .await
             .expect("read pending receipt");
     assert_eq!(status, "pending");
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn authority_receipt_binds_projection_to_source_and_invalidation_generations() {
+    let Some(pool) = pool_or_skip(8).await else {
+        return;
+    };
+    let (fixture, event, allocation) = fixture(&pool).await;
+    let context = context();
+    record_event(&pool, &event).await;
+    let mut client = ScriptedClient::new(ClientAction::Page(page(&context, &fixture.source_id)));
+    refresh_verified_event(
+        &pool,
+        &mut client,
+        &context,
+        &event,
+        &allocation,
+        CollectionLimits::default(),
+    )
+    .await
+    .expect("complete provider collection");
+    let attempt = sqlx::query(
+        "SELECT attempt_id, source_set_generation, provider_invalidation_generation, projection_revision \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 AND status = 'completed'",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read completed attempt");
+    let now = 1_800_000_000_i64;
+    let local_correction_material =
+        format!("{}:{}\nnone\n", fixture.source_id.len(), fixture.source_id);
+    let local_correction_digest = format!(
+        "{:x}",
+        sha2::Sha256::digest(local_correction_material.as_bytes())
+    );
+    sqlx::query(
+        "INSERT INTO cloud_coverage_authority_receipts \
+         (beneficiary_id, projection_revision, attempt_id, provider_namespace, provider_account_id, \
+          provider_environment, source_set_generation, provider_invalidation_generation, policy_version, \
+          local_correction_digest, observed_at, fresh_until) \
+         VALUES ($1, $2, $3, 'stripe', 'acct_refresh_test', 'test', $4, $5, 1, $6, \
+                 to_timestamp($7), to_timestamp($8))",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(attempt.try_get::<i64, _>("projection_revision").unwrap())
+    .bind(attempt.try_get::<String, _>("attempt_id").unwrap())
+    .bind(attempt.try_get::<i64, _>("source_set_generation").unwrap())
+    .bind(attempt.try_get::<i64, _>("provider_invalidation_generation").unwrap())
+    .bind(local_correction_digest)
+    .bind(now)
+    .bind(now + 3_600)
+    .execute(&pool)
+    .await
+    .expect("record authority fixture");
+    assert!(matches!(
+        sotto_server::cloud_coverage_authority::load_current(
+            &pool,
+            &fixture.beneficiary_id,
+            now + 1,
+        )
+        .await
+        .expect("load authority"),
+        sotto_server::cloud_coverage_authority::AuthorityState::Current { .. }
+    ));
+    assert!(matches!(
+        sotto_server::cloud_coverage_authority::load_current(
+            &pool,
+            &fixture.beneficiary_id,
+            now + 3_600,
+        )
+        .await
+        .expect("load expired authority"),
+        sotto_server::cloud_coverage_authority::AuthorityState::Stale
+    ));
+    sqlx::query(
+        "UPDATE cloud_provider_allocations SET effective_until = $2 WHERE allocation_id = $1",
+    )
+    .bind(&fixture.allocation_id)
+    .bind(now + 7_200)
+    .execute(&pool)
+    .await
+    .expect("end the allocation and invalidate its authority");
+    assert!(matches!(
+        sotto_server::cloud_coverage_authority::load_current(
+            &pool,
+            &fixture.beneficiary_id,
+            now + 2,
+        )
+        .await
+        .expect("load invalidated authority"),
+        sotto_server::cloud_coverage_authority::AuthorityState::Stale
+    ));
+    let revalidation_queued: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_revalidation_jobs \
+         WHERE beneficiary_id = $1 AND status = 'pending' AND next_attempt_at <= now())",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read source-change revalidation job");
+    assert!(revalidation_queued);
     cleanup(&pool, &fixture).await;
 }
 
