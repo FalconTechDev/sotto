@@ -798,6 +798,8 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             organisation_deletion_operator_token: None,
             billing_transfer_operator_token: None,
             cloud_action_enforcement_enabled: false,
+            cloud_coverage_authority_enforcement_enabled: false,
+            cloud_coverage_authority_shadow_enabled: false,
             machine_eligibility_enforcement_enabled: false,
             billing_transfers_enabled: false,
             billing_transfer_execution_enabled: false,

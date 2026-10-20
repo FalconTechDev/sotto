@@ -90,6 +90,7 @@ async fn run() -> Result<()> {
                 if config.provider_refresh_ingest_enabled
                     || config.provider_refresh_worker_enabled
                     || config.provider_refresh_reconciliation_enabled
+                    || config.provider_authority_revalidation_enabled
                 {
                     let account_id = config.stripe_account_id.as_deref().ok_or_else(|| {
                         Error::Config("provider refresh requires STRIPE_ACCOUNT_ID".into())
@@ -185,6 +186,9 @@ async fn run() -> Result<()> {
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,
         billing_transfer_operator_token: config.billing_transfer_operator_token,
         cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
+        cloud_coverage_authority_enforcement_enabled: config
+            .cloud_coverage_authority_enforcement_enabled,
+        cloud_coverage_authority_shadow_enabled: config.cloud_coverage_authority_shadow_enabled,
         machine_eligibility_enforcement_enabled: config.machine_eligibility_enforcement_enabled,
         billing_transfers_enabled: config.billing_transfers_enabled,
         billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
@@ -200,6 +204,13 @@ async fn run() -> Result<()> {
         config.provider_refresh_ingest_enabled,
         config.provider_refresh_worker_enabled,
         config.provider_refresh_reconciliation_enabled
+    );
+    println!(
+        "coverage authority: revalidation={}, shadow={}, enforcement={}, max_age_seconds={:?}",
+        config.provider_authority_revalidation_enabled,
+        config.cloud_coverage_authority_shadow_enabled,
+        config.cloud_coverage_authority_enforcement_enabled,
+        config.cloud_coverage_authority_max_age_seconds,
     );
     println!(
         "cloud action enforcement: {}",
@@ -322,6 +333,27 @@ async fn run() -> Result<()> {
             stripe,
             coverage,
             sponsored_coverage,
+            config
+                .provider_authority_revalidation_enabled
+                .then_some(config.cloud_coverage_authority_max_age_seconds)
+                .flatten(),
+        );
+    }
+    if config.provider_authority_revalidation_enabled {
+        let Some((coverage, sponsored_coverage, stripe)) = personal_coverage_runtime.clone() else {
+            return Err(Error::Config(
+                "Cloud authority revalidation requires configured Stripe coverage".into(),
+            ));
+        };
+        let max_age = config
+            .cloud_coverage_authority_max_age_seconds
+            .ok_or_else(|| Error::Config("Cloud authority max age is required".into()))?;
+        sotto_server::cloud_provider_stripe_refresh_executor::spawn_revalidation(
+            pool.clone(),
+            stripe,
+            coverage,
+            sponsored_coverage,
+            max_age,
         );
     }
     if config.provider_refresh_reconciliation_enabled {

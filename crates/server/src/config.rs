@@ -61,6 +61,10 @@ const ORGANISATION_DELETION_OPERATOR_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELET
 const PROVIDER_REFRESH_INGEST_ENV: &str = "SOTTO_PROVIDER_REFRESH_INGEST_ENABLED";
 const PROVIDER_REFRESH_WORKER_ENV: &str = "SOTTO_PROVIDER_REFRESH_WORKER_ENABLED";
 const PROVIDER_REFRESH_RECONCILIATION_ENV: &str = "SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED";
+const PROVIDER_AUTHORITY_REVALIDATION_ENV: &str = "SOTTO_PROVIDER_AUTHORITY_REVALIDATION_ENABLED";
+const CLOUD_COVERAGE_AUTHORITY_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_COVERAGE_AUTHORITY_ENFORCEMENT";
+const CLOUD_COVERAGE_AUTHORITY_SHADOW_ENV: &str = "SOTTO_CLOUD_COVERAGE_AUTHORITY_SHADOW";
+const CLOUD_COVERAGE_AUTHORITY_MAX_AGE_ENV: &str = "SOTTO_CLOUD_COVERAGE_AUTHORITY_MAX_AGE_SECONDS";
 const CLOUD_ACTION_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_ACTION_ENFORCEMENT";
 const MACHINE_ELIGIBILITY_ENFORCEMENT_ENV: &str = "SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT";
 const CLOUD_SALES_ENV: &str = "SOTTO_CLOUD_SALES_ENABLED";
@@ -104,6 +108,14 @@ pub struct Config {
     pub provider_refresh_worker_enabled: bool,
     /// Whether the periodic registered-source repair scan is enabled.
     pub provider_refresh_reconciliation_enabled: bool,
+    /// Whether the scheduled full-source authority revalidation worker is running.
+    pub provider_authority_revalidation_enabled: bool,
+    /// Maximum age of a complete Stripe authority collection, when configured.
+    pub cloud_coverage_authority_max_age_seconds: Option<i64>,
+    /// Whether Cloud eligibility requires a current authority receipt.
+    pub cloud_coverage_authority_enforcement_enabled: bool,
+    /// Whether stale authority is reflected in shadow decisions without blocking requests.
+    pub cloud_coverage_authority_shadow_enabled: bool,
     /// Whether the dormant human hosted action policy rejects ineligible requests.
     pub cloud_action_enforcement_enabled: bool,
     /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
@@ -370,10 +382,35 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        let provider_authority_revalidation_enabled = feature_flag_is_enabled(
+            std::env::var(PROVIDER_AUTHORITY_REVALIDATION_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let cloud_coverage_authority_enforcement_enabled = feature_flag_is_enabled(
+            std::env::var(CLOUD_COVERAGE_AUTHORITY_ENFORCEMENT_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let cloud_coverage_authority_shadow_enabled = feature_flag_is_enabled(
+            std::env::var(CLOUD_COVERAGE_AUTHORITY_SHADOW_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let cloud_coverage_authority_max_age_seconds = cloud_coverage_authority_max_age_from_env()?;
         validate_provider_refresh_configuration(
             provider_refresh_ingest_enabled,
             provider_refresh_worker_enabled,
             provider_refresh_reconciliation_enabled,
+            billing.as_ref(),
+            stripe_account_id.as_deref(),
+        )?;
+        validate_coverage_authority_configuration(
+            provider_authority_revalidation_enabled,
+            cloud_coverage_authority_enforcement_enabled,
+            cloud_coverage_authority_shadow_enabled,
+            cloud_coverage_authority_max_age_seconds,
+            deployment_mode,
             billing.as_ref(),
             stripe_account_id.as_deref(),
         )?;
@@ -418,6 +455,10 @@ impl Config {
             provider_refresh_ingest_enabled,
             provider_refresh_worker_enabled,
             provider_refresh_reconciliation_enabled,
+            provider_authority_revalidation_enabled,
+            cloud_coverage_authority_max_age_seconds,
+            cloud_coverage_authority_enforcement_enabled,
+            cloud_coverage_authority_shadow_enabled,
             cloud_action_enforcement_enabled,
             machine_eligibility_enforcement_enabled,
             cloud_sales_enabled,
@@ -523,6 +564,61 @@ fn validate_provider_refresh_configuration(
         ));
     }
     Ok(())
+}
+
+const MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS: i64 = 60;
+const MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS: i64 = 400 * 24 * 60 * 60;
+
+fn cloud_coverage_authority_max_age_from_env() -> Result<Option<i64>> {
+    let Some(value) = env_nonempty(CLOUD_COVERAGE_AUTHORITY_MAX_AGE_ENV) else {
+        return Ok(None);
+    };
+    let seconds = value.parse::<i64>().map_err(|_| {
+        Error::Config(format!(
+            "{CLOUD_COVERAGE_AUTHORITY_MAX_AGE_ENV} must be a positive integer"
+        ))
+    })?;
+    if !(MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS..=MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS)
+        .contains(&seconds)
+    {
+        return Err(Error::Config(format!(
+            "{CLOUD_COVERAGE_AUTHORITY_MAX_AGE_ENV} must be between {MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS} and {MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS} seconds"
+        )));
+    }
+    Ok(Some(seconds))
+}
+
+fn validate_coverage_authority_configuration(
+    revalidation_enabled: bool,
+    enforcement_enabled: bool,
+    shadow_enabled: bool,
+    max_age_seconds: Option<i64>,
+    deployment_mode: DeploymentMode,
+    billing: Option<&BillingConfig>,
+    stripe_account_id: Option<&str>,
+) -> Result<()> {
+    if let Some(seconds) = max_age_seconds {
+        if !(MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS..=MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS)
+            .contains(&seconds)
+        {
+            return Err(Error::Config(
+                "coverage authority max age is outside the supported range".into(),
+            ));
+        }
+    }
+    if !revalidation_enabled && !enforcement_enabled && !shadow_enabled {
+        return Ok(());
+    }
+    if deployment_mode != DeploymentMode::Cloud
+        || max_age_seconds.is_none()
+        || !revalidation_enabled
+    {
+        return Err(Error::Config(
+            "coverage authority requires Cloud mode, scheduled revalidation, and SOTTO_CLOUD_COVERAGE_AUTHORITY_MAX_AGE_SECONDS"
+                .into(),
+        ));
+    }
+    validate_provider_refresh_configuration(true, false, false, billing, stripe_account_id)
 }
 
 const BILLING_CATALOGUE_ENV: [&str; 4] = [
@@ -813,10 +909,12 @@ mod tests {
         telemetry_ping_enabled, validate_billing_transfer_execution_configuration,
         validate_billing_transfer_operator_configuration, validate_billing_transfers_configuration,
         validate_cloud_retention_configuration, validate_cloud_sales_configuration,
-        validate_deployment_billing_boundary, validate_founding_price_notices_configuration,
+        validate_coverage_authority_configuration, validate_deployment_billing_boundary,
+        validate_founding_price_notices_configuration,
         validate_founding_schedule_worker_configuration, validate_provider_refresh_configuration,
         BillingConfig, BillingPriceIds, DeploymentMode,
-        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
+        MAX_ORGANISATION_DELETION_RETENTION_DAYS, MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
     };
 
     #[test]
@@ -906,10 +1004,74 @@ mod tests {
             Some("acct_test"),
         )
         .is_ok());
+        assert!(validate_coverage_authority_configuration(
+            true,
+            true,
+            true,
+            Some(35 * 24 * 60 * 60),
+            DeploymentMode::Cloud,
+            Some(&complete),
+            Some("acct_test"),
+        )
+        .is_ok());
         assert!(
             validate_provider_refresh_configuration(true, true, false, Some(&complete), None,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn coverage_authority_requires_scheduled_cloud_revalidation_and_bounded_freshness() {
+        assert!(validate_coverage_authority_configuration(
+            false,
+            false,
+            false,
+            None,
+            DeploymentMode::Cloud,
+            None,
+            None
+        )
+        .is_ok());
+        assert!(validate_coverage_authority_configuration(
+            false,
+            true,
+            false,
+            Some(60),
+            DeploymentMode::Cloud,
+            None,
+            Some("acct_test")
+        )
+        .is_err());
+        assert!(validate_coverage_authority_configuration(
+            true,
+            false,
+            false,
+            None,
+            DeploymentMode::Cloud,
+            None,
+            Some("acct_test")
+        )
+        .is_err());
+        assert!(validate_coverage_authority_configuration(
+            false,
+            false,
+            false,
+            Some(MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS - 1),
+            DeploymentMode::Cloud,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(validate_coverage_authority_configuration(
+            false,
+            false,
+            false,
+            Some(MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS + 1),
+            DeploymentMode::Cloud,
+            None,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

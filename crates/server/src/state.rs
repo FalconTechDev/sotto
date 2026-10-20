@@ -37,6 +37,10 @@ pub struct AppState {
     pub billing_transfer_operator_token: Option<String>,
     /// Whether the dormant human hosted action policy rejects ineligible requests.
     pub cloud_action_enforcement_enabled: bool,
+    /// Whether Cloud eligibility requires a fresh, complete provider authority receipt.
+    pub cloud_coverage_authority_enforcement_enabled: bool,
+    /// Whether authority freshness participates in non-blocking shadow decisions.
+    pub cloud_coverage_authority_shadow_enabled: bool,
     /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
     pub machine_eligibility_enforcement_enabled: bool,
     /// Whether consented payer-transfer API routes are registered.

@@ -31,6 +31,8 @@ fn app(pool: PgPool, operator_token: Option<&str>) -> Router {
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: operator_token.map(str::to_owned),
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,

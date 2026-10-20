@@ -29,6 +29,8 @@ fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,

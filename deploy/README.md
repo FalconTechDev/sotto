@@ -108,6 +108,18 @@ Checkout subscription is linked is retried without recording a receipt. Neither 
 sales, reconciliation, or Cloud action enforcement; leave these values disabled until the hosted
 provider lifecycle has been exercised and reviewed.
 
+Coverage authority is a separate opt-in. `SOTTO_PROVIDER_AUTHORITY_REVALIDATION_ENABLED=1` starts
+the durable full-source scheduler; set `SOTTO_CLOUD_COVERAGE_AUTHORITY_MAX_AGE_SECONDS` to a
+positive freshness window between 60 seconds and 400 days. New and existing registered sources
+are queued independently of Stripe event ids, and a complete, generation-matched collection is
+required before it can be treated as current. Existing projections without an authority receipt
+remain unavailable to strict authority checks until revalidated. `SOTTO_CLOUD_COVERAGE_AUTHORITY_SHADOW=1`
+uses that result in non-blocking policy observations. Retention always requires current authority
+and holds candidates when it is missing or stale. Keep
+`SOTTO_CLOUD_COVERAGE_AUTHORITY_ENFORCEMENT=0` until the annual/no-event, mixed-source, invalidation,
+and restart cases have passed the pinned-version rehearsal. Enabling shadow or enforcement without
+scheduled revalidation is rejected at startup.
+
 Human hosted action checks are shadow-only by default. They record would-deny decisions while
 existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
 `SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been

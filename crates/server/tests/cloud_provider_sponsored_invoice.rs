@@ -709,6 +709,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         deployment_mode: sotto_server::config::DeploymentMode::Cloud,
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
