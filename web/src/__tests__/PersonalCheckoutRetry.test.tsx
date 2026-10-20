@@ -132,6 +132,7 @@ describe("CloudAccountPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Continue to secure checkout" }));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Opening checkout…" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Term" })).toBeDisabled();
     expect(api.createPersonalCheckout).toHaveBeenCalledTimes(2);
     expectCheckoutRequest(2);
     await act(async () => { retry.resolve(result); });
@@ -140,13 +141,16 @@ describe("CloudAccountPanel", () => {
   it("recovers from a failed personal checkout and opens the returned checkout URL on retry", async () => {
     const { assign, button } = await renderFreeAccountWithQuote();
     await failFirstCheckout(button, assign);
-    // Navigation must not happen before the operation can be recovered after the round trip.
+    // Record what was stored at the moment of navigation; an expect() thrown inside the spy would be
+    // swallowed by the component's catch and reported as an unrelated alert.
+    let storedAtNavigation: string | null = "not navigated";
     assign.mockImplementation(() => {
-      expect(sessionStorage.getItem("sotto_personal_operation_id")).toBe("operation-1");
+      storedAtNavigation = sessionStorage.getItem("sotto_personal_operation_id");
     });
 
     await retryCheckout({ operationId: "operation-1", state: "checkout_pending", checkoutUrl: "https://checkout.example/session-1" });
     expect(assign).toHaveBeenCalledExactlyOnceWith("https://checkout.example/session-1");
+    expect(storedAtNavigation).toBe("operation-1");
     expect(sessionStorage.getItem("sotto_personal_operation_id")).toBe("operation-1");
     expect(screen.queryByText(PENDING_NOTICE)).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
