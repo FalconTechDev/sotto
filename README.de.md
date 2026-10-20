@@ -313,13 +313,7 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-Das Mitglied führt den ausgegebenen Befehl in seiner eigenen Arbeitskopie aus:
-
-```sh
-sotto clone <project-id> <env-id> --org <org-id>
-```
-
-Das ist etwas anderes als **Ein weiteres Gerät**, wo du dein eigenes Konto auf einem zweiten Rechner
+Danach führt das Mitglied den ausgegebenen Befehl aus. Das ist etwas anderes als **Ein weiteres Gerät**, wo du dein eigenes Konto auf einem zweiten Rechner
 wiederherstellst. Das Mitglied nutzt sein eigenes Konto auf demselben Server: Es führt `sotto login`
 und `sotto unlock` aus und dann den ausgegebenen Befehl in einem Verzeichnis, das noch keine
 `sotto.toml` enthält:

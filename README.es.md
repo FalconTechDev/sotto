@@ -312,13 +312,7 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-El miembro ejecuta el comando impreso en su propia copia del proyecto:
-
-```sh
-sotto clone <project-id> <env-id> --org <org-id>
-```
-
-Esto no es lo mismo que **Otro dispositivo**, que restaura tu propia cuenta en una segunda máquina.
+Después, el miembro ejecuta el comando impreso. Esto no es lo mismo que **Otro dispositivo**, que restaura tu propia cuenta en una segunda máquina.
 El miembro usa su propia cuenta en el mismo servidor: ejecuta `sotto login` y `sotto unlock` y
 después el comando impreso en un directorio que todavía no tiene `sotto.toml`:
 
