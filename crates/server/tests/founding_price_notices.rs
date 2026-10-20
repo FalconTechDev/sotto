@@ -298,6 +298,64 @@ async fn verified_personal_transition_queues_one_exact_future_notice_and_late_di
 }
 
 #[tokio::test]
+async fn eligible_award_without_boundary_is_recorded_and_removed_from_reconciliation() {
+    let Some(database) = DisposableDatabase::create().await else {
+        eprintln!("skipping founding price notice tests: set SOTTO_RUN_DB_TESTS=1");
+        return;
+    };
+    let pool = &database.pool;
+    db::migrate(pool).await.expect("apply migrations");
+    let now = now_epoch();
+    seed_personal_award(
+        pool,
+        "award-price-notice-missing",
+        "user-price-notice-missing",
+        now + 120 * 24 * 60 * 60,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE billing_founding_awards SET original_start_epoch=NULL, original_end_epoch=NULL \
+         WHERE award_id='award-price-notice-missing'",
+    )
+    .execute(pool)
+    .await
+    .expect("simulate a malformed verified award");
+
+    assert!(founding_price_notices::run_once(pool, now)
+        .await
+        .expect("record malformed award for operator review"));
+    let state: (Option<i64>, String, String) = sqlx::query_as(
+        "SELECT transition_epoch, outcome, reason_code \
+         FROM billing_founding_price_notice_state \
+         WHERE award_id='award-price-notice-missing'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("load malformed award review state");
+    assert_eq!(
+        state,
+        (
+            None,
+            "schedule_unresolved".into(),
+            "schedule_not_verified".into()
+        )
+    );
+    let eligible: bool = sqlx::query_scalar(
+        "SELECT price_notice_eligible FROM billing_founding_schedule_jobs \
+         WHERE award_id='award-price-notice-missing'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("load malformed award eligibility");
+    assert!(!eligible);
+    assert!(!founding_price_notices::run_once(pool, now)
+        .await
+        .expect("malformed award no longer occupies a batch slot"));
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn sponsored_transition_notifies_only_current_billing_admins() {
     let Some(database) = DisposableDatabase::create().await else {
         eprintln!("skipping founding price notice tests: set SOTTO_RUN_DB_TESTS=1");

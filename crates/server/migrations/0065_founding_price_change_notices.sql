@@ -9,7 +9,7 @@ CREATE INDEX billing_founding_price_notice_candidates_idx
 
 CREATE TABLE billing_founding_price_notice_state (
     award_id TEXT PRIMARY KEY REFERENCES billing_founding_awards (award_id) ON DELETE RESTRICT,
-    transition_epoch BIGINT NOT NULL CHECK (transition_epoch > 0),
+    transition_epoch BIGINT CHECK (transition_epoch IS NULL OR transition_epoch > 0),
     schedule_version BIGINT NOT NULL CHECK (schedule_version > 0),
     payer_kind TEXT NOT NULL CHECK (payer_kind IN ('personal', 'sponsor')),
     payer_id TEXT NOT NULL CHECK (btrim(payer_id) <> ''),
@@ -21,7 +21,9 @@ CREATE TABLE billing_founding_price_notice_state (
     next_reconcile_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK ((outcome = 'queued' AND reason_code IS NULL)
-        OR (outcome <> 'queued' AND reason_code IS NOT NULL))
+        OR (outcome <> 'queued' AND reason_code IS NOT NULL)),
+    CHECK (transition_epoch IS NOT NULL
+        OR (outcome = 'schedule_unresolved' AND reason_code = 'schedule_not_verified'))
 );
 
 CREATE INDEX billing_founding_price_notice_state_outcome_idx

@@ -310,7 +310,14 @@ async fn reconcile_award(pool: &PgPool, award_id: &str, now_epoch: i64) -> Resul
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
     }
-    save_outcome(&mut tx, identity, transition_epoch, Outcome::Queued, None).await?;
+    save_outcome(
+        &mut tx,
+        identity,
+        Some(transition_epoch),
+        Outcome::Queued,
+        None,
+    )
+    .await?;
     tx.commit().await.map_err(Error::Db)?;
     Ok(())
 }
@@ -401,7 +408,33 @@ async fn retire_or_unresolve(
 ) -> Result<()> {
     if let Some(transition_epoch) = transition_epoch {
         cancel_event_in_tx(tx, &event_key(identity.award_id, transition_epoch)).await?;
-        save_outcome(tx, identity, transition_epoch, outcome, Some(reason)).await?;
+    } else {
+        let previous_transition_epoch: Option<i64> = sqlx::query_scalar(
+            "SELECT transition_epoch FROM billing_founding_price_notice_state WHERE award_id=$1",
+        )
+        .bind(identity.award_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::Db)?
+        .flatten();
+        if let Some(previous_transition_epoch) = previous_transition_epoch {
+            cancel_event_in_tx(tx, &event_key(identity.award_id, previous_transition_epoch))
+                .await?;
+        }
+    }
+    save_outcome(tx, identity, transition_epoch, outcome, Some(reason)).await?;
+    if transition_epoch.is_none() {
+        // A missing boundary cannot produce a notice. Disable this corrupted candidate after
+        // recording it so it does not occupy a batch slot on every poll.
+        sqlx::query(
+            "UPDATE billing_founding_schedule_jobs SET price_notice_eligible=FALSE, updated_at=now() \
+             WHERE award_id=$1 AND version=$2",
+        )
+        .bind(identity.award_id)
+        .bind(identity.version)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::Db)?;
     }
     Ok(())
 }
@@ -409,7 +442,7 @@ async fn retire_or_unresolve(
 async fn save_outcome(
     tx: &mut Transaction<'_, Postgres>,
     identity: NoticeIdentity<'_>,
-    transition_epoch: i64,
+    transition_epoch: Option<i64>,
     outcome: Outcome,
     reason: Option<&str>,
 ) -> Result<()> {
