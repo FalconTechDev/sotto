@@ -356,6 +356,63 @@ async fn eligible_award_without_boundary_is_recorded_and_removed_from_reconcilia
 }
 
 #[tokio::test]
+async fn one_award_failure_does_not_stop_the_rest_of_the_notice_batch() {
+    let Some(database) = DisposableDatabase::create().await else {
+        eprintln!("skipping founding price notice tests: set SOTTO_RUN_DB_TESTS=1");
+        return;
+    };
+    let pool = &database.pool;
+    db::migrate(pool).await.expect("apply migrations");
+    let now = now_epoch();
+    let boundary = now + 120 * 24 * 60 * 60;
+    seed_personal_award(pool, "award-batch-a", "user-batch-a", boundary).await;
+    seed_personal_award(pool, "award-batch-late", "user-batch-late", boundary).await;
+    sqlx::query(
+        "UPDATE billing_founding_schedule_jobs SET updated_at='2000-01-01' \
+         WHERE award_id IN ('award-batch-a','award-batch-late')",
+    )
+    .execute(pool)
+    .await
+    .expect("make candidate order deterministic");
+    sqlx::query(
+        "CREATE FUNCTION reject_one_test_notice() RETURNS trigger AS $$ \
+         BEGIN IF NEW.recipient_user_id='user-batch-a' THEN \
+           RAISE EXCEPTION 'synthetic notice enqueue failure'; \
+         END IF; RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .execute(pool)
+    .await
+    .expect("create scoped enqueue fault");
+    sqlx::query(
+        "CREATE TRIGGER reject_one_test_notice BEFORE INSERT ON cloud_notice_outbox \
+         FOR EACH ROW EXECUTE FUNCTION reject_one_test_notice()",
+    )
+    .execute(pool)
+    .await
+    .expect("install scoped enqueue fault");
+
+    assert!(founding_price_notices::run_once(pool, now).await.is_err());
+    let second_outcome: String = sqlx::query_scalar(
+        "SELECT outcome FROM billing_founding_price_notice_state \
+         WHERE award_id='award-batch-late'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("later award is reconciled despite the first failure");
+    assert_eq!(second_outcome, "queued");
+    let failed_state_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM billing_founding_price_notice_state \
+         WHERE award_id='award-batch-a'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("failed transaction leaves no partial state");
+    assert_eq!(failed_state_count, 0);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn sponsored_transition_notifies_only_current_billing_admins() {
     let Some(database) = DisposableDatabase::create().await else {
         eprintln!("skipping founding price notice tests: set SOTTO_RUN_DB_TESTS=1");

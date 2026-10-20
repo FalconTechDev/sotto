@@ -85,12 +85,23 @@ pub async fn run_once(pool: &PgPool, now_epoch: i64) -> Result<bool> {
     .await
     .map_err(Error::Db)?;
     let mut processed = false;
+    let mut first_error = None;
     for row in candidates {
         let award_id: String = row.try_get("award_id").map_err(Error::Db)?;
-        reconcile_award(pool, &award_id, now_epoch).await?;
-        processed = true;
+        match reconcile_award(pool, &award_id, now_epoch).await {
+            Ok(()) => processed = true,
+            Err(error) => {
+                // One corrupt or temporarily failing award must not prevent the rest of this
+                // bounded batch from progressing. Return the first failure after trying peers.
+                first_error.get_or_insert(error);
+            }
+        }
     }
-    Ok(processed)
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(processed)
+    }
 }
 
 async fn reconcile_award(pool: &PgPool, award_id: &str, now_epoch: i64) -> Result<()> {
