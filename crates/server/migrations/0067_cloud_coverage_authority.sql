@@ -29,7 +29,7 @@ CREATE INDEX cloud_coverage_authority_freshness_idx
 -- and is deliberately separate from the event-repair queue.
 CREATE TABLE cloud_coverage_revalidation_jobs (
     beneficiary_id       TEXT PRIMARY KEY
-        REFERENCES cloud_coverage_coordinators (beneficiary_id) ON DELETE RESTRICT,
+        REFERENCES cloud_coverage_coordinators (beneficiary_id) ON DELETE CASCADE,
     status               TEXT NOT NULL DEFAULT 'pending'
                          CHECK (status IN ('pending', 'leased')),
     next_attempt_at      TIMESTAMPTZ NOT NULL DEFAULT now(),

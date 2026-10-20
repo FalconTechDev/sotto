@@ -1014,5 +1014,26 @@ async fn migration_0067_queues_registered_sources_for_authority_revalidation() {
         queued,
         "a new source must be scheduled independently of events"
     );
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+        .bind(&beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("delete registered source");
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
+        .bind(&beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("delete coordinator with derived revalidation job");
+    let job_remains: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_revalidation_jobs WHERE beneficiary_id = $1)",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("check coordinator cleanup");
+    assert!(
+        !job_remains,
+        "coordinator deletion cascades its derived queue row"
+    );
     database.cleanup().await;
 }
