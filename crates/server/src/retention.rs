@@ -459,32 +459,28 @@ pub async fn apply_operator_action(
     bounded(operator, 80, "operator")?;
     let mut tx = pool.begin().await?;
     let affected = match action {
-        OperatorAction::Hold => {
-            sqlx::query(
-                "UPDATE cloud_retention_jobs SET state='held', hold_code='operator_hold', \
+        OperatorAction::Hold => sqlx::query(
+            "UPDATE cloud_retention_jobs SET state='held', hold_code='operator_hold', \
                      lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
                  WHERE job_id=$1 AND state IN ('planned','ready','dry_run','held','leased') \
                    AND dry_run=TRUE AND purge_enabled=FALSE",
-            )
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-        }
-        OperatorAction::Cancel => {
-            sqlx::query(
-                "UPDATE cloud_retention_jobs SET state='cancelled', hold_code='operator_cancelled', \
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+        OperatorAction::Cancel => sqlx::query(
+            "UPDATE cloud_retention_jobs SET state='cancelled', hold_code='operator_cancelled', \
                      lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
                  WHERE job_id=$1 AND state IN ('planned','ready','dry_run','held','leased') \
                    AND dry_run=TRUE AND purge_enabled=FALSE",
-            )
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-        }
+        )
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
         OperatorAction::RetryDryRun => {
-            sqlx::query(
+            let affected = sqlx::query(
                 "UPDATE cloud_retention_jobs SET state='ready', hold_code=NULL, \
                      dry_run_completed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
                  WHERE job_id=$1 AND state='held' AND dry_run=TRUE AND purge_enabled=FALSE \
@@ -494,7 +490,19 @@ pub async fn apply_operator_action(
             .bind(job_id)
             .execute(&mut *tx)
             .await?
-            .rows_affected()
+            .rows_affected();
+            if affected == 1 {
+                // Held items retain their expected identity, but a retry must validate that
+                // identity again. Still-shared or invalid items will be held by the worker.
+                sqlx::query(
+                    "UPDATE cloud_retention_scope_items SET state='planned', hold_code=NULL, updated_at=now() \
+                     WHERE job_id=$1 AND state='held'",
+                )
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            affected
         }
     };
     if affected != 1 {
@@ -575,7 +583,7 @@ async fn claim_due(
     let row = sqlx::query(
         "SELECT job_id FROM cloud_retention_jobs \
          WHERE deadline_at <= now() AND ($2=FALSE OR scope_kind='personal') AND \
-           (($1 = 'dry_run' AND ((state='ready' AND dry_run=TRUE) OR state='dry_run')) OR \
+           (($1 = 'dry_run' AND state='ready' AND dry_run=TRUE) OR \
             (state = 'ready' AND dry_run = FALSE AND purge_enabled = TRUE AND $1 = 'purge') OR \
             (state = 'leased' AND lease_expires_at <= now() AND \
              (($1 = 'dry_run' AND dry_run = TRUE) OR \
@@ -595,7 +603,7 @@ async fn claim_due(
         "UPDATE cloud_retention_jobs SET state='leased', lease_owner=$1, \
              lease_expires_at=now()+interval '5 minutes', attempt_count=attempt_count+1, updated_at=now() \
          WHERE job_id=$2 AND \
-           (($3 = 'dry_run' AND ((state='ready' AND dry_run=TRUE) OR state='dry_run')) OR \
+           (($3 = 'dry_run' AND state='ready' AND dry_run=TRUE) OR \
             ($3 = 'purge' AND state='ready' AND dry_run=FALSE AND purge_enabled=TRUE) OR \
             (state='leased' AND lease_expires_at <= now() AND \
              (($3 = 'dry_run' AND dry_run=TRUE) OR \
@@ -1267,6 +1275,9 @@ async fn validate_dry_run_evidence(
             .bind(subject)
             .fetch_optional(&mut **tx)
             .await?;
+    if personal_state.as_deref() == Some("refund_required") {
+        return Ok(Some("eligibility_unavailable"));
+    }
     if personal_state
         .as_deref()
         .is_some_and(|state| matches!(state, "pending" | "active" | "past_due"))

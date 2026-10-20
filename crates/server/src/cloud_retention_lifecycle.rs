@@ -194,7 +194,9 @@ async fn reconcile_expiry_candidate(
         hold_user_candidates(pool, user_id, "coverage_deadline_invalid").await?;
         return Ok(());
     };
-    if deadline_epoch <= 0 || export_start_epoch <= 0 || now_epoch < export_start_epoch {
+    // The export notice starts the recovery window; it does not mean the account has expired.
+    // Do not create a candidate until the full export deadline has passed.
+    if deadline_epoch <= 0 || export_start_epoch <= 0 || now_epoch < deadline_epoch {
         return Ok(());
     }
     let notice_event_key = format!("cloud-export-window:{export_start_epoch}:{deadline_epoch}");
