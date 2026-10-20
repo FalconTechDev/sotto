@@ -85,6 +85,8 @@ pub mod cloud_provider_stripe_sponsored_adapter;
 pub mod cloud_provider_stripe_sponsored_refresh;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_sponsored_store;
+#[doc(hidden)]
+pub mod cloud_retention_lifecycle;
 pub mod community;
 pub mod config;
 pub mod db;
@@ -102,6 +104,8 @@ pub mod person_eligibility;
 pub mod personal_billing;
 #[doc(hidden)]
 pub mod retention;
+#[doc(hidden)]
+pub mod retention_ops;
 // The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
 // deployment rather than presented as a stable public API surface, and the internal seam is not
 // something an embedder should call directly.
@@ -160,6 +164,11 @@ pub fn app(state: AppState) -> Router {
     } else {
         Router::new()
     };
+    let cloud_retention_ops = if state.cloud_retention_operator_token.is_some() {
+        retention_ops::router()
+    } else {
+        Router::new()
+    };
     Router::new()
         .merge(health::router())
         .merge(auth::router())
@@ -173,6 +182,7 @@ pub fn app(state: AppState) -> Router {
         .merge(billing_transfers)
         .merge(billing_transfer_setup)
         .merge(billing_transfer_ops)
+        .merge(cloud_retention_ops)
         .merge(if state.billing_transfer_operator_token.is_some() {
             founding_price_notices::operator_router()
         } else {

@@ -196,7 +196,7 @@ pub(crate) async fn load_view(state: &AppState, user_id: &str) -> Result<Eligibi
         .map(|(view, _)| view)
 }
 
-async fn load_view_with_revision(
+pub(crate) async fn load_view_with_revision(
     state: &AppState,
     user_id: &str,
 ) -> Result<(EligibilityView, Option<i64>)> {

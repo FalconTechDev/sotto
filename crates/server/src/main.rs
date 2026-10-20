@@ -189,6 +189,8 @@ async fn run() -> Result<()> {
         billing_transfers_enabled: config.billing_transfers_enabled,
         billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
         billing_transfer_setup_enabled: config.billing_transfer_setup_enabled,
+        cloud_retention_dry_run_enabled: config.cloud_retention_dry_run_enabled,
+        cloud_retention_operator_token: config.cloud_retention_operator_token.clone(),
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
@@ -236,6 +238,10 @@ async fn run() -> Result<()> {
         "organisation deletion routes and worker: {}",
         config.organisation_deletion_worker_enabled
     );
+    println!(
+        "Cloud personal retention dry run: {}",
+        config.cloud_retention_dry_run_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
@@ -246,6 +252,9 @@ async fn run() -> Result<()> {
     }
     if config.organisation_deletion_worker_enabled {
         sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider.clone());
+    }
+    if config.cloud_retention_dry_run_enabled {
+        sotto_server::cloud_retention_lifecycle::spawn(state.clone());
     }
     if config.founding_schedule_worker_enabled {
         #[cfg(not(feature = "e2e-mock-billing"))]

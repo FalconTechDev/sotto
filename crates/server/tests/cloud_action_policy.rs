@@ -50,6 +50,8 @@ fn app(pool: PgPool, deployment_mode: DeploymentMode, enforcement_enabled: bool)
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
     })
 }
 

@@ -39,6 +39,8 @@ fn app(token: Option<&str>) -> Router {
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
     })
 }
 
@@ -77,6 +79,8 @@ fn app_for_pool(pool: PgPool, token: &str) -> Router {
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
     })
 }
 

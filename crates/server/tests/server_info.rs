@@ -33,6 +33,8 @@ fn app(
         billing_transfers_enabled,
         billing_transfer_execution_enabled,
         billing_transfer_setup_enabled,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,

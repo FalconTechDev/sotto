@@ -49,6 +49,8 @@ fn app(pool: PgPool, transfers_enabled: bool) -> Router {
         billing_transfers_enabled: transfers_enabled,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
     })
 }
 

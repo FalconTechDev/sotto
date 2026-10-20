@@ -63,6 +63,8 @@ fn app_with_billing(
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
         pool,
         oauth: None,
         oauth_config: None,

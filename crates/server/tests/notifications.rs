@@ -475,7 +475,9 @@ async fn export_window_notice_tracks_the_complete_coverage_episode() {
     .fetch_one(&pool)
     .await
     .expect("count durable export episodes");
-    assert_eq!(episode_count, 2);
+    // The first expired episode remains as durable evidence; the earlier recovery boundary is
+    // superseded and retained as cancelled; the latest complete coverage boundary is pending.
+    assert_eq!(episode_count, 3);
     assert!(notifications::list_for_user(&pool, USER_ID)
         .await
         .expect("future export notice is hidden")
@@ -800,6 +802,8 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             billing_transfers_enabled: false,
             billing_transfer_execution_enabled: false,
             billing_transfer_setup_enabled: false,
+            cloud_retention_dry_run_enabled: false,
+            cloud_retention_operator_token: None,
         });
     let response = app
         .clone()

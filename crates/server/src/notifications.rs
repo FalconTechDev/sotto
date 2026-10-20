@@ -28,7 +28,7 @@ const MAX_TEXT: usize = 240;
 const MAX_DETAIL: usize = 2_000;
 const MAX_NOTICES: i64 = 100;
 pub const STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS: i64 = 60 * 24 * 60 * 60;
-const EXPORT_DEADLINE_POLICY_KEY: &str = "cloud-export-deadline-v1";
+pub(crate) const EXPORT_DEADLINE_POLICY_KEY: &str = "cloud-export-deadline-v1";
 type NoticeResult<T> = std::result::Result<T, NoticeError>;
 
 const RETRY_DELAYS: [Duration; 5] = [
@@ -346,37 +346,24 @@ pub async fn reconcile_export_deadline_notice(
         return Ok(false);
     }
 
+    // Eligibility can cross the export deadline between loading an ExportOnly view and writing
+    // its notice. Preserve the existing row for the retention reconciler rather than cancelling
+    // it based on a snapshot that is stale only because the clock crossed the boundary.
+    if view.state == EligibilityState::ExportOnly
+        && view
+            .export_until_epoch
+            .is_some_and(|deadline| deadline <= now_epoch)
+    {
+        tx.commit().await?;
+        return Ok(false);
+    }
+
     // A pending personal checkout takes precedence in the public eligibility state, but its
     // coverage decision can still carry the beneficiary's current export deadline. Keep the
     // notice tied to that complete projection until its deadline passes; pending billing alone
     // does not prove that the export episode has ended.
-    let export_window_is_open = view.state == EligibilityState::ExportOnly
-        || (view.state == EligibilityState::PendingInitialPayment
-            && view
-                .export_until_epoch
-                .is_some_and(|deadline| deadline > now_epoch));
-    let intent = if export_window_is_open {
-        let deadline = view
-            .export_until_epoch
-            .ok_or(NoticeError::InvalidContent("export deadline is missing"))?;
-        let effective_at =
-            deadline
-                .checked_sub(EXPORT_WINDOW_SECONDS)
-                .ok_or(NoticeError::InvalidContent(
-                    "export deadline is out of range",
-                ))?;
-        // Eligibility can cross its deadline between loading the view and reaching this write.
-        // In that case the old ExportOnly snapshot is simply stale; do not turn a normal boundary
-        // race into a failed eligibility request or create a notice after the deadline.
-        if deadline <= now_epoch {
-            tx.commit().await?;
-            return Ok(false);
-        }
-        if effective_at <= 0 || effective_at > now_epoch {
-            return Err(NoticeError::InvalidContent(
-                "export-only deadline is outside its expected window",
-            ));
-        }
+    let notice_window = export_deadline_notice_window(view, now_epoch)?;
+    let intent = if let Some((effective_at, deadline)) = notice_window {
         Some(NoticeIntent {
             recipient_user_id: recipient_user_id.to_owned(),
             event_key: format!("cloud-export-window:{effective_at}:{deadline}"),
@@ -432,6 +419,73 @@ pub async fn reconcile_export_deadline_notice(
 
     tx.commit().await?;
     Ok(true)
+}
+
+/// Return the fixed export-window start and deadline that should identify the durable notice.
+///
+/// Queueing the notice while the person is still paid makes it available in the account surface
+/// exactly when the export window opens, even if they do not sign in at that boundary. The
+/// eligibility projection remains authoritative: a later paid-through change produces a new
+/// event key and cancels the superseded pending notice.
+fn export_deadline_notice_window(
+    view: &EligibilityView,
+    now_epoch: i64,
+) -> NoticeResult<Option<(i64, i64)>> {
+    let window =
+        match view.state {
+            EligibilityState::Paid | EligibilityState::RenewalRecovery => {
+                let effective_at = match view.state {
+                    EligibilityState::Paid => view.paid_through_epoch,
+                    EligibilityState::RenewalRecovery => {
+                        view.recovery_until_epoch.or(view.paid_through_epoch)
+                    }
+                    _ => unreachable!("matched paid or recovery state"),
+                };
+                let Some(effective_at) = effective_at else {
+                    return Ok(None);
+                };
+                if effective_at <= now_epoch {
+                    return Ok(None);
+                }
+                let deadline = effective_at.checked_add(EXPORT_WINDOW_SECONDS).ok_or(
+                    NoticeError::InvalidContent("export deadline is out of range"),
+                )?;
+                Some((effective_at, deadline))
+            }
+            EligibilityState::ExportOnly => {
+                let deadline = view
+                    .export_until_epoch
+                    .ok_or(NoticeError::InvalidContent("export deadline is missing"))?;
+                let effective_at = deadline.checked_sub(EXPORT_WINDOW_SECONDS).ok_or(
+                    NoticeError::InvalidContent("export deadline is out of range"),
+                )?;
+                if deadline <= now_epoch {
+                    return Ok(None);
+                }
+                Some((effective_at, deadline))
+            }
+            EligibilityState::PendingInitialPayment
+                if view
+                    .export_until_epoch
+                    .is_some_and(|deadline| deadline > now_epoch) =>
+            {
+                let deadline = view.export_until_epoch.expect("guarded above");
+                Some((
+                    deadline.checked_sub(EXPORT_WINDOW_SECONDS).ok_or(
+                        NoticeError::InvalidContent("export deadline is out of range"),
+                    )?,
+                    deadline,
+                ))
+            }
+            _ => None,
+        };
+    if window.is_some_and(|(effective_at, deadline)| effective_at <= 0 || deadline <= effective_at)
+    {
+        return Err(NoticeError::InvalidContent(
+            "export-only deadline is outside its expected window",
+        ));
+    }
+    Ok(window)
 }
 
 /// Record a verified email destination. Verification is intentionally an internal boundary until
@@ -859,5 +913,92 @@ mod tests {
                 "price change notice would be due before the epoch"
             ))
         ));
+    }
+
+    #[test]
+    fn export_notice_is_queued_while_paid_for_the_future_window_boundary() {
+        let now = 1_900_000_000;
+        let view = EligibilityView {
+            model: "person_eligibility_v1",
+            deployment_mode: "cloud",
+            state: EligibilityState::Paid,
+            account_initialized: true,
+            billing_available: true,
+            paid_through_epoch: Some(now + 60),
+            recovery_until_epoch: None,
+            export_until_epoch: None,
+            actions: crate::person_eligibility::EligibilityActions {
+                setup: false,
+                billing: false,
+                export: false,
+                revoke: true,
+            },
+            next_actions: vec!["revoke"],
+            payer: Some("personal"),
+        };
+
+        assert_eq!(
+            export_deadline_notice_window(&view, now).expect("notice window"),
+            Some((now + 60, now + 60 + EXPORT_WINDOW_SECONDS))
+        );
+    }
+
+    #[test]
+    fn export_notice_uses_recovery_end_as_the_start_of_the_export_window() {
+        let now = 1_900_000_000;
+        let recovery_end = now + 14 * 24 * 60 * 60;
+        let view = EligibilityView {
+            model: "person_eligibility_v1",
+            deployment_mode: "cloud",
+            state: EligibilityState::RenewalRecovery,
+            account_initialized: true,
+            billing_available: true,
+            paid_through_epoch: Some(recovery_end),
+            recovery_until_epoch: Some(recovery_end),
+            export_until_epoch: None,
+            actions: crate::person_eligibility::EligibilityActions {
+                setup: false,
+                billing: false,
+                export: false,
+                revoke: true,
+            },
+            next_actions: vec!["revoke"],
+            payer: Some("personal"),
+        };
+
+        assert_eq!(
+            export_deadline_notice_window(&view, now).expect("notice window"),
+            Some((recovery_end, recovery_end + EXPORT_WINDOW_SECONDS))
+        );
+    }
+
+    #[test]
+    fn export_notice_uses_recovery_boundary_when_it_differs_from_paid_boundary() {
+        let now = 1_900_000_000;
+        let paid_boundary = now + 2 * 24 * 60 * 60;
+        let recovery_end = now + 9 * 24 * 60 * 60;
+        let view = EligibilityView {
+            model: "person_eligibility_v1",
+            deployment_mode: "cloud",
+            state: EligibilityState::RenewalRecovery,
+            account_initialized: true,
+            billing_available: true,
+            paid_through_epoch: Some(paid_boundary),
+            recovery_until_epoch: Some(recovery_end),
+            export_until_epoch: None,
+            actions: crate::person_eligibility::EligibilityActions {
+                setup: false,
+                billing: false,
+                export: false,
+                revoke: true,
+            },
+            next_actions: vec!["revoke"],
+            payer: Some("personal"),
+        };
+
+        assert_eq!(
+            export_deadline_notice_window(&view, now).expect("notice window"),
+            Some((recovery_end, recovery_end + EXPORT_WINDOW_SECONDS))
+        );
     }
 }
