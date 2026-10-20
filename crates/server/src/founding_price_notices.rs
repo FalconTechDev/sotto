@@ -207,7 +207,23 @@ async fn reconcile_award(pool: &PgPool, award_id: &str, now_epoch: i64) -> Resul
 
     let due_at = notifications::price_change_due_at(transition_epoch)
         .map_err(|error| Error::Internal(error.to_string()))?;
-    if due_at < now_epoch {
+    let already_queued: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM billing_founding_price_notice_state \
+         WHERE award_id=$1 AND transition_epoch=$2 AND schedule_version=$3 \
+           AND payer_kind=$4 AND payer_id=$5 AND outcome='queued')",
+    )
+    .bind(award_id)
+    .bind(transition_epoch)
+    .bind(version)
+    .bind(&payer_kind_text)
+    .bind(&payer_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(Error::Db)?;
+    // A notice discovered after its send window is a review item. Once the exact transition
+    // has been queued on time, however, later reconciliation must preserve it after due_at;
+    // otherwise the 30-second poll would cancel it just as it becomes visible.
+    if due_at < now_epoch && !already_queued {
         retire_or_unresolve(
             &mut tx,
             identity,

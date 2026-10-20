@@ -148,6 +148,49 @@ async fn verified_personal_transition_queues_one_exact_future_notice_and_late_di
         "future notice must remain hidden"
     );
 
+    let notice_due_at = boundary - notifications::STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS;
+    sqlx::query(
+        "UPDATE billing_founding_price_notice_state SET next_reconcile_at=now() \
+         WHERE award_id='award-price-notice'",
+    )
+    .execute(pool)
+    .await
+    .expect("make queued notice due for reconciliation");
+    assert!(founding_price_notices::run_once(pool, notice_due_at + 31)
+        .await
+        .expect("reconcile after the notice due time"));
+    let due_state: String = sqlx::query_scalar(
+        "SELECT outcome FROM billing_founding_price_notice_state \
+         WHERE award_id='award-price-notice'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("load due notice state");
+    assert_eq!(due_state, "queued");
+    let outbox_status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_notice_outbox WHERE recipient_user_id='user-price-notice'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("load due outbox status");
+    assert_eq!(outbox_status, "pending");
+
+    // Simulate the notice's scheduled time passing in the database clock as well as the
+    // worker's explicit clock, then prove it remains visible to the recipient.
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET due_at=now()-interval '1 second', \
+             available_at=now()-interval '1 second' \
+         WHERE recipient_user_id='user-price-notice'",
+    )
+    .execute(pool)
+    .await
+    .expect("make the notice visible");
+    let visible = notifications::list_for_user(pool, "user-price-notice")
+        .await
+        .expect("list due notice");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].content.title, "Your founding price is changing");
+
     let late_boundary = now + notifications::STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS - 1;
     seed_personal_award(
         pool,
