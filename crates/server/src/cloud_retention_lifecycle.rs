@@ -48,7 +48,18 @@ pub async fn reconcile_once(state: &AppState) -> Result<usize> {
     }
     for user_id in &users {
         refresh_scan_lease(&state.pool, &scan_owner).await?;
-        reconcile_user_at(state, user_id, now_epoch).await?;
+        if let Err(error) = reconcile_user_at(state, user_id, now_epoch).await {
+            eprintln!("Cloud retention scan could not reconcile one account: {error}");
+            if let Err(hold_error) =
+                hold_user_candidates(&state.pool, user_id, "reconciliation_failed").await
+            {
+                // Continue the bounded scan even if the fallback hold cannot be persisted. The
+                // durable cursor will wrap around and revisit this account on a later pass.
+                eprintln!(
+                    "Cloud retention scan could not persist a hold for one account: {hold_error}"
+                );
+            }
+        }
     }
     let next_cursor = (users.len() == USER_BATCH as usize)
         .then(|| users.last().cloned())
@@ -135,7 +146,11 @@ pub async fn reconcile_user(state: &AppState, user_id: &str) -> Result<()> {
 }
 
 async fn reconcile_user_at(state: &AppState, user_id: &str, now_epoch: i64) -> Result<()> {
-    let (view, revision) = match person_eligibility::load_view_with_revision(state, user_id).await {
+    let (view, revision) = match person_eligibility::load_view_with_authority_requirement(
+        state, user_id, true,
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         // Corrupt billing or coverage evidence is not a reason to stop the bounded scan for every
         // later user. Preserve the candidate as held; database failures still propagate and retry.

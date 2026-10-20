@@ -108,6 +108,18 @@ Checkout subscription is linked is retried without recording a receipt. Neither 
 sales, reconciliation, or Cloud action enforcement; leave these values disabled until the hosted
 provider lifecycle has been exercised and reviewed.
 
+Coverage authority is a separate opt-in. `SOTTO_PROVIDER_AUTHORITY_REVALIDATION_ENABLED=1` starts
+the durable full-source scheduler; set `SOTTO_CLOUD_COVERAGE_AUTHORITY_MAX_AGE_SECONDS` to a
+positive freshness window between 60 seconds and 400 days. New and existing registered sources
+are queued independently of Stripe event ids, and a complete, generation-matched collection is
+required before it can be treated as current. Existing projections without an authority receipt
+remain unavailable to strict authority checks until revalidated. `SOTTO_CLOUD_COVERAGE_AUTHORITY_SHADOW=1`
+uses that result in non-blocking policy observations. Retention always requires current authority
+and holds candidates when it is missing or stale. Keep
+`SOTTO_CLOUD_COVERAGE_AUTHORITY_ENFORCEMENT=0` until the annual/no-event, mixed-source, invalidation,
+and restart cases have passed the pinned-version rehearsal. Enabling shadow or enforcement without
+scheduled revalidation is rejected at startup.
+
 Human hosted action checks are shadow-only by default. They record would-deny decisions while
 existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
 `SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been
@@ -1141,6 +1153,25 @@ build needs the RAM headroom noted under [First deployment](#first-deployment).
 organisation whose purge has already begun. Existing operations keep their stored `purge_after`
 deadline; the routes return `404` again and the worker stops advancing the queue, leaving frozen
 organisations frozen until deletion is re-enabled or an operator recovers them through the runbook.
+
+## Cloud lifecycle email contacts
+
+Contact enrolment is optional and independent of billing and vault access. Both
+`SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED` and `SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED` default to
+`0` and must be enabled together; the server rejects a partial configuration. Keep both off until
+the sender domain is authenticated and a test recipient has completed the full challenge flow.
+The server requires an HTTPS `SOTTO_WEB_ORIGIN`, a configured sender address, and the transport
+credential from the deployment secret store. Do not put the credential in a checked-in file or
+pass it on a command line.
+
+The contact endpoints let a signed-in user set, verify, view, and revoke their own lifecycle email
+address without unlocking the vault. Verification proves control of that address; it does not
+change billing, access, or export rights, and it does not mean future notices have been delivered.
+The verification callback token is one-use and short-lived. The server stores only its digest.
+
+To disable the journey, turn both flags off and restart the server. Existing verified contacts are
+retained, and users can still revoke their own contact. Re-enabling the flags does not resend an
+old challenge; the user starts a fresh verification request.
 
 ## Database security
 

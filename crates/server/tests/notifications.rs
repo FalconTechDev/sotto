@@ -791,6 +791,7 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             oauth_config: None,
             billing: None,
             telemetry_ingest: false,
+            contact_verification: None,
             organisation_deletion_enabled: false,
             organisation_deletion_retention_days:
                 sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
@@ -798,6 +799,8 @@ async fn eligibility_route_records_export_notice_without_vault_unlock() {
             organisation_deletion_operator_token: None,
             billing_transfer_operator_token: None,
             cloud_action_enforcement_enabled: false,
+            cloud_coverage_authority_enforcement_enabled: false,
+            cloud_coverage_authority_shadow_enabled: false,
             machine_eligibility_enforcement_enabled: false,
             billing_transfers_enabled: false,
             billing_transfer_execution_enabled: false,

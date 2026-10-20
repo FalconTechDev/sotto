@@ -7,6 +7,7 @@ use sqlx::PgPool;
 use crate::auth::OAuthProvider;
 use crate::billing::BillingState;
 use crate::config::{DeploymentMode, OAuthConfig};
+use crate::contact_verification::ContactVerificationService;
 
 /// Cloneable handle to the resources every request needs.
 ///
@@ -19,6 +20,8 @@ pub struct AppState {
     pub oauth: Option<Arc<dyn OAuthProvider>>,
     pub oauth_config: Option<OAuthConfig>,
     pub billing: Option<BillingState>,
+    /// Contact enrolment and verification transport. `None` keeps the feature unavailable.
+    pub contact_verification: Option<Arc<ContactVerificationService>>,
     /// Whether this instance accepts telemetry pings (`SOTTO_TELEMETRY_INGEST=1`, hosted only).
     pub telemetry_ingest: bool,
     /// Whether the organisation-deletion API is registered on this instance.
@@ -37,6 +40,10 @@ pub struct AppState {
     pub billing_transfer_operator_token: Option<String>,
     /// Whether the dormant human hosted action policy rejects ineligible requests.
     pub cloud_action_enforcement_enabled: bool,
+    /// Whether Cloud eligibility requires a fresh, complete provider authority receipt.
+    pub cloud_coverage_authority_enforcement_enabled: bool,
+    /// Whether authority freshness participates in non-blocking shadow decisions.
+    pub cloud_coverage_authority_shadow_enabled: bool,
     /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
     pub machine_eligibility_enforcement_enabled: bool,
     /// Whether consented payer-transfer API routes are registered.
