@@ -184,6 +184,11 @@ async fn run() -> Result<()> {
                 .from_address
                 .clone()
                 .expect("contact email configuration validated at startup"),
+            config
+                .contact_verification
+                .web_origin
+                .clone()
+                .expect("contact email configuration validated at startup"),
         )?;
         let origin = config
             .contact_verification
@@ -199,6 +204,27 @@ async fn run() -> Result<()> {
     } else {
         None
     };
+    let notice_sender = if config.cloud_notice_dispatch_enabled {
+        Some(ResendSender::new(
+            config
+                .contact_verification
+                .resend_api_key
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+            config
+                .contact_verification
+                .from_address
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+            config
+                .contact_verification
+                .web_origin
+                .clone()
+                .expect("notice dispatch configuration validated at startup"),
+        )?)
+    } else {
+        None
+    };
 
     let repair_billing = billing.clone();
     let repair_runtime = personal_coverage_runtime.clone();
@@ -210,12 +236,28 @@ async fn run() -> Result<()> {
         oauth_config: config.oauth.clone(),
         billing,
         contact_verification,
+        cloud_notice_dispatch_enabled: config.cloud_notice_dispatch_enabled,
+        resend_webhook_secret: config
+            .cloud_notice_dispatch_enabled
+            .then(|| config.resend_webhook_secret.clone())
+            .flatten(),
         telemetry_ingest: config.telemetry.ingest_enabled,
         // One opt-in drives both halves: the routes that accept work and the worker that performs
         // it. Splitting them would let a deployment freeze organisations it can never purge.
         organisation_deletion_enabled: config.organisation_deletion_worker_enabled,
         organisation_deletion_retention_days: config.organisation_deletion_retention_days,
         organisation_deletion_metrics_token: config.organisation_deletion_metrics_token,
+        cloud_operations_metrics_token: config.cloud_operations_metrics_token,
+        cloud_coverage_repair_token: config.cloud_coverage_repair_token,
+        provider_refresh_ingest_enabled: config.provider_refresh_ingest_enabled,
+        provider_refresh_worker_enabled: config.provider_refresh_worker_enabled,
+        provider_refresh_reconciliation_enabled: config.provider_refresh_reconciliation_enabled,
+        provider_authority_revalidation_enabled: config.provider_authority_revalidation_enabled,
+        cloud_sales_enabled: config.cloud_sales_enabled,
+        founding_schedule_worker_enabled: config.founding_schedule_worker_enabled,
+        founding_price_notices_enabled: config.founding_price_notices_enabled,
+        billing_recovery_worker_enabled: config.billing_recovery_worker_enabled,
+        sponsored_billing_recovery_worker_enabled: config.sponsored_billing_recovery_worker_enabled,
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,
         billing_transfer_operator_token: config.billing_transfer_operator_token,
         cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
@@ -227,7 +269,12 @@ async fn run() -> Result<()> {
         billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
         billing_transfer_setup_enabled: config.billing_transfer_setup_enabled,
         cloud_retention_dry_run_enabled: config.cloud_retention_dry_run_enabled,
+        cloud_shared_retention_dry_run_enabled: config.cloud_shared_retention_dry_run_enabled,
         cloud_retention_operator_token: config.cloud_retention_operator_token.clone(),
+        cloud_retention_purge_enabled: config.cloud_retention_purge_enabled,
+        cloud_retention_destructive_token: config.cloud_retention_destructive_token.clone(),
+        cloud_retention_evidence_hmac_key: config.cloud_retention_evidence_hmac_key.clone(),
+        cloud_retention_build_sha: config.cloud_retention_build_sha.clone(),
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
@@ -236,6 +283,18 @@ async fn run() -> Result<()> {
         "cloud contact enrolment: {}, email sends: {}",
         config.contact_verification.enrolment_enabled,
         config.contact_verification.email_sends_enabled
+    );
+    println!(
+        "Cloud lifecycle notice email dispatch: {}",
+        config.cloud_notice_dispatch_enabled
+    );
+    println!(
+        "Cloud billing recovery worker: {}",
+        config.billing_recovery_worker_enabled
+    );
+    println!(
+        "Sponsored billing recovery worker: {}",
+        config.sponsored_billing_recovery_worker_enabled
     );
     println!(
         "provider refresh: ingest={}, worker={}, reconciliation={}",
@@ -291,6 +350,10 @@ async fn run() -> Result<()> {
         "Cloud personal retention dry run: {}",
         config.cloud_retention_dry_run_enabled
     );
+    println!(
+        "Cloud shared organisation retention dry run: {}",
+        config.cloud_shared_retention_dry_run_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
@@ -302,7 +365,21 @@ async fn run() -> Result<()> {
     if config.organisation_deletion_worker_enabled {
         sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider.clone());
     }
-    if config.cloud_retention_dry_run_enabled {
+    if config.billing_recovery_worker_enabled {
+        let billing = state.billing.clone().ok_or_else(|| {
+            Error::Config("billing recovery worker requires configured Stripe billing".into())
+        })?;
+        sotto_server::billing_recovery_executor::spawn(pool.clone(), billing);
+    }
+    if config.sponsored_billing_recovery_worker_enabled {
+        let billing = state.billing.clone().ok_or_else(|| {
+            Error::Config(
+                "sponsored billing recovery worker requires configured Stripe billing".into(),
+            )
+        })?;
+        sotto_server::sponsored_billing_recovery_executor::spawn(pool.clone(), billing);
+    }
+    if config.cloud_retention_dry_run_enabled || config.cloud_shared_retention_dry_run_enabled {
         sotto_server::cloud_retention_lifecycle::spawn(state.clone());
     }
     if config.founding_schedule_worker_enabled {
@@ -346,6 +423,9 @@ async fn run() -> Result<()> {
     }
     if config.founding_price_notices_enabled {
         sotto_server::founding_price_notices::spawn(pool.clone());
+    }
+    if let Some(sender) = notice_sender {
+        sotto_server::notifications::spawn(pool.clone(), sender);
     }
     if config.billing_transfer_execution_enabled {
         let provider = worker_provider.as_ref().ok_or_else(|| {
