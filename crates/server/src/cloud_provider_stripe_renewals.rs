@@ -577,7 +577,8 @@ pub fn decode_personal_renewal_failure(
     let amount_remaining = required_i64(invoice, "amount_remaining")?;
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;
-    let amount_paid_off_stripe = required_i64(invoice, "amount_paid_off_stripe")?;
+    let amount_paid_off_stripe = optional_i64(invoice, "amount_paid_off_stripe")?;
+    let starting_balance = required_i64(invoice, "starting_balance")?;
     for (amount, field) in [
         (amount_due, "amount_due"),
         (amount_remaining, "amount_remaining"),
@@ -595,7 +596,11 @@ pub fn decode_personal_renewal_failure(
     if amount_remaining == 0 {
         return Err(StripeContractError::InvalidField("amount_remaining"));
     }
-    if amount_paid != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
+    if amount_paid != 0
+        || amount_overpaid != 0
+        || amount_paid_off_stripe != 0
+        || starting_balance != 0
+    {
         return Err(StripeContractError::UnsupportedSettlement(
             "renewal invoice has a partial or off-Stripe settlement",
         ));
@@ -1110,6 +1115,13 @@ fn required_i64(object: &Value, field: &'static str) -> Result<i64, StripeContra
         .get(field)
         .and_then(Value::as_i64)
         .ok_or(StripeContractError::MissingField(field))
+}
+
+fn optional_i64(object: &Value, field: &'static str) -> Result<i64, StripeContractError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(_) => required_i64(object, field),
+    }
 }
 
 fn required_bool(object: &Value, field: &'static str) -> Result<bool, StripeContractError> {

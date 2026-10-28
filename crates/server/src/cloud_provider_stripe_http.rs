@@ -19,7 +19,7 @@ use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
     StripeContractError, StripeCoverageConfig, StripePersonalInvoiceFacts,
-    StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY,
+    StripePersonalInvoiceObservation, STRIPE_ALLOCATION_METADATA_KEY, STRIPE_CURRENCY,
 };
 use crate::cloud_provider_stripe_corrections::{
     evaluate_personal_invoice_access, StripePersonalInvoiceAccessDecision,
@@ -308,6 +308,16 @@ impl StripeReadClient {
         if api_key.trim().is_empty() {
             return Err(StripeReadError::InvalidConfig("Stripe API key"));
         }
+        let key_livemode = if api_key.starts_with("sk_live_") || api_key.starts_with("rk_live_") {
+            Some(true)
+        } else if api_key.starts_with("sk_test_") || api_key.starts_with("rk_test_") {
+            Some(false)
+        } else {
+            None
+        };
+        if key_livemode != Some(matches!(config.environment, ProviderEnvironment::Live)) {
+            return Err(StripeReadError::InvalidConfig("Stripe API key environment"));
+        }
         let limits = limits.validate()?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -335,6 +345,7 @@ impl StripeReadClient {
             pages: 0,
             records: 0,
             account_verified: false,
+            last_permission_scope: None,
             identity: Arc::clone(&self.identity),
         }
     }
@@ -367,15 +378,13 @@ impl StripeReadClient {
         if id != self.account_id {
             return Err(StripeReadError::AccountMismatch);
         }
-        let livemode = value
-            .get("livemode")
-            .and_then(Value::as_bool)
-            .ok_or(StripeReadError::MalformedResponse("account.livemode"))?;
-        if livemode != matches!(self.environment, ProviderEnvironment::Live) {
-            return Err(StripeReadError::ContextMismatch);
-        }
         session.account_verified = true;
-        Ok(StripeAccountResource { id, livemode })
+        // Stripe's Account object has no `livemode` field. The key prefix is the authoritative
+        // mode signal; `build` rejects a key whose mode differs from the configured environment.
+        Ok(StripeAccountResource {
+            id,
+            livemode: matches!(self.environment, ProviderEnvironment::Live),
+        })
     }
 
     pub async fn subscription(
@@ -405,7 +414,14 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}");
-        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        let value = self
+            .request_json(
+                session,
+                Method::GET,
+                &path,
+                &[("expand[]".into(), "amount_paid_off_stripe".into())],
+            )
+            .await?;
         let resource = parse_invoice(&value)?;
         if resource.id != invoice_id {
             return Err(StripeReadError::ContextMismatch);
@@ -796,11 +812,21 @@ impl StripeReadClient {
                 .ok_or(StripeReadError::MalformedResponse(
                     "invoice.amount_paid_off_stripe",
                 ))?;
+        let starting_balance =
+            invoice
+                .starting_balance
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.starting_balance",
+                ))?;
         let currency = invoice
             .currency
             .clone()
             .ok_or(StripeReadError::MalformedResponse("invoice.currency"))?;
-        if amount_remaining != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
+        if amount_remaining != 0
+            || amount_overpaid != 0
+            || amount_paid_off_stripe != 0
+            || starting_balance != 0
+        {
             return Err(StripeReadError::Observation(
                 StripeContractError::UnsupportedSettlement(
                     "sponsored invoice has unresolved financial amounts",
@@ -1048,6 +1074,18 @@ impl StripeReadClient {
             ));
         }
         let settlement = payments[0].settlement(&self.coverage)?;
+        let amount_paid_off_stripe =
+            invoice
+                .amount_paid_off_stripe
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.amount_paid_off_stripe",
+                ))?;
+        let starting_balance =
+            invoice
+                .starting_balance
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.starting_balance",
+                ))?;
         validate_personal_invoice_observation(
             &self.coverage,
             binding,
@@ -1089,9 +1127,8 @@ impl StripeReadClient {
                 amount_overpaid: invoice.amount_overpaid.ok_or(
                     StripeReadError::MalformedResponse("invoice.amount_overpaid"),
                 )?,
-                amount_paid_off_stripe: invoice.amount_paid_off_stripe.ok_or(
-                    StripeReadError::MalformedResponse("invoice.amount_paid_off_stripe"),
-                )?,
+                amount_paid_off_stripe,
+                starting_balance,
                 period_start: line
                     .period_start
                     .ok_or(StripeReadError::MalformedResponse("line.period.start"))?,
@@ -1571,6 +1608,82 @@ impl StripeReadClient {
         Ok(Some((invoice, lines)))
     }
 
+    /// Verify that a personal renewal-failure snapshot still describes an unpaid Stripe invoice.
+    /// The webhook does not carry expanded `amount_paid_off_stripe`, so failure evidence is only
+    /// usable after this detail read confirms no off-Stripe payment or customer-balance amount.
+    #[doc(hidden)]
+    pub async fn personal_renewal_failure_invoice_is_open_and_unpaid(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+        binding: &StripeAllocationBinding,
+    ) -> Result<bool, StripeReadError> {
+        let invoice = self.invoice(session, invoice_id).await?;
+        validate_current_invoice(&invoice, binding)?;
+        match invoice.status.as_deref() {
+            Some("open") => {}
+            Some("paid" | "void" | "uncollectible") => return Ok(false),
+            Some(_) => {
+                return Err(StripeReadError::Observation(
+                    StripeContractError::UnsupportedSettlement(
+                        "personal renewal invoice is not open or closed",
+                    ),
+                ));
+            }
+            None => return Err(StripeReadError::MalformedResponse("invoice.status")),
+        }
+        match validate_current_invoice_cycle(&invoice) {
+            Ok(()) => {}
+            Err(CurrentInvoiceCycleError::Malformed(field)) => {
+                return Err(StripeReadError::MalformedResponse(field));
+            }
+            Err(CurrentInvoiceCycleError::Unsupported { .. }) => return Ok(false),
+        }
+        let Some(currency) = invoice.currency.as_deref() else {
+            return Err(StripeReadError::MalformedResponse("invoice.currency"));
+        };
+        let amount_due = invoice
+            .amount_due
+            .ok_or(StripeReadError::MalformedResponse("invoice.amount_due"))?;
+        let amount_remaining =
+            invoice
+                .amount_remaining
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.amount_remaining",
+                ))?;
+        let amount_paid = invoice
+            .amount_paid
+            .ok_or(StripeReadError::MalformedResponse("invoice.amount_paid"))?;
+        let amount_overpaid = invoice
+            .amount_overpaid
+            .ok_or(StripeReadError::MalformedResponse(
+                "invoice.amount_overpaid",
+            ))?;
+        let amount_paid_off_stripe =
+            invoice
+                .amount_paid_off_stripe
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.amount_paid_off_stripe",
+                ))?;
+        let starting_balance =
+            invoice
+                .starting_balance
+                .ok_or(StripeReadError::MalformedResponse(
+                    "invoice.starting_balance",
+                ))?;
+        if !currency.eq_ignore_ascii_case(STRIPE_CURRENCY)
+            || amount_due <= 0
+            || amount_remaining != amount_due
+            || amount_paid != 0
+            || amount_overpaid != 0
+            || amount_paid_off_stripe != 0
+            || starting_balance != 0
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     async fn list_bounded<T, F>(
         &self,
         session: &mut StripeReadSession,
@@ -1767,7 +1880,13 @@ impl StripeReadClient {
             request = request.query(query);
         }
         let response = request.send().await.map_err(map_request_error)?;
-        self.read_response(session, response).await
+        match self.read_response(session, response).await {
+            Err(error @ StripeReadError::Permission { .. }) => {
+                session.last_permission_scope = Some(safe_permission_scope(path));
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     async fn read_response(
@@ -1823,6 +1942,7 @@ pub struct StripeReadSession {
     pages: usize,
     records: usize,
     account_verified: bool,
+    last_permission_scope: Option<&'static str>,
     identity: Arc<()>,
 }
 
@@ -1840,6 +1960,14 @@ impl fmt::Debug for StripeReadSession {
 }
 
 impl StripeReadSession {
+    /// Return the fixed endpoint category for the most recent 403 response.
+    ///
+    /// This diagnostic omits request paths and resource identifiers.
+    #[doc(hidden)]
+    pub fn last_permission_scope(&self) -> Option<&'static str> {
+        self.last_permission_scope
+    }
+
     fn remaining(&self) -> Result<Duration, StripeReadError> {
         self.deadline
             .checked_duration_since(Instant::now())
@@ -1892,6 +2020,24 @@ impl StripeReadSession {
     }
 }
 
+fn safe_permission_scope(path: &str) -> &'static str {
+    match path {
+        "v1/account" => "account",
+        "v1/invoices" => "invoice_list",
+        "v1/invoice_payments" => "invoice_payments",
+        "v1/refunds" => "refunds",
+        "v1/disputes" => "disputes",
+        "v1/credit_notes" => "credit_notes",
+        "v1/events" => "events",
+        "v1/prices" => "prices",
+        "v1/products" => "products",
+        path if path.starts_with("v1/invoices/") && path.ends_with("/lines") => "invoice_lines",
+        path if path.starts_with("v1/invoices/") => "invoice_detail",
+        path if path.starts_with("v1/subscriptions/") => "subscriptions",
+        _ => "other_stripe_read",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAccountResource {
     pub id: String,
@@ -1929,6 +2075,7 @@ pub struct StripeInvoiceResource {
     pub amount_remaining: Option<i64>,
     pub amount_overpaid: Option<i64>,
     pub amount_paid_off_stripe: Option<i64>,
+    pub starting_balance: Option<i64>,
     pub allocation_reference: Option<String>,
     pub livemode: Option<bool>,
     /// Line summaries included in the Invoice response. When `lines_complete` is false, callers
@@ -2184,7 +2331,11 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
         && left.amount_due == right.amount_due
         && left.amount_remaining == right.amount_remaining
         && left.amount_overpaid == right.amount_overpaid
-        && left.amount_paid_off_stripe == right.amount_paid_off_stripe
+        // Stripe only returns this includable value when expanded on an invoice detail read. A
+        // list summary that omits it is unknown rather than evidence that the invoice changed.
+        && (left.amount_paid_off_stripe.is_none()
+            || left.amount_paid_off_stripe == right.amount_paid_off_stripe)
+        && left.starting_balance == right.starting_balance
         && left.allocation_reference == right.allocation_reference
         && left.livemode == right.livemode
 }
@@ -2335,7 +2486,11 @@ fn validate_current_line(
 fn open_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
     matches!(
         (invoice.amount_due, invoice.amount_remaining, invoice.amount_paid, invoice.amount_overpaid, invoice.amount_paid_off_stripe),
-        (Some(due), Some(remaining), Some(0), Some(0), Some(0)) if due > 0 && remaining == due
+        (Some(due), Some(remaining), Some(0), Some(0), amount_paid_off_stripe)
+            if due > 0
+                && remaining == due
+                && amount_paid_off_stripe == Some(0)
+                && invoice.starting_balance == Some(0)
     )
 }
 
@@ -2348,8 +2503,12 @@ fn closed_invoice_amounts_valid(invoice: &StripeInvoiceResource) -> bool {
             invoice.amount_overpaid,
             invoice.amount_paid_off_stripe
         ),
-        (Some(due), Some(remaining), Some(0), Some(0), Some(0))
-            if due >= 0 && remaining >= 0 && remaining <= due
+        (Some(due), Some(remaining), Some(0), Some(0), amount_paid_off_stripe)
+            if due >= 0
+                && remaining >= 0
+                && remaining <= due
+                && amount_paid_off_stripe == Some(0)
+                && invoice.starting_balance == Some(0)
     )
 }
 
@@ -2906,6 +3065,7 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
             value.get("amount_paid_off_stripe"),
             "invoice.amount_paid_off_stripe",
         )?,
+        starting_balance: optional_i64(value.get("starting_balance"), "invoice.starting_balance")?,
         allocation_reference: parent_allocation_reference.or(invoice_allocation_reference),
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
         line_summaries,
@@ -3373,7 +3533,24 @@ fn map_request_error(error: reqwest::Error) -> StripeReadError {
 
 #[cfg(test)]
 mod invoice_summary_tests {
-    use super::parse_invoice;
+    use super::{parse_invoice, safe_permission_scope};
+
+    #[test]
+    fn permission_scope_diagnostics_never_include_resource_identifiers() {
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123/lines"),
+            "invoice_lines"
+        );
+        assert_eq!(
+            safe_permission_scope("v1/invoices/in_secret_123"),
+            "invoice_detail"
+        );
+        assert_eq!(safe_permission_scope("v1/refunds"), "refunds");
+        assert_eq!(
+            safe_permission_scope("v1/unrecognised/resource_456"),
+            "other_stripe_read"
+        );
+    }
 
     #[test]
     fn invoice_list_summary_marks_complete_line_data_for_candidate_filtering() {
