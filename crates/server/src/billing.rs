@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
@@ -3580,10 +3580,7 @@ async fn select_founding_aware_offer(
 }
 
 fn billing_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
+    crate::clock::business_epoch_seconds()
 }
 
 fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Error {
@@ -3698,6 +3695,11 @@ async fn personal_quote(
 /// verified paid webhook handled below.
 const SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS: i64 = 23 * 60 * 60;
 
+#[cfg(feature = "e2e-test-clock")]
+fn test_checkout_customer_matches(configured: Option<&str>, stored: Option<&str>) -> bool {
+    configured.is_none_or(|customer_id| Some(customer_id) == stored)
+}
+
 async fn personal_checkout(
     State(state): State<AppState>,
     user: AuthUser,
@@ -3730,6 +3732,8 @@ async fn personal_checkout(
     validate_personal_catalogue(billing, catalogue).await?;
     let price_id = catalogue.id_for(offer).to_string();
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    #[cfg(feature = "e2e-test-clock")]
+    let test_clock_customer_id = crate::clock::test_clock_customer_id();
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
     #[cfg(feature = "e2e-stripe-test-clock")]
@@ -3800,6 +3804,24 @@ async fn personal_checkout(
             )
             .await
             .map_err(personal_billing_error)?;
+            #[cfg(feature = "e2e-test-clock")]
+            if let Some(customer_id) = test_clock_customer_id.as_deref() {
+                let result = sqlx::query(
+                    "UPDATE billing_personal_accounts SET stripe_customer_id = $2, updated_at = now() \
+                     WHERE user_id = $1 AND operation_id = $3 AND state = 'pending' \
+                       AND (stripe_customer_id IS NULL OR stripe_customer_id = $2)",
+                )
+                .bind(&user.user_id)
+                .bind(customer_id)
+                .bind(&operation.operation_id)
+                .execute(&mut *tx)
+                .await?;
+                if result.rows_affected() != 1 {
+                    return Err(Error::Conflict(
+                        "billing operation is bound to a different test customer".into(),
+                    ));
+                }
+            }
             let operation = billing_operations::record_personal_checkout_request(
                 &mut tx,
                 &operation.operation_id,
@@ -3928,6 +3950,12 @@ async fn personal_checkout(
     .bind(&operation.operation_id)
     .fetch_one(&state.pool)
     .await?;
+    #[cfg(feature = "e2e-test-clock")]
+    if !test_checkout_customer_matches(test_clock_customer_id.as_deref(), customer_id.as_deref()) {
+        return Err(Error::Conflict(
+            "billing operation is bound to a different test customer".into(),
+        ));
+    }
     let stored_price_id = operation
         .provider_checkout_price_id
         .as_deref()
@@ -6786,10 +6814,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         .get("Stripe-Signature")
         .and_then(|v| v.to_str().ok())
         .ok_or(Error::Unauthorized)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = crate::clock::wall_epoch_seconds();
     if !verify_signature(&billing.webhook_secret, signature, &body, now) {
         return Err(Error::Unauthorized);
     }
@@ -7125,6 +7150,8 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                         &coverage.context,
                         &coverage.event,
                         &coverage.allocation,
+                        coverage.previous_provider_item_id.as_deref(),
+                        coverage.provider_item_rebind_allowed,
                         true,
                     )
                     .await?;
@@ -7632,6 +7659,8 @@ pub(crate) async fn repair_authenticated_stripe_event(
                 &coverage.context,
                 &coverage.event,
                 &coverage.allocation,
+                coverage.previous_provider_item_id.as_deref(),
+                coverage.provider_item_rebind_allowed,
                 true,
             )
             .await?;
@@ -7741,6 +7770,8 @@ pub(crate) async fn repair_authenticated_stripe_event(
             &coverage.context,
             &coverage.event,
             &coverage.allocation,
+            coverage.previous_provider_item_id.as_deref(),
+            coverage.provider_item_rebind_allowed,
             true,
         )
         .await?;
@@ -8064,6 +8095,8 @@ struct PreparedPersonalInvoiceCoverage {
     payment_reference: String,
     period_start: i64,
     period_end: i64,
+    previous_provider_item_id: Option<String>,
+    provider_item_rebind_allowed: bool,
 }
 
 enum PersonalInvoiceCoveragePreparation {
@@ -8081,6 +8114,8 @@ struct PreparedPersonalRenewalFailure {
     context: ProviderContext,
     allocation: VerifiedAllocation,
     evidence: crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence,
+    previous_provider_item_id: Option<String>,
+    provider_item_rebind_allowed: bool,
 }
 
 struct PreparedSponsoredRenewalFailure {
@@ -8154,13 +8189,39 @@ async fn prepare_signed_personal_renewal_failure(
     let Some(allocation_reference) = invoice_allocation_reference_claim(invoice) else {
         return Ok(None);
     };
+    let Some(failed_line) = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+    else {
+        return Ok(None);
+    };
+    let Some(event_item_id) = failed_line
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_item_details"))
+        .and_then(|details| details.get("subscription_item"))
+        .and_then(stripe_reference)
+    else {
+        return Ok(None);
+    };
+    let Some(failed_period_start) = failed_line
+        .get("period")
+        .and_then(|period| period.get("start"))
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Ok(None);
+    };
     let row = sqlx::query(
         "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
                 allocation.provider_subscription_id, allocation.provider_item_id, \
                 allocation.external_allocation_reference, allocation.coverage_source_id, \
                 allocation.effective_from, allocation.effective_until, allocation.state, \
                 allocation.ownership_evidence_reference, allocation.provider_account_id, \
-                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind \
+                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind, \
+                (SELECT paid_through_epoch FROM billing_personal_accounts \
+                 WHERE user_id = allocation.beneficiary_id) AS personal_paid_through_epoch \
          FROM cloud_provider_allocations AS allocation \
          JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
          WHERE allocation.provider_namespace = 'stripe' \
@@ -8180,12 +8241,19 @@ async fn prepare_signed_personal_renewal_failure(
     }
     let customer_id: String = row.try_get("provider_customer_id")?;
     let subscription_id: String = row.try_get("provider_subscription_id")?;
-    let provider_item_id: String = row.try_get("provider_item_id")?;
+    let previous_provider_item_id: String = row.try_get("provider_item_id")?;
+    let item_changed = previous_provider_item_id != event_item_id;
+    let provider_item_rebind_allowed = item_changed
+        && row.try_get::<Option<i64>, _>("personal_paid_through_epoch")?
+            == Some(failed_period_start);
+    if item_changed && !provider_item_rebind_allowed {
+        return Ok(None);
+    }
     let binding = StripeAllocationBinding::new(
         allocation_reference,
         customer_id.clone(),
         subscription_id.clone(),
-        provider_item_id.clone(),
+        event_item_id.clone(),
         ProviderPayerKind::Personal,
     )
     .map_err(|_| Error::Internal("stored Stripe allocation binding is invalid".into()))?;
@@ -8196,7 +8264,7 @@ async fn prepare_signed_personal_renewal_failure(
         ProviderPayerKind::Personal,
         row.try_get::<String, _>("beneficiary_id")?,
         subscription_id.clone(),
-        provider_item_id,
+        event_item_id,
         row.try_get::<String, _>("external_allocation_reference")?,
         row.try_get::<String, _>("coverage_source_id")?,
         row.try_get::<i64, _>("effective_from")?,
@@ -8264,6 +8332,8 @@ async fn prepare_signed_personal_renewal_failure(
         context,
         allocation,
         evidence,
+        previous_provider_item_id: item_changed.then_some(previous_provider_item_id),
+        provider_item_rebind_allowed,
     }))
 }
 
@@ -8271,6 +8341,26 @@ async fn accept_prepared_personal_renewal_failure(
     tx: &mut Transaction<'_, Postgres>,
     failure: &PreparedPersonalRenewalFailure,
 ) -> Result<()> {
+    if failure.provider_item_rebind_allowed {
+        let previous_item_id = failure
+            .previous_provider_item_id
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Internal(
+                    "personal renewal item transition lacks its previous binding".into(),
+                )
+            })?;
+        crate::cloud_provider::rebind_personal_allocation_item(
+            tx,
+            &failure.context,
+            &failure.allocation,
+            previous_item_id,
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal("personal renewal item binding could not be advanced".into())
+        })?;
+    }
     crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure(
         tx,
         &failure.context,
@@ -9410,6 +9500,7 @@ async fn prepare_personal_invoice_coverage(
     let row = sqlx::query(
         "SELECT user_id, operation_id, allocation_reference, stripe_coverage_binding_required, \
                 offer, stripe_customer_id, \
+                paid_through_epoch, \
                 (SELECT offer FROM billing_founding_awards \
                  WHERE beneficiary_id = billing_personal_accounts.user_id) AS founding_offer, \
                 (SELECT original_end_epoch FROM billing_founding_awards \
@@ -9446,6 +9537,7 @@ async fn prepare_personal_invoice_coverage(
         .map(parse_founding_offer)
         .transpose()?;
     let founding_end_epoch: Option<i64> = row.try_get("founding_end_epoch")?;
+    let account_paid_through_epoch: Option<i64> = row.try_get("paid_through_epoch")?;
     let Some(customer_id) = row.try_get::<Option<String>, _>("stripe_customer_id")? else {
         return Err(Error::Internal(
             "personal invoice checkout is not yet linked".into(),
@@ -9749,6 +9841,14 @@ async fn prepare_personal_invoice_coverage(
             ));
         }
     };
+    let previous_provider_item_id = stored
+        .as_ref()
+        .map(|row| row.try_get::<String, _>("provider_item_id"))
+        .transpose()?;
+    let provider_item_rebind_allowed = previous_provider_item_id
+        .as_deref()
+        .is_some_and(|previous| previous != allocation.provider_item_id)
+        && account_paid_through_epoch == Some(evidence.period_start);
     if stored.as_ref().is_some_and(|row| {
         row.try_get::<String, _>("beneficiary_id").ok().as_deref()
             != Some(allocation.beneficiary_id.as_str())
@@ -9762,8 +9862,9 @@ async fn prepare_personal_invoice_coverage(
                 .ok()
                 .as_deref()
                 != Some(allocation.subscription_id.as_str())
-            || row.try_get::<String, _>("provider_item_id").ok().as_deref()
+            || (row.try_get::<String, _>("provider_item_id").ok().as_deref()
                 != Some(allocation.provider_item_id.as_str())
+                && !provider_item_rebind_allowed)
             || row.try_get::<String, _>("payer_kind").ok().as_deref() != Some("personal")
             || row
                 .try_get::<String, _>("provider_account_id")
@@ -9791,6 +9892,8 @@ async fn prepare_personal_invoice_coverage(
             payment_reference: evidence.payment_intent_id,
             period_start: evidence.period_start,
             period_end: evidence.period_end,
+            previous_provider_item_id,
+            provider_item_rebind_allowed,
         },
     )))
 }
@@ -9811,11 +9914,28 @@ async fn accept_personal_invoice_coverage(
     context: &ProviderContext,
     event: &crate::cloud_provider::VerifiedProviderEvent,
     allocation: &VerifiedAllocation,
+    previous_provider_item_id: Option<&str>,
+    provider_item_rebind_allowed: bool,
     ingest_enabled: bool,
 ) -> Result<()> {
     record_verified_event(tx, context, event)
         .await
         .map_err(|_| Error::Internal("personal provider event receipt failed".into()))?;
+    if provider_item_rebind_allowed {
+        let previous_item_id = previous_provider_item_id.ok_or_else(|| {
+            Error::Internal("personal provider item transition lacks its previous binding".into())
+        })?;
+        crate::cloud_provider::rebind_personal_allocation_item(
+            tx,
+            context,
+            allocation,
+            previous_item_id,
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal("personal provider item binding could not be advanced".into())
+        })?;
+    }
     register_verified_allocation(tx, context, allocation)
         .await
         .map_err(|_| Error::Internal("personal provider source registration failed".into()))?;
@@ -13015,6 +13135,22 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "e2e-test-clock")]
+    #[test]
+    fn test_clock_checkout_replays_only_with_its_original_customer() {
+        assert!(test_checkout_customer_matches(None, None));
+        assert!(test_checkout_customer_matches(None, Some("cus_existing")));
+        assert!(test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_original")
+        ));
+        assert!(!test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_different")
+        ));
+        assert!(!test_checkout_customer_matches(Some("cus_original"), None));
+    }
     use axum::response::IntoResponse;
     use std::collections::HashSet;
     use std::str::FromStr;
