@@ -540,16 +540,9 @@ pub fn decode_personal_renewal_failure(
     if customer_id != binding.customer_id() {
         return Err(StripeContractError::OwnershipMismatch);
     }
-    let allocation_reference = invoice
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or(StripeContractError::MissingField(
-            "metadata.sotto_allocation_reference",
-        ))?;
+    let allocation_reference = invoice_allocation_reference(invoice).ok_or(
+        StripeContractError::MissingField("metadata.sotto_allocation_reference"),
+    )?;
     if allocation_reference != binding.allocation_reference() {
         return Err(StripeContractError::OwnershipMismatch);
     }
@@ -577,7 +570,8 @@ pub fn decode_personal_renewal_failure(
     let amount_remaining = required_i64(invoice, "amount_remaining")?;
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;
-    let amount_paid_off_stripe = required_i64(invoice, "amount_paid_off_stripe")?;
+    let amount_paid_off_stripe = optional_i64(invoice, "amount_paid_off_stripe")?;
+    let starting_balance = required_i64(invoice, "starting_balance")?;
     for (amount, field) in [
         (amount_due, "amount_due"),
         (amount_remaining, "amount_remaining"),
@@ -595,7 +589,11 @@ pub fn decode_personal_renewal_failure(
     if amount_remaining == 0 {
         return Err(StripeContractError::InvalidField("amount_remaining"));
     }
-    if amount_paid != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
+    if amount_paid != 0
+        || amount_overpaid != 0
+        || amount_paid_off_stripe != 0
+        || starting_balance != 0
+    {
         return Err(StripeContractError::UnsupportedSettlement(
             "renewal invoice has a partial or off-Stripe settlement",
         ));
@@ -795,7 +793,7 @@ pub fn decode_personal_renewal_failure(
         predecessor_evidence_reference: term.evidence_reference().to_owned(),
         provider_account_id: config.account_id.clone(),
         environment: config.environment,
-        allocation_reference,
+        allocation_reference: allocation_reference.to_owned(),
         customer_id,
         subscription_id,
         provider_item_id,
@@ -809,6 +807,27 @@ pub fn decode_personal_renewal_failure(
     };
     evidence.evidence_reference = evidence_reference(&evidence);
     Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
+}
+
+fn invoice_allocation_reference(invoice: &Value) -> Option<&str> {
+    let root = invoice.get("metadata");
+    let parent = invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"));
+    let line = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+        .and_then(|line| line.get("metadata"));
+    [line, parent, root]
+        .into_iter()
+        .flatten()
+        .find_map(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Link an authenticated repair candidate to exactly one previously paid predecessor.
@@ -1110,6 +1129,13 @@ fn required_i64(object: &Value, field: &'static str) -> Result<i64, StripeContra
         .get(field)
         .and_then(Value::as_i64)
         .ok_or(StripeContractError::MissingField(field))
+}
+
+fn optional_i64(object: &Value, field: &'static str) -> Result<i64, StripeContractError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(_) => required_i64(object, field),
+    }
 }
 
 fn required_bool(object: &Value, field: &'static str) -> Result<bool, StripeContractError> {
